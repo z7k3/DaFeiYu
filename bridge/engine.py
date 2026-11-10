@@ -86,7 +86,7 @@ STICKER_TEST_ON = False
 STICKER_COLLECT = False
 ACCOUNT_WANTED = ''
 REMINDER_RUNNER = None
-from send_state import SEND_STATE, ChatIdentityError, DraftDirtyError, _chat_identity_level, _SendStateScope
+from send_state import SEND_STATE, ChatIdentityError, DraftDirtyError, _chat_identity_level, _SendStateScope, touch, ensure_budget, note_raised, clear_raised
 BG_SEND = {'enabled': True, 'charGap': 0.04, 'verify': True, 'charMode': 'auto', 'fallback': True, 'strip': True, 'unhide': True}
 PIPELINE_WORKERS = 4
 PIPELINE_QUEUE_LIMIT = 8
@@ -275,7 +275,7 @@ def reload_config(path=None):
             time.sleep(1)
         if SEND_STATE.get('active'):
             log('⚠️ 仍有发送未结束就重启了，输入框可能留有半截草稿，请手动清一下')
-        os._exit(7)
+        hard_exit(7)
     GOODNIGHT_TEXT = str(w.get('goodnightText') or GOODNIGHT_TEXT)
     SYSTEM_SENDER_NAMES = set(BASE_SYSTEM_SENDERS)
     SYSTEM_SENDER_NAMES |= {str(x).strip() for x in w.get('ignoreSenders') or [] if str(x).strip()}
@@ -361,6 +361,7 @@ def list_accounts_cli():
         except Exception:
             pass
         if WeChatDB is not None and time.time() < deadline:
+            probe = None
             try:
                 probe = WeChatDB(db_dir=db_dir, account=n)
                 if probe.account == n:
@@ -368,6 +369,11 @@ def list_accounts_cli():
                     item['nick'] = str(info.get('nick_name') or info.get('remark') or '').strip()
             except Exception:
                 pass
+            finally:
+                # I2：已核对 wechatauto 源码，WeChatDB 没有 close()/dispose()，
+                # 也不常驻线程（查询用的连接都在库内部 finally 关闭）。这里显式
+                # 丢掉引用，让密钥表/文件清单尽早回收，别攒着等进程退出。
+                probe = None
         rows.append(item)
     rows.sort(key=lambda x: -x['lastActive'])
     payload = {'dbDir': db_dir or '', 'generatedAt': int(time.time() * 1000), 'accounts': rows}
@@ -419,6 +425,7 @@ def write_accounts_cache(db_dir, account='', nick='', probe_others=True, deadlin
                 pass
             item['lastActive'] = int(newest * 1000)
             if not item['nick'] and wechat_db is not None and (time.time() < deadline):
+                probe = None
                 try:
                     probe = wechat_db(db_dir=db_dir, account=n)
                     if probe.account == n:
@@ -426,6 +433,9 @@ def write_accounts_cache(db_dir, account='', nick='', probe_others=True, deadlin
                         item['nick'] = str(info.get('nick_name') or info.get('remark') or '').strip()
                 except Exception:
                     pass
+                finally:
+                    # I2：同上，WeChatDB 无 close()，用完显式丢引用。
+                    probe = None
             rows.append(item)
         rows.sort(key=lambda x: -x['lastActive'])
         payload = {'dbDir': db_dir, 'generatedAt': int(time.time() * 1000), 'accounts': rows}
@@ -438,7 +448,12 @@ def write_accounts_cache(db_dir, account='', nick='', probe_others=True, deadlin
     except Exception as e:
         log('账号缓存补写失败（不影响收发）：', repr(e))
         return False
-BRIDGE_LOCK_PORT = 47821
+# 单实例锁端口。原来用的 47821 落在 WSL2 镜像网络保留的宿主端口段里
+# （本机实测 44620-48715 整段 bind 都失败，netstat 却看不见占用者），
+# 导致 bind() 必然失败、桥接每次秒退、启动器无限重启。换到保留段外，
+# 并多留两个后备端口（见 bridge/instance_lock.py）。
+BRIDGE_LOCK_PORT = 48800
+BRIDGE_LOCK_PORTS = (BRIDGE_LOCK_PORT, 48810, 48820)
 VOICE_ENABLED = True
 VOICE_BASE_URL = 'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation'
 VOICE_MODEL = 'qwen3-asr-flash'
@@ -466,6 +481,32 @@ def wait_for_server(url, timeout=30):
 def ensure_ffmpeg_env():
     """兼容旧调用：实现在 config.py。"""
     return _ensure_ffmpeg_env()
+
+def hard_exit(code):
+    """统一硬退出（S5）：os._exit 之前还原系统级副作用。
+
+    os._exit 不走 atexit：bg_sender 打开的 SPI_SETSCREENREADER（还带着
+    SPIF_UPDATEINIFILE 持久化）如果不还原，会一直留在系统设置里，影响
+    其它程序的无障碍行为。看门狗、配置热重载的重启都从这里退出，
+    保证标志一定被关掉（旧注释说「下次启动会关」，实际启动路径没人关）。
+    """
+    try:
+        import bg_sender
+        bg_sender.shutdown()
+    except Exception:
+        pass
+    # 发送期间被临时置顶的微信窗口同样要还原：os._exit 不执行 finally，
+    # 不还原的话进程一死微信就永远盖在所有窗口上面（只能重启微信才能恢复）。
+    try:
+        hwnd = int(SEND_STATE.get('raised_hwnd') or 0)
+        if hwnd and not SEND_STATE.get('raised_was_topmost'):
+            import ctypes
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE = 0x2, 0x1, 0x10
+            ctypes.windll.user32.SetWindowPos(hwnd, ctypes.c_void_p(-2), 0, 0, 0, 0,
+                                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+    except Exception:
+        pass
+    os._exit(code)
 try:
     from .msg_pipeline import MessagePipeline, MessageBatches, split_runs, mergeable
 except ImportError:

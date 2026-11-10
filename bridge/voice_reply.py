@@ -169,8 +169,10 @@ def deliver(root, text, hwnd, prepare, log, allow_foreground=None, cancelled=Non
             if not synthesized and result.get("ErrorKind") in ("timeout", "network", "http"):
                 _health_update(root, True)
             if "RequestMs" in result:
+                # 字段存在但值为 None 时 .get(key, "-") 会打出 "Nonems"，统一 or "-"
                 log("自动语音接口：HTTP=%s 首响应=%sms 总耗时=%sms" % (
-                    result.get("HttpStatus", "-"), result.get("HeadersMs", "-"), result["RequestMs"]))
+                    result.get("HttpStatus") or "-", result.get("HeadersMs") or "-",
+                    result.get("RequestMs") or "-"))
             if outcome is not None:
                 outcome.update(Status=status, Error=str(result.get("Error", "")))
             log("自动语音：", status, result.get("Error", ""))

@@ -35,30 +35,76 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
             G.log_warn('[!] 路径里有中文/非英文字符：', G.ROOT)
             G.log('    微信 UI 自动化在这种路径下会失败（发送一直报「拒绝访问」）。')
             G.log('    请把整个文件夹移到纯英文路径再启动，例如 D:\\whale-girl-3.0')
+        # 单实例锁：占一个本地 TCP 端口。bind 失败不一定是「已有实例」——端口被系统
+        # 保留时（WSL2 镜像网络会把宿主机一整段端口保留掉，见 bridge/instance_lock.py）
+        # 报的是一模一样的 WSAEADDRINUSE。所以交给 instance_lock 分清楚：
+        #   能连上 → 真的已有实例，正常退出；连不上 → 端口不可用，报明确错误并非 0 退出。
         _lock_sock = None
         try:
-            import socket as _socket
-            _lock_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-            _lock_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 0)
-            _lock_sock.bind(('127.0.0.1', G.BRIDGE_LOCK_PORT))
-            _lock_sock.listen(1)
-            G.boot('单实例锁已获取（端口 %d）' % G.BRIDGE_LOCK_PORT)
-        except OSError as e:
-            G.log('已经有一个桥接在跑了（端口 %d 被占用），本进程退出：%r' % (G.BRIDGE_LOCK_PORT, e))
-            try:
-                if _lock_sock:
-                    _lock_sock.close()
-            except Exception:
-                pass
-            return 0
-        except Exception:
+            import instance_lock as _lock
+            _state = _lock.acquire(getattr(G, 'BRIDGE_LOCK_PORTS', (G.BRIDGE_LOCK_PORT,)))
+            if _state['status'] == 'running':
+                G.log('已经有一个桥接在跑了（端口 %s 被占用且能连上），本进程退出' % _state['port'])
+                return 0
+            if _state['status'] != 'ok':
+                G.log_error('单实例锁端口全都用不了，桥接起不来。这不是「已有实例」，是端口被系统保留：')
+                G.log_error('  %s' % _lock.describe(_state))
+                G.log_error('  本机常见原因：WSL2 开了镜像网络（.wslconfig 里 networkingMode=mirrored），')
+                G.log_error('  它把 Linux 虚拟机的临时端口段整段保留在宿主机上（本机实测 44620-48715）。')
+                G.log_error('  这段端口 netstat 里看不到占用者，netsh excludedportrange 也不列。')
+                G.log_error('  处理：换 bridge/engine.py 里的 BRIDGE_LOCK_PORTS，或 wsl --shutdown，')
+                G.log_error('        或去掉 .wslconfig 里的 networkingMode=mirrored。')
+                return 3
+            _lock_sock = _state['sock']
+            G.boot('单实例锁已获取（端口 %s）' % _state['port'])
+        except Exception as e:
+            # 锁模块本身出问题（比如漏拷文件）不该拦住桥接：退回「不占锁」继续跑，只是不挡双开。
+            G.log_warn('[!] 单实例锁没装上（%r），这次不挡双开。' % (e,))
             _lock_sock = None
         try:
             import faulthandler
+            # I1：启动时把超大的 hang/crash 日志截断（以前只增不减，也没有轮转）
+            for _name in ('bridge-hang.log', 'bridge-crash.log'):
+                try:
+                    _p = G.os.path.join(G.ROOT, 'data', _name)
+                    if G.os.path.exists(_p) and G.os.path.getsize(_p) > 5 * 1024 * 1024:
+                        with open(_p, 'w', encoding='utf-8') as _f:
+                            _f.write('（超过 5MB，启动时已截断轮转）\n')
+                        G.boot('%s 超过 5MB，已截断' % _name)
+                except Exception:
+                    pass
             try:
                 _hang_file = open(G.os.path.join(G.ROOT, 'data', 'bridge-hang.log'), 'a', encoding='utf-8')
-                faulthandler.dump_traceback_later(40, repeat=True, file=_hang_file)
-                G.boot('已开启卡死堆栈转储（40s）')
+
+                def _hang_watch():
+                    # I1：旧实现 dump_traceback_later(40, repeat=True) 不管卡没卡，
+                    # 每 40 秒都把全线程堆栈追加一遍，一天能长 20MB+。改成只有
+                    # 「发送临界区 active 且 40 秒无进度」才转储一次；start 被
+                    # touch() 刷新即视为有进度，同一卡死事件不重复转储。
+                    dumped_start = None
+                    while True:
+                        G.time.sleep(10)
+                        try:
+                            st = G.SEND_STATE
+                            if not st.get('active'):
+                                dumped_start = None
+                                continue
+                            start = float(st.get('start') or 0)
+                            gap = G.time.time() - start
+                            if gap < 40:
+                                dumped_start = None
+                                continue
+                            if dumped_start == start:
+                                continue
+                            _hang_file.write('\n==== 疑似卡死：发送 %.0f 秒无进度（pid=%d）====\n' % (gap, G.os.getpid()))
+                            _hang_file.flush()
+                            faulthandler.dump_traceback(file=_hang_file, all_threads=True)
+                            _hang_file.flush()
+                            dumped_start = start
+                        except Exception:
+                            pass
+                G.threading.Thread(target=_hang_watch, daemon=True, name='hang-watch').start()
+                G.boot('已开启卡死堆栈转储（仅发送 40 秒无进度时转储一次）')
             except Exception:
                 pass
             try:
@@ -115,7 +161,7 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
         self.token = G.bridge_config.wechat_token(self.cfg)
         self.bot_url = G.build_bot_url(self.cfg)
         self.aliases = ((self.cfg.get('persona') or {}).get('aliases') or []) + [(self.cfg.get('persona') or {}).get('name') or '鲸鲸']
-        G.log('引用回复：%s（关掉更快，需要时在 config.json 把 wechat.quoteReply 设 true）' % ('开' if G.QUOTE_REPLY else '关'))
+        G.log('引用回复：%s（%s）' % ('开' if G.QUOTE_REPLY else '关', '关掉更快，需要时把 config.json 的 wechat.quoteReply 设为 false' if G.QUOTE_REPLY else '需要引用上下文时把 config.json 的 wechat.quoteReply 设为 true'))
         G.log('连接微信 4.x 数据库（只读）…')
         if self.token:
             G.log('webhook token：已读取（长度 %d，内容不进日志）' % len(self.token))
@@ -210,8 +256,12 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
         self.gui_lock = G.threading.Lock()
         self.send_lock = G.threading.Lock()
         self.account_lock = G.threading.RLock()
-        self.dead_chats = set()
+        # S3：dead_chats 改成 {username: 拉黑时间}，普通失败 10 分钟后自动
+        # 放行一条探测（chat_dead）；「移出群聊/群里没我」写 inf 永久拉黑。
+        self.dead_chats = {}
         self.fail_streak = {}
+        # S1：同一目标连续打不开会话的记账（连续 2 次放弃整条前台通道矩阵）
+        self.open_chat_fail = {}
         self.self_wxid = self.db.wxid
         self.ACCOUNT = {'hwnd': 0, 'verified': False, 'why': '', 'label': ''}
         self._pin_cache = {'mtime': None, 'wanted': '', 'dir': ''}

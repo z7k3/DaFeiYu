@@ -55,6 +55,12 @@ class WindowMixin:
             return False
 
     def find_weixin_hwnd(self):
+        if G.uia_boot is None:
+            # uia_boot 导入失败时，旧代码在回调里调 is_wechat_main_title 会
+            # AttributeError 被整体吞掉 → 所有窗口被跳过、永远返回 0，键盘通道
+            # 等静默失效。不如明说：判定不可用，直接找不到主窗。
+            G.log_throttled('uia-boot-missing', 'uia_boot 不可用：微信主窗判定退化，find_weixin_hwnd 返回 0', ttl=600)
+            return 0
         try:
             import win32gui
             import win32con
@@ -222,6 +228,9 @@ class WindowMixin:
                         G.log_window_problem('窗口置顶失败（继续发送）', e)
                     win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
                     G.time.sleep(0.2)
+                    # 记录被临时置顶的窗口：看门狗 hard_exit 不执行 finally，
+                    # 得靠这份记录在退出前还原，否则微信会永远盖在所有窗口上。
+                    G.note_raised(hwnd, was_topmost)
             if require_foreground and win32gui.GetForegroundWindow() != hwnd:
                 G.log('表情包前台模式：微信未进入前台，本次未发送')
                 return False
@@ -232,6 +241,10 @@ class WindowMixin:
                     import win32gui
                     import win32con
                     win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+            except Exception:
+                pass
+            try:
+                G.clear_raised()
             except Exception:
                 pass
 
@@ -245,7 +258,11 @@ class WindowMixin:
              这样你在用电脑时最多看到它闪一下。
         把 wechat.backgroundSend 设成 false 就退回以前的「每次先抢前台、发完不管」。
         """
-        force_front = G.STICKER_TEST_ON
+        # 表情包开关不再劫持文字通道：send_sticker 自己会把微信切到前台并在
+        # 发完还原（sticker_mixin.py），不依赖这里；文字保持「先零焦点、
+        # 失败才前台」的原设计——微信被其他窗口盖住也能正常回文字，
+        # 也不会把盖着它的窗口最小化。
+        force_front = False
         restore_after = G.BACKGROUND_SEND
         snap = self.snapshot_win_state() if restore_after else None
         try:
@@ -265,6 +282,27 @@ class WindowMixin:
         finally:
             if restore_after:
                 self.restore_win_state(snap)
+            # guia 内部（send_file/send_image/open_chat 等）会调 ensure_visible()
+            # 自动最小化盖住微信的窗口，且从不还原（_blocked_minimized 只增不减）。
+            # 发送一结束就把它们还回去：被盖住的窗口最多消失几秒钟。
+            try:
+                gui = self.gui
+                if gui is not None and hasattr(gui, 'restore_blockers'):
+                    gui.restore_blockers()
+            except Exception:
+                pass
+            # ensure_visible → bring_to_front(keep_topmost=True) 会把微信设成 TOPMOST；
+            # 发送前不是置顶的话，发完就撤掉，微信不会一直压在所有窗口上。
+            try:
+                if snap and snap.get('hwnd') and not snap.get('topmost'):
+                    import win32con
+                    import win32gui
+                    ex = win32gui.GetWindowLong(snap['hwnd'], win32con.GWL_EXSTYLE)
+                    if ex & win32con.WS_EX_TOPMOST:
+                        win32gui.SetWindowPos(snap['hwnd'], win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
+            except Exception:
+                pass
 
     def force_foreground(self, hwnd):
         """把微信强制拉到前台，并且**确认真的到位**。
@@ -382,6 +420,13 @@ class WindowMixin:
             snap['hwnd'] = int(self.ACCOUNT.get('hwnd') or 0) or self.find_weixin_hwnd() or 0
             if snap['hwnd']:
                 snap['iconic'] = bool(win32gui.IsIconic(snap['hwnd']))
+                # guia 的 bring_to_front(keep_topmost=True) 会把微信设成 TOPMOST；
+                # 先记下发送前是否置顶，发完只在「原本没置顶」时撤掉，
+                # 别覆盖用户自己在微信里开的「置顶」设置。
+                try:
+                    snap['topmost'] = bool(win32gui.GetWindowLong(snap['hwnd'], -20) & 0x8)  # GWL_EXSTYLE / WS_EX_TOPMOST
+                except Exception:
+                    snap['topmost'] = False
             snap['fg'] = win32gui.GetForegroundWindow() or 0
         except Exception:
             pass
@@ -461,6 +506,27 @@ class WindowMixin:
             u.quiet_mode = True
         except Exception as e:
             G.log('后台模式补丁没打上（不影响发送）：', repr(e))
+
+    def install_no_minimize(self, gui):
+        """禁止 guia 自动最小化遮挡窗口（用户要求：微信被盖住时只切前台，不动别人的窗口）。
+
+        guia 的 ensure_visible() 会先 _minimize_blockers()（把与微信重叠的顶层窗口
+        全部 SW_MINIMIZE）再 bring_to_front，且从不还原。而文字兜底路径在调 fn()
+        之前已经 force_foreground 把微信压到 z 序最上——微信本身在前台时鼠标点击
+        不会落到覆盖层，这一步是多余的。补丁成 no-op 后，ensure_visible 的其余
+        步骤（bring_to_front / 渲染矩形刷新）照常保留。
+        """
+        try:
+            if getattr(gui, '_whale_no_minimize_patch', False):
+                return
+
+            def _no_minimize(*_a, **_k):
+                return 0
+
+            gui._minimize_blockers = _no_minimize
+            gui._whale_no_minimize_patch = True
+        except Exception as e:
+            G.log('禁用自动最小化补丁没打上（行为不变）：', repr(e))
 
     def _bg_hwnd(self):
         try:

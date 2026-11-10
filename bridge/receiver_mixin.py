@@ -105,7 +105,6 @@ class ReceiverMixin:
                         parts.append(buf.getvalue())
                     mime = 'image/jpeg'
                     G.log('长截图 %dx%d，切成 %d 段分别识别' % (w, h, len(parts)))
-                    mime = 'image/jpeg'
                 else:
                     img2 = img.convert('RGB')
                     buf = _io.BytesIO()
@@ -292,7 +291,8 @@ class ReceiverMixin:
                 content = '（对方发了一条语音，说的是：%s）' % said
             if mtype not in ('文本', '语音', '图片', '表情', '动画表情'):
                 if '移出群聊' in content or '移出' in content:
-                    self.dead_chats.add(username)
+                    # 确定性证据：永久拉黑（S3 的 dict 里用 inf 表示不到期）
+                    self.dead_chats[username] = float('inf')
                     G.log('被移出群聊，停掉这个会话：', self.display_name(username))
                     return
                 _low = content.lower()
