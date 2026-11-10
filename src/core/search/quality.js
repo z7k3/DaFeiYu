@@ -57,7 +57,7 @@ function relevanceScore(query, item) {
   // 长句暂不强行切实体，避免二字分词把自然问句误当成完整专名。
   const topics = cleanQuery(query).replace(/\bsite:[a-z0-9.-]+/gi, '')
     .replace(/B站|哔哩哔哩|微博|今日头条/gi, ' ')
-    .replace(/明天|后天|多少度|天气|气温|温度|预报|下雨|下雪|会不会|会|价格|报价|行情|热搜|热榜|新闻|更新|进度|发布|上市|机型|型号|机器|推荐|是什么|怎么样/g, ' ')
+    .replace(/明天|后天|多少度|天气|气温|温度|预报|下雨|下雪|会不会|会|价格|报价|行情|热搜|热榜|新闻|更新|进度|发布|上市|机型|型号|机器|推荐|是什么|怎么样|副歌|歌词|原文|全文|攻略|台词|诗文|含义|出处|背景|步骤|教程|怎么玩|怎么弄|怎么做|完整|一段/g, ' ')
     .match(/[\u4e00-\u9fa5]{2,}/g) || [];
   const anchors = topics.filter(x => x.length <= 4);
   if (!entities.length && anchors.length && !anchors.some(t => hay.includes(t) || (ALIASES[t] || []).some(a => hay.includes(a)))) return 0;

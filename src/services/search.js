@@ -4,9 +4,15 @@ const web = require('../adapters/websearch');
 const weather = require('../adapters/search/weather');
 const router = require('../adapters/searchRouter');
 const policy = require('../core/search/policy');
-const { effectiveMaxAgeDays } = require('../core/search/quality');
+const quality = require('../core/search/quality');
+const { effectiveMaxAgeDays } = quality;
 const { result, formatResult } = require('../core/search/result');
 const { remaining, errorInfo, report, searchError } = require('../adapters/search/transport');
+const links = require('../adapters/links');
+
+// 原文类查询：要的是「内容本身」（歌词/台词/攻略/步骤…），搜索摘要往往只剩
+// 歌名页/目录页，必须把结果页正文抓回来才算拿到东西。见 run() 里的补正文步骤。
+const ORIGINAL_TEXT_RE = /(歌词|副歌|台词|原文|全文|诗文|攻略|步骤|教程|说明书|玩法|怎么玩|怎么弄|怎么做)/;
 
 /** 单轮搜索的唯一入口；只返回证据，不读写会话存储或决定聊天回复。 */
 async function search({ text = '', history = [], llm, config = {}, now = new Date(), signal, trace } = {}, deps = {}) {
@@ -24,7 +30,8 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
   const finish = value => {
     if (completed) return completed;
     const out = { ...value, attempts: [...attempts, ...(value.attempts || [])], staleItems: [...staleItems, ...(value.staleItems || [])], elapsedMs: Date.now() - started };
-    out.text = formatResult(out);
+    // 默认 1400 字会截掉第 3 条以后的摘要；放宽到 3200，persona 侧有自己的截断兜底。
+    out.text = formatResult(out, { maxChars: 3200 });
     completed = out;
     say('complete', { status: out.status, reason: out.reason, selected: out.items.length, chars: out.text.length, elapsedMs: out.elapsedMs });
     return out;
@@ -65,7 +72,9 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
       try {
         route = await routeSearch(llm, text, { ...options(), now,
           history: typeof history === 'function' ? history() : history,
-          timeoutMs: Math.min(2000, options().timeoutMs) });
+          // 2 秒对自建/较慢的模型太苛刻（实测 75% 超时回退关键词规则，热梗问题
+          // 全被跳过）。3.5 秒内大部分路由能返回；总预算仍在 websearch.timeoutMs 内。
+          timeoutMs: Math.min(3500, options().timeoutMs) });
       } catch (err) { say('route_failed', errorInfo(err)); }
       attempts.push({ provider: 'router', status: route.failed ? 'failed' : 'ok', elapsedMs: Date.now() - routeStarted });
     }
@@ -110,6 +119,29 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
     if (policy.DOMAINS[intent.site]) q = q.replace(/\bsite:[a-z0-9.-]+/gi, '').trim() + ' site:' + policy.DOMAINS[intent.site];
     const value = await call('web', () => providers.searchResult(q, { ...options(), limit: 4,
       maxAgeDays: effectiveMaxAgeDays(`${text} ${q}`, intent.fresh, intent.timeRange) }));
+    // 原文类查询：搜索摘要经常只剩「歌名页/目录页」（用户看到的「都是链接没正文」就是
+    // 这个）。抓前两条非百科结果页的正文补进资料——复用读链接的 SSRF 防护和缓存；
+    // 死链/失效页的「正文」是站点提示语，必须剔除，不然反而污染资料。
+    if (value.status === 'ok' && value.items?.length && ORIGINAL_TEXT_RE.test(text + ' ' + q) && active()) {
+      const candidates = value.items.filter(it => it.provider !== 'baike' && it.provider !== 'page').slice(0, 2);
+      for (const top of candidates) {
+        const page = await locate('page-reader', () => links.describeLink(top.url,
+          { timeoutMs: Math.max(0, Math.min(6000, Math.floor(options().timeoutMs * 0.6))) }));
+        // 三道闸：站点失效提示 → 死链；正文不含查询关键词 → JS 渲染页抓到的页脚垃圾；
+        // 都过不了就不收，宁可只有摘要列表也不往资料里塞噪音。
+        const dead = page && page.ok
+          && /失效|已删除|被删除|不存在|查无此页|您访问的页面|找不到页面|404 Not Found/.test(page.article.slice(0, 120));
+        const relevant = page && page.ok && !dead
+          && page.article.length > 60
+          // 只给抓回来的正文打分（title 来自搜索结果，本来就含关键词，凑进去会放过页脚垃圾）。
+          && quality.relevanceScore(q, { title: '', snippet: page.article }) > 0;
+        if (relevant) {
+          value.items = [{ title: (page.title || top.title) + '（正文摘录）', url: page.url || top.url,
+            snippet: page.article, provider: 'page' }, ...value.items];
+          break;
+        }
+      }
+    }
     return finish(value);
   };
   let timer, abort;

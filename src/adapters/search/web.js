@@ -2,6 +2,7 @@
 
 const bing = require('./bing');
 const so360 = require('./so360');
+const baike = require('./baike');
 const { remaining, report, errorInfo } = require('./transport');
 const quality = require('../../core/search/quality');
 const { result } = require('../../core/search/result');
@@ -27,7 +28,7 @@ async function searchResult(query, opts = {}) {
     // 首源最多占大部分预算，给备用源留出机会；极短预算不再切成无意义的小请求。
     const timeoutMs = reserve && left > 100 ? Math.floor(left * 0.65) : left;
     try {
-      const parsed = await ({ bing, so360 }[provider]).search(term, { ...opts, deadline, timeoutMs });
+      const parsed = await ({ bing, so360, baike }[provider]).search(term, { ...opts, deadline, timeoutMs });
       const scoped = site ? parsed.filter(item => {
         const host = new URL(item.url).hostname.toLowerCase();
         return host === site.toLowerCase() || host.endsWith('.' + site.toLowerCase());
@@ -51,6 +52,10 @@ async function searchResult(query, opts = {}) {
       report(opts.trace, 'failed', { provider, ...info });
     }
   };
+  // 梗/流行语类查询：先直接抓百度百科词条摘要。热梗释义集中在百科，通用搜索
+  // 收录差且易被相关性过滤器整页拒掉；词条不存在时 baike 返回空数组，不影响
+  // 后面的 bing/360 主检索。限定 site: 的查询跳过（站点过滤会把百科结果全滤掉）。
+  if (!site && baike.MEME_RE.test(body)) await ask('baike', body, true);
   await ask('bing', q, true);
   const named = quality.modelNames(body).length || /\b(?:macbook|ipad|watch|airpods)\b/i.test(body);
   if (!site && !named && /(苹果|iphone|mac)/i.test(body) && /(最新|机器|机型|型号|出到|几代|发布)/.test(body)) {
@@ -67,6 +72,9 @@ async function searchResult(query, opts = {}) {
     }
   }
   if (valid().length < 2) await ask('so360', q);
+  // 通用兜底：bing/360 都没给够时，专名类查询往往在百度百科有词条（人物/作品/地名/产品/梗）。
+  // baike.search 自带清洗（去问句骨架），词条不存在返回空数组，不产生噪音。
+  if (valid().length < 2 && !site) await ask('baike', body);
   const split = quality.splitFreshness(q, quality.keepRelevant(body, all), opts);
   staleItems.push(...split.staleItems);
   const items = split.items.slice(0, Math.max(1, Math.min(10, Number(opts.limit) || 5)));
