@@ -207,6 +207,8 @@ class Store {
       role,
       ts: at,
     });
+    // 会话刚被删除/归档：这条不落库（调用方都对 null 容错，回复照常走）
+    if (!entry) return null;
     // 消息和去重 id 一起落盘：崩溃后重启不会把同一条再回一遍
     if (entry.msgId) this.markSeen(key, entry.msgId);
     episode.touchEpisode(chat, entry, { now: at });

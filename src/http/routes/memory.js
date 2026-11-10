@@ -49,7 +49,9 @@ module.exports = function register(router) {
       return json(res, 404, { ok: false, error: '该对话没有可清空的记忆，请刷新列表' });
     }
     // 回复结束前不能删：进行中的管线会继续追加带旧上下文的回复。
-    if (runtime.bot._handleChains.has(body.key)) {
+    // 守卫键必须用 Bot 的统一拼法（platform:g|u:chatId）：拿 chatId 裸值去查永远查不到，守卫形同虚设
+    const chainKey = typeof runtime.bot.chainKeyFor === 'function' ? runtime.bot.chainKeyFor(chat) : body.key;
+    if (runtime.bot._handleChains.has(chainKey)) {
       return json(res, 409, { ok: false, error: '该对话正在处理消息，请等回复结束后再清空' });
     }
     try {

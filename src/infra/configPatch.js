@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { loadConfig, DEFAULT_CONFIG } = require('./config');
+const { writeJsonAtomic } = require('./jsonFile');
 const configSchema = require('./configSchema');
 const { getByPath } = require('./objpath');
 
@@ -118,7 +119,8 @@ function clearSettingsShadow(runtime, paths) {
     }
   }
   if (cleared.length) {
-    try { fs.writeFileSync(file, JSON.stringify(cur, null, 2), 'utf8'); } catch { /* 写不了就算了 */ }
+    // settings.json 里可能有 Key，同样走原子写
+    try { writeJsonAtomic(file, cur, { spaces: 2 }); } catch { /* 写不了就算了 */ }
   }
   return cleared;
 }
@@ -213,8 +215,8 @@ function applyConfigPatch(runtime, patch) {
   }
   if (!changed.length) return { changed, cleared: [] };
   for (const [p, next] of pending) setByPath(raw, p, next);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+  // 原子写：保存到一半崩溃 / 断电不能把整份 config.json 变成坏 JSON（坏了会一路退回默认值）
+  writeJsonAtomic(file, raw, { spaces: 2, trailingNewline: true });
   const cleared = clearSettingsShadow(runtime, changed);
   reloadRuntimeConfig(runtime);
   runtime.stickerService?.reconcile();
@@ -340,7 +342,7 @@ function saveConfigPatch(config, patch) {
     setByPath(config, dotted, next);
   }
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+  writeJsonAtomic(file, raw, { spaces: 2, trailingNewline: true });
   return pending.map(([dotted]) => dotted);
 }
 

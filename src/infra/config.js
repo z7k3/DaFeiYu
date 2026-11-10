@@ -9,7 +9,7 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
-const { readJson } = require('./jsonFile');
+const { readJson, writeJsonAtomic } = require('./jsonFile');
 
 /**
  * 模型服务预设。needsKey 表示必须填 API Key；本地地址（localhost/内网）会自动免 Key。
@@ -490,7 +490,13 @@ function ensureConfigFile(root = projectRoot()) {
 }
 
 function loadSettings(cfg) {
-  return readJson(cfg.paths.settingsFile, {}) || {};
+  let value = readJson(cfg.paths.settingsFile, null);
+  // 主文件「存在但读不出来」（写坏 / 权限）时退回 .bak 镜像，别让所有 Key 直接消失；
+  // 主文件是被人为删掉（重置）时不退回，避免旧设置复活。
+  if (value === null && fs.existsSync(cfg.paths.settingsFile)) {
+    value = readJson(cfg.paths.settingsFile + '.bak', null);
+  }
+  return value || {};
 }
 
 function saveSettings(cfg, patch) {
@@ -519,7 +525,10 @@ function saveSettings(cfg, patch) {
   }
   next.keys = keys;
   fs.mkdirSync(cfg.paths.dataDir, { recursive: true });
-  fs.writeFileSync(cfg.paths.settingsFile, JSON.stringify(next, null, 2), 'utf8');
+  // 这个文件存着所有服务商的 Key：必须原子写（tmp+fsync+rename），写一半崩溃不能把 Key 全赔进去
+  writeJsonAtomic(cfg.paths.settingsFile, next, { spaces: 2 });
+  // 镜像一份（仿 reminders.json）：主文件万一损坏，至少还能从 .bak 把 Key 救回来
+  try { writeJsonAtomic(cfg.paths.settingsFile + '.bak', next, { spaces: 2 }); } catch { /* 备份失败不影响保存 */ }
   return next;
 }
 

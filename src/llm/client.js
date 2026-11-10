@@ -389,15 +389,19 @@ class DeepSeekClient {
     );
     // 调用方没指定就用「本模型当前天花板」：截断过的话它已经比配置值高
     const want = Number(maxTokens) || ceiling;
+    // 关不干净的模型（实测发了关思考参数仍 reasoning_tokens>0）：思考 token 计入
+    // max_tokens，显式预算必须加上实测的思考额度，否则 episode 抽取这类「1200 预算」
+    // 的后台任务会被思考吃光 → 空响应 → 重试同样空 → 退回规则兜底。
+    const reserve = caps && caps.offThinks ? Math.max(Number(caps.offReasoningTokens) || 1200, 1) : 0;
     // 跑飞重试：给足预算，别再因为 320 token 把话截断（旧行为）
-    if (safe) return Math.min(Math.max(want, 900), 2000);
+    if (safe) return Math.min(Math.max(want, 900) + reserve, 3200);
     // gpt-5 / O 系关不干净：无视开关，按 thinkingMaxTokens 给
     if (plan && plan.canDisable === false) return Number(this.thinkingMaxTokens) || 5000;
     // 后台任务（episode 抽取）：不走聊天那套 700 夹取，但也不能无限给
-    if (allowOverflow) return Math.min(Math.max(0, want), 6000);
+    if (allowOverflow) return Math.min(want + reserve, 6000);
     // 关不干净的老实模型（实测关思考后 reasoning_tokens 仍 > 0）：后续直接按思考给预算
     if (modeOn || (caps && caps.offThinks)) {
-      return Math.min(Math.max(want, Number(this.chatThinkingTokens) || 2000), 6000);
+      return Math.min(Math.max(want, Number(this.chatThinkingTokens) || 2000) + reserve, 6000);
     }
     return Math.min(want, Math.max(700, ceiling));
   }
@@ -495,6 +499,42 @@ class DeepSeekClient {
       this.logger && this.logger.warn('[llm] 切换备用服务商失败：' + describeError(err));
     }
     return null;
+  }
+
+  /**
+   * 总超时信号：把「调用方 signal」和「整次调用的硬上限」合成一个 AbortSignal。
+   *
+   * 只有 req.setTimeout（socket 空闲超时）时，对端每 40 秒滴一个字节就能把请求无限拖住，
+   * 上层还会按会话排队 → 一个挂起的回复堵死整个会话。这里保证 complete/stream 一定在
+   * 有限时间内结束：complete 上限 min(2×timeoutMs, 120s)，stream 放宽到 min(2×timeoutMs, 180s)。
+   */
+  _deadlineSignal(signal, kind = 'complete') {
+    const controller = new AbortController();
+    const state = { timedOut: false, timer: null, onOuter: null, disposed: false };
+    const base = Number(this.timeoutMs) || 45000;
+    const cap = kind === 'stream' ? 180000 : 120000;
+    const totalMs = Math.min(base * 2, cap);
+    state.timer = setTimeout(() => {
+      state.timedOut = true;
+      controller.abort();
+    }, totalMs);
+    if (state.timer.unref) state.timer.unref();
+    if (signal) {
+      state.onOuter = () => controller.abort();
+      if (signal.aborted) controller.abort();
+      else signal.addEventListener('abort', state.onOuter, { once: true });
+    }
+    return {
+      signal: controller.signal,
+      totalMs,
+      get timedOut() { return state.timedOut; },
+      dispose() {
+        if (state.disposed) return;
+        state.disposed = true;
+        clearTimeout(state.timer);
+        if (signal && state.onOuter) signal.removeEventListener('abort', state.onOuter);
+      },
+    };
   }
 
   endpoint() {
@@ -680,6 +720,7 @@ class DeepSeekClient {
   async _readAll(res, { signal } = {}) {
     return new Promise((resolve, reject) => {
       const chunks = [];
+      let size = 0;   // 累计长度：别在每个 data 事件里把全部 chunks reduce 一遍（O(n²)）
       const finish = (err, value) => {
         if (signal) signal.removeEventListener('abort', abort);
         if (err) reject(err); else resolve(value);
@@ -689,8 +730,9 @@ class DeepSeekClient {
         res.destroy();
       };
       res.on('data', (c) => {
+        size += c.length;
         chunks.push(c);
-        if (chunks.reduce((n, b) => n + b.length, 0) > 1024 * 1024) {
+        if (size > 1024 * 1024) {
           finish(new LlmError(FRIENDLY.default, { code: 'too_large', detail: 'response too large' }));
           res.destroy();
         }
@@ -742,6 +784,10 @@ class DeepSeekClient {
    */
   async complete({ system, turns, maxTokens, signal, thinking, allowOverflow = false } = {}) {
     this.lastUsage = null;
+    // 总超时兜底：把合成信号重新赋给 signal，方法体内 _open/_readAll/sleep 的用法不用动
+    const deadline = this._deadlineSignal(signal, 'complete');
+    signal = deadline.signal;
+    try {
     let lastErr = null;
     let sawDegenerate = false;
     const plan = this.thinkingPlan();
@@ -856,7 +902,12 @@ class DeepSeekClient {
           );
         return truncated ? cutToSentence(text) : text;
       } catch (err) {
-        if (signal && signal.aborted) throw new LlmError('aborted', { code: 'aborted' });
+        if (signal && signal.aborted) {
+          // 总超时（不是调用方主动取消）报成可识别的 timeout，别把「aborted」当文案发给用户
+          throw deadline.timedOut
+            ? new LlmError(FRIENDLY.timeout, { code: 'timeout', detail: 'total timeout ' + deadline.totalMs + 'ms', retryable: false })
+            : new LlmError('aborted', { code: 'aborted' });
+        }
         lastErr = err;
         const llmErr = err instanceof LlmError ? err : new LlmError(FRIENDLY.default, { detail: String(err && err.message) });
         // 参数被拒（400/422 且提示里带 max_tokens / thinking / temperature…）：
@@ -885,6 +936,9 @@ class DeepSeekClient {
     }
     if (lastErr) throw lastErr;
     throw new LlmError(FRIENDLY.empty, { code: 'empty' });
+    } finally {
+      deadline.dispose();
+    }
   }
 
   /**
@@ -973,9 +1027,21 @@ class DeepSeekClient {
    */
   async *stream({ system, turns, signal }) {
     this.lastUsage = null;
+    // 总超时兜底（流式放宽到 180s）：合成信号重新赋给 signal，_open/_errorFrom 用法不变
+    const deadline = this._deadlineSignal(signal, 'stream');
+    signal = deadline.signal;
     const payload = this.buildPayload({ system, turns, stream: true });
-    const { req, res } = await this._open(payload, { signal, stream: true });
-    if (res.statusCode !== 200) throw await this._errorFrom(res);
+    let req; let res;
+    try {
+      ({ req, res } = await this._open(payload, { signal, stream: true }));
+      if (res.statusCode !== 200) throw await this._errorFrom(res, { signal });
+    } catch (err) {
+      // 等响应头阶段就被总超时打断：报 timeout，别让 LlmError('aborted') 冒给用户
+      if (deadline.timedOut) {
+        throw new LlmError(FRIENDLY.timeout, { code: 'timeout', detail: 'stream total timeout ' + deadline.totalMs + 'ms', retryable: false });
+      }
+      throw err;
+    }
     res.setEncoding('utf8');
     let buffer = '';
     let sent = 0;
@@ -1020,10 +1086,15 @@ class DeepSeekClient {
         }
       }
     } catch (err) {
+      // 中途断流也要区分：总超时抛 timeout（可识别），调用方主动取消静默返回
+      if (deadline.timedOut) {
+        throw new LlmError(FRIENDLY.timeout, { code: 'timeout', detail: 'stream total timeout ' + deadline.totalMs + 'ms', retryable: false });
+      }
       if (err instanceof LlmError) throw err;
       if (signal && signal.aborted) return;
       throw new LlmError(FRIENDLY.network, { code: 'network', detail: 'stream error: ' + (err && err.message) });
     } finally {
+      deadline.dispose();
       try { req.destroy(); } catch { /* ignore */ }
       try { res.destroy(); } catch { /* ignore */ }
     }

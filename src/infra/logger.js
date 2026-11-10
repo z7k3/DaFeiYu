@@ -32,6 +32,14 @@ const COLORS = {
 const MAX_FILE_BYTES = 10 * 1024 * 1024;   // 单文件 10MB + 一个 .1 备份
 const ROTATE_CHECK_MS = 60 * 1000;
 
+// 时间戳 formatter 模块级缓存：Intl.DateTimeFormat 构造不便宜，
+// 以前每打一行日志 new 一个，debug 全量落盘时是白烧的 CPU
+const TS_FORMAT = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: 'Asia/Shanghai', hour12: false,
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+});
+
 /** 栈帧 → { file, line }：兼容 `at fn (E:\a\b.js:12:3)` 和 `at E:\a\b.js:12:3` */
 function parseFrame(frame) {
   let s = frame.trim();
@@ -119,7 +127,7 @@ function createLogger({ level = 'info', fileLevel = 'debug', file = null, tag = 
     const toFile = !!stream && n >= fileThreshold;
     if (!toConsole && !toFile) return;
 
-    const ts = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date());
+    const ts = TS_FORMAT.format(new Date());
     // 不省略：对象展开到任意深度、长字符串不截断，否则出错时看不到真正的现场。
     const text = args
       .map((a) => (typeof a === 'string' ? a : util.inspect(a, {

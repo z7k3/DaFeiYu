@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { loadSettings, saveSettings } = require('./config');
+const { writeJsonAtomic } = require('./jsonFile');
 
 /**
  * 称呼迁移：老版本存在 settings.userName，新版本只认 config.json 的 persona.ownerName。
@@ -25,8 +26,7 @@ function migrateOwnerName(config) {
       } catch { raw = {}; }
       if (!raw.persona) raw.persona = {};
       raw.persona.ownerName = fromSettings;
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+      writeJsonAtomic(file, raw, { spaces: 2, trailingNewline: true });
       // 只迁移一次：搬完就把老字段清掉，否则以后把称呼改回「主人」重启又会被它盖回去
       try { saveSettings(config, { userName: '' }); } catch { /* 清不掉也没关系 */ }
     } catch { /* 写不了就只改内存，不至于启动失败 */ }

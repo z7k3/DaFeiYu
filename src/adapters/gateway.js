@@ -1,6 +1,7 @@
 'use strict';
 
 const { sendDenial } = require('../core/wechatSendPolicy');
+const { safeEqual } = require('../http/security');
 
 /**
  * 通用 HTTP 网关适配器：把微信/抖音中转服务发来的 JSON 变成统一消息，
@@ -173,7 +174,8 @@ class Gateway {
       ? new URL(req.url, 'http://localhost').searchParams.get('token')
       : null;
     const fromBody = body && (body.token || body.verify_token || body.signature);
-    return [header, query, fromBody].some((v) => String(v || '') === expected);
+    // 恒定时间比较：开 allowRemote 暴露到公网时，别让人靠响应时间逐位猜 token
+    return [header, query, fromBody].some((v) => safeEqual(String(v || ''), expected));
   }
 
   async handleInbound(payload, { local = false } = {}) {
@@ -193,7 +195,17 @@ class Gateway {
         `[${this.platform}] 收到 ${msg.chatType === 'group' ? '群' : '私聊'}消息 ${msg.senderName}（${String(msg.text).length} 字）`
       );
     const localWechat = local && this.platform === 'wechat';
-    const result = await this.bot.handle(msg, { localWechat });
+    let result;
+    try {
+      result = await this.bot.handle(msg, { localWechat });
+    } catch (err) {
+      // 管线深处抛错（不是正常的 ignore/llm_error）也要给桥接一个明确交代，
+      // 不能让异常裸穿到路由层变成无日志的 500
+      this.stats.failed += 1;
+      this.stats.lastError = (err && err.message) || String(err);
+      this.logger && this.logger.error('[' + this.platform + '] 处理消息失败：' + ((err && err.stack) || err));
+      throw Object.assign(new Error('处理消息失败，这条回复没能生成交付'), { statusCode: 500 });
+    }
     if (result.action !== 'reply' || !result.reply) {
       return { ok: true, action: 'ignore', reason: result.reason || 'ignored' };
     }

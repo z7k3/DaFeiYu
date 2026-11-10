@@ -140,7 +140,11 @@ function printBanner(runtime, url) {
     '  ────────────────────────────────────────────',
     `  运行模式：   ${llm.isMock ? '演示模式（还没配置模型，用内置台词）' : `${llm.providerLabel} · ${llm.model}`}`,
     `  模型服务：   ${llm.providerLabel}${llm.needsKey ? (llm.apiKey ? '（Key 已配置）' : '（未填 Key）') : '（本地/免 Key）'}`,
-    `  记忆文件：   ${config.paths.storeFile}`,
+    // 记忆 v2 的数据实际在 data/memory/：store.json 只是旧版残留文件，
+    // 它不存在时别再显示一个不存在的路径骗人
+    fs.existsSync(config.paths.storeFile)
+      ? `  记忆文件：   ${config.paths.storeFile}`
+      : `  记忆目录：   ${path.join(path.dirname(config.paths.storeFile), 'memory')}`,
     `  回复发送：   ${replyChannelLabel(config)}`,
     `  接入微信：   POST ${url}/webhook/wechat   （见 docs/接入微信.md）`,
     `  接入抖音：   POST ${url}/webhook/douyin   （见 docs/接入抖音.md）`,

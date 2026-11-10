@@ -19,7 +19,7 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
-const { readJson } = require('../infra/jsonFile');
+const { readJson, writeJsonAtomic } = require('../infra/jsonFile');
 const { chatHash, personHash } = require('./hash');
 const { LIMITS, DAY_MS } = require('./constants');
 const { estimateTokens, messageTokens } = require('./tokens');
@@ -29,11 +29,25 @@ const relations = require('./relations');
 const META_SAVE_DEBOUNCE_MS = 400;
 const MESSAGE_FSYNC_EVERY = 1;
 
-function writeJsonAtomic(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value), 'utf8');
-  fs.renameSync(tmp, file);
+/* writeJsonAtomic 统一收口到 infra/jsonFile.js（tmp 写入 + fsync + rename）：
+ * 旧的本地实现没有 fsync，断电时 rename 可能先于数据块落盘，meta/summary 变成 0 字节。
+ * 文件内容格式与旧实现逐字节一致（无缩进、无换行），迁移类调用方无感。 */
+
+/** 递归删掉目录树里名字以 .tmp 结尾的普通文件（writeJsonAtomic / _rewriteMessages 崩溃残留） */
+function cleanupTmpFiles(dir) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const ent of entries) {
+    const full = path.join(dir, ent.name);
+    if (ent.isDirectory()) cleanupTmpFiles(full);
+    else if (ent.isFile() && ent.name.endsWith('.tmp')) {
+      try { fs.unlinkSync(full); } catch { /* 删不掉下次启动再清 */ }
+    }
+  }
 }
 
 function padSeq(seq) {
@@ -105,6 +119,9 @@ class ChatStore {
 
   init() {
     fs.mkdirSync(this.chatRoot, { recursive: true });
+    // 启动清残留：writeJsonAtomic / _rewriteMessages 崩溃时会留下 *.tmp，
+    // rename 之后它们就是垃圾，不清会越攒越多（只动 memory 目录树内的 .tmp 文件）
+    cleanupTmpFiles(this.dir);
     this.manifest = readJson(path.join(this.dir, 'manifest.json'));
     if (!this.manifest || Number(this.manifest.version) !== 2) {
       this.manifest = {
@@ -360,6 +377,8 @@ class ChatStore {
   /* ------------------------------ 原文 ------------------------------ */
 
   appendMessage(chat, message) {
+    // 会话刚被删除/归档：飞行中的回复不能把已删目录重建回来（与 saveCard 等守卫对齐）
+    if (chat.deleted) return null;
     const at = Number(message.ts) || this.now();
     const seq = chat.meta.nextSeq;
     chat.meta.nextSeq += 1;
@@ -655,6 +674,12 @@ class ChatStore {
       if (chat.meta.importedAt && now - chat.meta.importedAt < 7 * DAY_MS) continue;
       if (now - chat.lastActiveAt < LIMITS.chatArchiveIdleDays * DAY_MS) continue;
       this._closeFd(chat);
+      // 和 deleteChat 同款三件套：清掉防抖定时器、标记 deleted，
+      // 否则飞行中的 _flushMeta / 后台压缩任务会把已归档目录在旧路径重建出来（幽灵会话）
+      const pendingTimer = this._saveTimers.get(chat.chatId);
+      if (pendingTimer) clearTimeout(pendingTimer);
+      this._saveTimers.delete(chat.chatId);
+      chat.deleted = true;
       const target = path.join(this.dir, 'archive', chat.hash);
       try {
         fs.mkdirSync(path.dirname(target), { recursive: true });
