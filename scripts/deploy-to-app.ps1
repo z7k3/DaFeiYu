@@ -1,4 +1,4 @@
-# deploy-to-app.ps1 —— 把本仓库的程序文件同步到鲸鲸 APP 目录。
+﻿# deploy-to-app.ps1 —— 把本仓库的程序文件同步到鲸鲸 APP 目录。
 # 用法：powershell -NoProfile -ExecutionPolicy Bypass -File scripts\deploy-to-app.ps1 [-App 'D:\WhaleGirl\WhaleGirl'] [-BackupData]
 # 只覆盖程序文件（src/bridge/examples/server.js/assets），data/ 与 runtime/ 永远不碰；
 # -BackupData 会先把 config.json + data/memory + data/kb 快照到 data-backup-<时间戳>。
