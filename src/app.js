@@ -25,6 +25,7 @@ const { StickerService } = require('./services/stickerService');
 const stickersAdapter = require('./adapters/stickers');
 const probe = require('./infra/probe');
 const { ContactsCache } = require('./services/contacts');
+const kbStore = require('./kb/store');
 const { ReminderService } = require('./services/reminderService');
 const locationProbe = require('./services/location');
 
@@ -130,6 +131,17 @@ function createRuntime({ root = path.resolve(__dirname, '..'), env = process.env
     raw: Boolean(config.log && config.log.traceRaw !== false),
   });
   runtime.trace = trace;
+  // 知识库：主人/群友教的条目 + 自喂文档（data/kb/），检索结果由管线注入提示词，
+  // 可信度高于自动记忆和联网资料；管理路由在 /api/kb/*。
+  try {
+    const kbStats = kbStore.init({ root, logger: child('kb') });
+    runtime.kb = kbStore;
+    if (kbStats.chunks || kbStats.global || kbStats.personEntries) {
+      logger.info('知识库已加载：' + JSON.stringify(kbStats));
+    }
+  } catch (err) {
+    logger.warn('知识库初始化失败（不影响聊天）：' + describeError(err));
+  }
   runtime.bot = new Bot({ config, store, llm: runtime.llm, logger: child('pipeline'), trace, version: VERSION });
   // 本机所在地：后台探一次（Windows 定位服务优先，挂 VPN 也准），之后定期刷新。
   // 只放在内存里，给 <env> 块用；关掉 features.envContext 或 env.autoDetect=false 就完全不动。

@@ -6,6 +6,7 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const { writeJsonAtomic } = require('../infra/jsonFile');
 
 const FILE_NAME = 'persona.json';
 
@@ -134,8 +135,8 @@ function save(config, patch) {
     const forFile = { ...forApply };
     for (const [k, v] of Object.entries(forFile)) if (v === '') delete forFile[k];
     try {
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, JSON.stringify(forFile, null, 2), 'utf8');
+      // 原子写：主人正在微信里调语态时进程被杀，不能把 persona.json 写成半截
+      writeJsonAtomic(file, forFile, { spaces: 2 });
     } catch {
       /* 测试环境可能没有目录权限，忽略 */
     }

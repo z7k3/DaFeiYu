@@ -1,0 +1,6 @@
+﻿- infra/jsonFile：新增 writeJsonAtomic（tmp+fsync+rename）并统一接入 saveSettings(+.bak)/configPatch/persona/ownerName
+- pipeline/chat + routes/memory：记忆重置守卫改用 chainKeyFor 统一键（原守卫永不生效）；chatStore.appendMessage 检查 deleted；archiveIdle 补三件套
+- llm/client：LLM 总超时（complete 120s/stream 180s 封顶）+ 关思考不干净的模型自动加思考预算余量（思考吃满预算修复）
+- adapters/gateway：verifyToken 恒定时间比较；bot.handle 外层兜底
+- pipeline/chat：finalize 调用点降级保底；_masterWarned 上限
+- server.js：banner 记忆路径显示实际目录；infra/logger 格式器缓存

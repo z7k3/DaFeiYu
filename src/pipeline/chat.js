@@ -23,6 +23,7 @@ const features = require('../infra/features');
 const { matchMaster, isVerifiedOwner } = require('../core/master');
 const links = require('../adapters/links');
 const searchService = require('../services/search');
+const kbStore = require('../kb/store');
 const { LlmError } = require('../llm/client');
 const { describeError } = require('../infra/errors');
 const { saveSettings } = require('../infra/config');
@@ -166,9 +167,87 @@ class Bot {
     };
   }
 
+  /** 统一的会话队列键：platform:g|u:chatId（可传 chatStore 的会话对象或同形消息） */
+  chainKeyFor(chat) {
+    if (!chat) return '';
+    const type = chat.chatType === 'group' ? 'g' : 'u';
+    return chat.platform + ':' + type + ':' + chat.chatId;
+  }
+
   sessionKey(msg) {
-    const type = msg.chatType === 'group' ? 'g' : 'u';
-    return `${msg.platform}:${type}:${msg.chatId}`;
+    // 拼法只此一处：handle() 的串行链、HTTP 的「回复中不许清空」守卫都必须走 chainKeyFor，
+    // 各写各的早晚会再错位（routes/memory.js 就拿 chatId 查过带平台前缀的键，守卫全程失效）
+    return this.chainKeyFor({ platform: msg.platform, chatType: msg.chatType, chatId: msg.chatId });
+  }
+
+  /**
+   * 主人/群友在微信里直接教她：写知识库（分层与配额见 src/kb/store.js）。
+   * 主人 → 全局条目（设定/规则）；群友 → 只能写「关于他自己」的条目（防污染）。
+   * 高精度触发（显式「记住：」/称呼指令/遗忘指令），普通聊天不会被误当成教学。
+   * 不在触发范围内的消息原样返回 null，交给后面的正常流程。
+   */
+  tryTeach({ msg, clean, key, atMe }) {
+    const text = String((clean && clean.text) || '').trim();
+    const uid = String(msg.senderId || '').trim();
+    if (!text || !uid) return null;
+    const isMaster = msg.isMaster === true;
+    const by = isMaster ? 'master' : uid;
+
+    // 遗忘：「忘掉：X」——主人删全局，群里删自己的
+    const forget = text.match(/^(?:忘掉|忘了|别记了|删掉)[：:]\s*(.{1,80})$/);
+    if (forget) {
+      const content = forget[1].trim();
+      let removed = isMaster ? (kbStore.masterForget({ scope: 'global', text: content }).removed || 0) : 0;
+      removed += kbStore.forget({ uid, text: content }).removed || 0;
+      return { action: 'reply', key, msg, atMe, canned: removed ? `好，忘掉了 ${removed} 条。` : '我本来就没记住这条啊。', reason: 'kb_forget' };
+    }
+
+    // 称呼负向：「别再叫我宝贝」
+    const dontCall = text.match(/^(?:以后)?(?:不要|别)(?:再)?(?:叫我|称呼我|喊我)(.{1,20})$/);
+    if (dontCall) {
+      const word = dontCall[1].replace(/[。.!！~～\s]+$/g, '').trim();
+      if (!word) return null;
+      kbStore.forget({ uid, text: word });
+      kbStore.teach({ scope: 'person', uid, text: `不希望被称为「${word}」，也别主动提起这件事`, by });
+      return { action: 'reply', key, msg, atMe, canned: '知道了，不这么叫你了。', reason: 'kb_teach' };
+    }
+
+    // 称呼正向：「以后叫我抚琴」——写知识库 + 同步人物卡，下一句就生效
+    const callMe = text.match(/^(?:以后|以后请|请|都)?(?:要)?(?:叫我|称呼我|喊我)(.{1,20})$/);
+    if (callMe) {
+      const word = callMe[1].replace(/[。.!！~～\s]+$/g, '').trim();
+      if (!word) return null;
+      const out = kbStore.teach({ scope: 'person', uid, text: `希望被称呼为「${word}」`, by });
+      if (!out.ok) return { action: 'reply', key, msg, atMe, canned: '你教我的东西太多了，先忘掉几条再来。', reason: 'kb_teach' };
+      this.syncCardNickname(key, uid, word);
+      return { action: 'reply', key, msg, atMe, canned: `行，以后叫你${word}。`, reason: 'kb_teach' };
+    }
+
+    // 显式记忆：「记住：X」——主人写全局（设定/规则），群友写自己的
+    const remember = text.match(/^记住[：:](.{1,280})$/);
+    if (remember) {
+      const content = remember[1].trim();
+      const out = isMaster
+        ? kbStore.teach({ scope: 'global', text: content, by: 'master' })
+        : kbStore.teach({ scope: 'person', uid, text: content, by });
+      if (!out.ok) {
+        if (out.reason === 'too_long') return { action: 'reply', key, msg, atMe, canned: '这条太长了，挑重点说。', reason: 'kb_teach' };
+        return { action: 'reply', key, msg, atMe, canned: '我脑子里已经塞满了，先删几条再来教我。', reason: 'kb_teach' };
+      }
+      return { action: 'reply', key, msg, atMe, canned: (out.action === 'updated' ? '更新了：' : '记下了：') + content, reason: 'kb_teach' };
+    }
+    return null;
+  }
+
+  /** 称呼类教学同步人物卡：displayNames 优先用 profile.nickname，下一句就生效。 */
+  syncCardNickname(key, uid, nickname) {
+    try {
+      const chat = this.store.chatStore.chats.get(key);
+      if (!chat || chat.deleted) return;
+      const card = this.store.chatStore.getCard(chat, uid) || this.store.chatStore.ensurePerson(chat, uid, '');
+      card.nickname = String(nickname).slice(0, 60);
+      this.store.chatStore.saveCard(chat, card);
+    } catch { /* 卡写不进不影响教学回执 */ }
   }
 
   /**
@@ -549,6 +628,8 @@ class Bot {
     if (!isMaster && msg.platform === 'wechat' && masterHit.nameHit) {
       const sid = String(msg.senderId || '(没有 id)');
       this._masterWarned = this._masterWarned || new Set();
+      // 上限保护：长期运行时按 senderId 无限累积；超 200 条清空重来（代价只是每个 id 再提醒一次）
+      if (this._masterWarned.size > 200) this._masterWarned.clear();
       if (!this._masterWarned.has(sid) && this.logger) {
         this._masterWarned.add(sid);
         this.logger.warn(
@@ -565,6 +646,9 @@ class Bot {
     // 放在最前面：群里没 @ 她也要能设，且不能被后面的静默/忽略逻辑挡掉。
     // 回填的旧问题（recycled）不再登记一遍，否则只 @ 一下就多出一条重复提醒（M27）。
     if (hasText && !msg.recycled) {
+      // 先于提醒和搜索：教学是写操作，命中就不该再走联网或普通回复
+      const teachReply = this.tryTeach({ msg, clean, key, atMe });
+      if (teachReply) return teachReply;
       const reminderReply = await this.tryReminder({ msg, clean, key, now, nowMs, isGroup, atMe });
       if (reminderReply) return reminderReply;
     }
@@ -742,6 +826,13 @@ class Bot {
       }
     }
 
+    // 知识库检索：<1ms 的本地 BM25 查询，每条消息都跑，命中才注入（原文件/教学条目）。
+    if (hasText) {
+      try {
+        const kbRes = kbStore.query(clean.text, { uid: msg.senderId, k: 3 });
+        msg.kbEntries = (kbRes.person.length || kbRes.global.length || kbRes.docs.length) ? kbRes : null;
+      } catch { msg.kbEntries = null; }
+    } else msg.kbEntries = null;
     // 群聊触发判定后再并行获取链接和搜索资料，避免无关消息消耗网络预算。
     const linkUrls = (this.config.links && this.config.links.enabled === false)
       ? [] : links.extractUrls(clean.text || '');
@@ -1854,7 +1945,14 @@ class Bot {
       return { action: 'ignore', reason: decision.reason };
     }
     if (decision.action === 'command') {
-      const bubbles = this.finalize(decision, decision.text);
+      // 收尾抛错不能把已经生成的回复整个丢掉（异常会穿透到网关变 500）
+      let bubbles;
+      try {
+        bubbles = this.finalize(decision, decision.text);
+      } catch (err) {
+        this.logger && this.logger.error('命令收尾失败（照常回复原文）：' + describeError(err));
+        bubbles = [String(decision.text || '').slice(0, 200)];
+      }
       return { action: 'reply', reply: decision.text, bubbles, reason: 'command', commandType: decision.commandType };
     }
     // 私聊的直接请求由程序处理，避免模型漏写标记或误报已送达。
@@ -1959,7 +2057,15 @@ class Bot {
     }
     text = String(text == null ? '' : text).trim();
     this.recordUsage(decision, this.usageSince(usageMark));
-    const bubbles = this.finalize(decision, text);
+    // 模型的钱已经花了：收尾（拆气泡/剥表情标记/落库）抛错时降级成原文单条，绝不能变 500
+    let bubbles;
+    try {
+      bubbles = this.finalize(decision, text);
+    } catch (err) {
+      this.logger && this.logger.error('回复收尾失败（降级为原文单条）：' + describeError(err));
+      decision.finalText = text;
+      bubbles = text ? [String(text).slice(0, 200)] : [];
+    }
     if (!bubbles.length) return { action: 'ignore', reason: 'empty_reply' };
     // 群里骂人时要真 @ 到对方：优先用靶子，其次看正文开头有没有 @名字
     const finalText = decision.finalText || text;

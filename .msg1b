@@ -1,0 +1,6 @@
+﻿- bridge/instance_lock.py：新增单实例锁三分法（WSL2 镜像网络保留端口段导致 bind 必败的修复）
+- send_state：新增 touch() 进度心跳与 ensure_budget()；window_mixin：置顶窗口记录供 hard_exit 还原
+- sender_mixin：零焦点通道预算抬升、快速失败、dead_chats 10 分钟 TTL、open_chat 连败记账
+- loop_mixin：care 目标名称回退 display_name + 6 小时冷却；心跳 payload 组装兜底必发
+- app.py：hang 日志只在真卡死时转储一次，>5MB 启动截断
+- engine.py：hard_exit 统一出口（还原 SPI_SETSCREENREADER）；bridge 目录其余小修
