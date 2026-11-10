@@ -317,10 +317,14 @@ class AccountMixin:
     def new_window_driver(self):
         hwnd = int(self.ACCOUNT.get('hwnd') or 0) if self.ACCOUNT.get('verified') else 0
         if hwnd:
-            return self.WeChatGUI(hwnd=hwnd)
+            gui = self.WeChatGUI(hwnd=hwnd)
+            self.install_no_minimize(gui)
+            return gui
         if getattr(self, 'acct', ''):
             raise RuntimeError('尚未确认已选微信账号的窗口')
-        return self.WeChatGUI()
+        gui = self.WeChatGUI()
+        self.install_no_minimize(gui)
+        return gui
 
     def selected_window_ready(self):
         if not getattr(self, 'acct', ''):
