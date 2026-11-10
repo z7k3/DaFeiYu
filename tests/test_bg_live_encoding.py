@@ -1,0 +1,283 @@
+"""模拟同一微信窗口运行时切换编码；绝不接触真实微信或输入设备。"""
+import os
+import sys
+import unittest
+import tempfile
+import ast
+import time
+from types import SimpleNamespace
+from contextlib import nullcontext
+from unittest.mock import patch, Mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from bridge import bg_sender as bg
+
+
+class LiveEncodingTests(unittest.TestCase):
+    def setUp(self):
+        self.state = dict(text='', actual='gbk', chat='测试群', sent=[], modes=[], clears=0,
+                          unreadable=False, never_matches=False, clear_ok=True, switch_on_clear=False,
+                          drop_linebreaks=False, short_first=False, stale_reads=0, replace_while_reading=False,
+                          probes=[], input_tick=123, foreground=4242, manual_draft=False,
+                          other_app_input=False, raise_on_clear=False, switch_on_send=False)
+        state = self.state
+
+        class Sender:
+            def __init__(self, hwnd):
+                self.hwnd = hwnd
+
+            def type_text(self, text, char_gap=0, strip_unencodable=True, mode='gbk'):
+                (state['probes'] if text == '鲸' else state['modes']).append(mode)
+                skipped = []
+                if mode == 'gbk':
+                    payload, skipped = bg.encode_gbk(text, strip_unencodable)
+                    if payload is None:
+                        return False, skipped
+                    text = payload.decode('gbk')
+                state['text'] = text if mode == state['actual'] and not state['never_matches'] else '¾¨乱码'
+                if state['drop_linebreaks']:
+                    state['text'] = state['text'].replace('\r', '').replace('\n', '')
+                if text != '鲸' and state['short_first'] and len(state['modes']) == 1:
+                    state['text'] = state['text'][:-1]
+                if state['manual_draft']:
+                    state['text'] = '用户刚输入的草稿'
+                    state['input_tick'] += 1
+                if state['other_app_input']:
+                    state['input_tick'] += 1
+                return True, skipped
+
+            def end_input(self):
+                pass
+
+            def click_screen(self, *xy):
+                state['sent'].append(state['text'])
+                state['text'] = ''
+                if state['switch_on_send']:
+                    state['chat'] = '另一个群'
+
+        def read(hwnd):
+            value = None if state['unreadable'] and state['modes'] else state['text']
+            if state['modes'] and state['stale_reads']:
+                state['stale_reads'] -= 1
+                value = ''
+            if state['modes'] and state['replace_while_reading']:
+                state['text'] += '手动输入'
+            return dict(nodes=[1] * 200, edit=object(), value=value, send_xy=(1, 2), chat=state['chat'])
+
+        def clear(*args):
+            if state['raise_on_clear']:
+                raise RuntimeError('UIA 控件断开')
+            state['clears'] += 1
+            if state['clear_ok']:
+                state['text'] = ''
+            if state['switch_on_clear']:
+                state['chat'] = '另一个群'
+            return state['clear_ok']
+
+        for name, replacement in [
+            ('user32', Mock(IsIconic=lambda h: False, GetForegroundWindow=lambda: state['foreground'])),
+            ('WeChatSender', Sender),
+            ('read_ui', read), ('_ensure_tree', lambda *a, **k: read(1)),
+            ('open_chat', lambda *a, **k: True), ('_WriteGuard', nullcontext),
+            ('_clear_composer', clear), ('_detect_char_mode_by_version', lambda h=0: 'utf16'),
+            ('_last_input_tick', lambda: state['input_tick']),
+        ]:
+            p = patch.object(bg, name, replacement)
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch.object(bg.time, 'sleep', lambda _: None)
+        p.start()
+        self.addCleanup(p.stop)
+        bg._DETECTED_MODES.clear()
+        bg._CONFIGURED_MODES.clear()
+        p = patch.object(bg, '_MODE_STATE_FILE', None)
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.object(bg, '_LAST_MODE_STATE', '')
+        p.start()
+        self.addCleanup(p.stop)
+        bg._DETECT_DIRTY.clear()
+        self.addCleanup(bg._DETECTED_MODES.clear)
+        self.addCleanup(bg._CONFIGURED_MODES.clear)
+
+    def send(self, **kwargs):
+        return bg.send('鲸鲸测试', chat='测试群', hwnd=4242, **kwargs)
+
+    def test_hot_switch_both_directions_uses_content_and_updates_cache(self):
+        self.assertEqual(self.send(), (True, 'sent'))
+        self.assertEqual(self.state['modes'], ['utf16', 'gbk'])
+        self.assertEqual(self.state['sent'], ['鲸鲸测试'])
+        self.assertEqual(bg._DETECTED_MODES[4242], 'gbk')
+        self.state['actual'] = 'utf16'
+        self.state['modes'].clear()
+        self.assertEqual(self.send(), (True, 'sent'))
+        self.assertEqual(self.state['modes'], ['gbk', 'utf16'])
+        self.assertEqual(self.state['sent'], ['鲸鲸测试', '鲸鲸测试'])
+        self.assertEqual(bg._DETECTED_MODES[4242], 'utf16')
+
+    def test_verified_mode_stays_fixed_despite_original_manual_setting(self):
+        self.assertEqual(self.send(char_mode='utf16'), (True, 'sent'))
+        self.assertEqual(self.state['modes'], ['utf16', 'gbk'])
+        self.state['modes'].clear()
+        self.assertEqual(self.send(char_mode='utf16'), (True, 'sent'))
+        self.assertEqual(self.state['modes'], ['gbk'])
+        self.state['actual'] = 'utf16'
+        self.state['modes'].clear()
+        self.assertEqual(self.send(char_mode='utf16'), (True, 'sent'))
+        self.assertEqual(self.state['modes'], ['gbk', 'utf16'])
+        self.state['modes'].clear()
+        self.assertEqual(self.send(char_mode='utf16'), (True, 'sent'))
+        self.assertEqual(self.state['modes'], ['utf16'])
+
+    def test_verified_mode_survives_bridge_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            file = os.path.join(root, 'encoding.json')
+            bg.configure({}, state_file=file)
+            self.assertEqual(self.send(char_mode='utf16'), (True, 'sent'))
+            bg._DETECTED_MODES.clear()
+            bg._CONFIGURED_MODES.clear()
+            bg._MODE_STATE_FILE = None
+            bg.configure({}, state_file=file)
+            self.state['modes'].clear()
+            self.assertEqual(self.send(char_mode='utf16'), (True, 'sent'))
+            self.assertEqual(self.state['modes'], ['gbk'])
+
+    def test_second_failure_never_clicks_send_even_if_verify_disabled(self):
+        self.state['never_matches'] = True
+        self.assertEqual(self.send(verify=False), (False, 'content_mismatch'))
+        self.assertEqual(self.state['modes'], ['utf16'])
+        self.assertEqual(self.state['probes'], ['utf16', 'gbk'])
+        self.assertEqual(self.state['sent'], [])
+        self.assertEqual(self.state['text'], '')
+
+    def test_multiline_reply_stays_readable_on_input_that_drops_linebreaks(self):
+        self.state.update(actual='utf16', drop_linebreaks=True)
+        self.assertEqual(bg.send('第一段\r\n\r\n第二段', chat='测试群', hwnd=4242), (True, 'sent'))
+        self.assertEqual(self.state['sent'], ['第一段 第二段'])
+        self.assertEqual(self.state['modes'], ['utf16'])
+        self.assertEqual(self.state['probes'], [])
+
+    def test_correct_encoding_with_a_dropped_character_does_not_retype_in_gbk(self):
+        self.state.update(actual='utf16', short_first=True)
+        self.assertEqual(self.send(), (True, 'sent'))
+        self.assertEqual(self.state['modes'], ['utf16', 'utf16'])
+        self.assertEqual(self.state['probes'], ['utf16'])
+        self.assertEqual(self.state['sent'], ['鲸鲸测试'])
+
+    def test_slow_uia_readback_does_not_clear_or_switch(self):
+        self.state.update(actual='utf16', stale_reads=2)
+        self.assertEqual(self.send(), (True, 'sent'))
+        self.assertEqual(self.state['modes'], ['utf16'])
+        self.assertEqual(self.state['clears'], 0)
+
+    def test_failed_recalibration_keeps_last_proven_mode(self):
+        self.assertEqual(self.send(), (True, 'sent'))
+        self.state.update(never_matches=True)
+        self.assertEqual(self.send(), (False, 'content_mismatch'))
+        self.assertEqual(bg._DETECTED_MODES[4242], 'gbk')
+
+    def test_changing_draft_is_never_cleared_or_sent(self):
+        self.state.update(actual='utf16', short_first=True, replace_while_reading=True)
+        self.assertEqual(self.send(), (False, 'input_dirty'))
+        self.assertEqual(self.state['clears'], 0)
+        self.assertEqual(self.state['sent'], [])
+
+    def test_user_can_finish_typing_before_first_read_without_losing_draft(self):
+        self.state.update(actual='utf16', manual_draft=True)
+        self.assertEqual(self.send(), (False, 'input_dirty'))
+        self.assertEqual(self.state['text'], '用户刚输入的草稿')
+        self.assertEqual(self.state['clears'], 0)
+        self.assertEqual(self.state['sent'], [])
+
+    def test_input_in_another_foreground_app_does_not_block_encoding_recovery(self):
+        self.state.update(foreground=9876, other_app_input=True)
+        self.assertEqual(self.send(), (True, 'sent'))
+        self.assertEqual(self.state['modes'], ['utf16', 'gbk'])
+        self.assertEqual(self.state['sent'], ['鲸鲸测试'])
+
+    def test_switch_after_click_does_not_treat_another_chats_empty_input_as_confirmation(self):
+        self.state.update(actual='utf16', switch_on_send=True)
+        self.assertEqual(self.send(), (True, 'sent_unverified'))
+        self.assertEqual(self.state['sent'], ['鲸鲸测试'])
+
+    def test_failed_initial_probe_cleanup_never_requests_foreground_fallback(self):
+        self.state['raise_on_clear'] = True
+        with patch.object(bg, '_detect_char_mode_by_version', return_value='gbk'):
+            self.assertEqual(self.send(), (False, 'input_dirty'))
+        self.assertEqual(self.state['modes'], [])
+        self.assertEqual(self.state['sent'], [])
+
+    def test_gbk_unrepresentable_message_tries_verified_utf16_before_fallback(self):
+        self.state['actual'] = 'utf16'
+        self.assertEqual(bg.send('😀', chat='测试群', hwnd=4242, char_mode='gbk'), (True, 'sent'))
+        self.assertEqual(self.state['probes'], ['utf16'])
+        self.assertEqual(self.state['sent'], ['😀'])
+        self.assertEqual(bg._DETECTED_MODES[4242], 'utf16')
+
+    def test_unreadable_after_typing_does_not_guess_encoding_or_send(self):
+        self.state['unreadable'] = True
+        self.assertEqual(self.send(), (False, 'input_dirty'))
+        self.assertEqual(self.state['clears'], 0)
+        self.assertEqual(self.state['sent'], [])
+
+    def test_existing_draft_is_preserved(self):
+        self.state['text'] = '用户正在编辑的草稿'
+        self.assertEqual(self.send(), (False, 'input_not_empty'))
+        self.assertEqual(self.state['modes'], [])
+        self.assertEqual(self.state['clears'], 0)
+        self.assertEqual(self.state['text'], '用户正在编辑的草稿')
+
+    def test_clear_failure_stops_without_appending_another_encoding(self):
+        self.state['clear_ok'] = False
+        self.assertEqual(self.send(), (False, 'input_dirty'))
+        self.assertEqual(self.state['modes'], ['utf16'])
+        self.assertEqual(self.state['sent'], [])
+
+    def test_chat_switch_during_clear_never_types_into_other_chat(self):
+        self.state['switch_on_clear'] = True
+        self.assertEqual(self.send(), (False, 'input_dirty'))
+        self.assertEqual(self.state['modes'], ['utf16'])
+        self.assertEqual(self.state['sent'], [])
+
+    def test_gbk_skipped_emoji_is_compared_against_actual_payload(self):
+        self.assertEqual(bg.send('鲸鲸😀', chat='测试群', hwnd=4242, char_mode='gbk'), (True, 'sent_partial'))
+        self.assertEqual(self.state['sent'], ['鲸鲸'])
+        self.assertEqual(self.state['clears'], 0)
+
+    def test_correct_utf16_sends_emoji_without_switching(self):
+        self.state['actual'] = 'utf16'
+        self.assertEqual(bg.send('鲸鲸😀', chat='测试群', hwnd=4242), (True, 'sent'))
+        self.assertEqual(self.state['sent'], ['鲸鲸😀'])
+        self.assertEqual(self.state['modes'], ['utf16'])
+
+
+class DirtyDraftPipelineTests(unittest.TestCase):
+    def test_bridge_does_not_fall_back_or_disable_chat_after_dirty_draft(self):
+        # 只提取发送闭包，避开 main 的真实微信连接；执行的仍是实际桥接代码。
+        from bridge_ast import init, load_function
+        for reason in ('input_dirty', 'residue_left', 'input_not_empty', 'content_mismatch'):
+            with self.subTest(reason=reason):
+                draft_error = type('DraftDirtyError', (RuntimeError,), {})
+                fallback = Mock(side_effect=AssertionError('不能进入会抢前台的下一条发送通道'))
+                env = dict(time=time, BG_SEND={'enabled': True},
+                    BG_STATS=dict(disabled=False, cooldownUntil=0, tried=0),
+                    _bg_hwnd=lambda: 4242, log=Mock(), log_error=Mock(),
+                    DraftDirtyError=draft_error, ChatIdentityError=type('ChatIdentityError', (RuntimeError,), {}),
+                    dead_chats=set(), fail_streak={}, account_send_allowed=lambda *a: True,
+                    send_policy_allows=lambda *a: True,
+                    sticker_quarantine_allows=lambda *a: True, send_lock=nullcontext(),
+                    _SendStateScope=lambda n: nullcontext(), STICKER_TEST_ON=False,
+                    SEND_STATE={}, gui=None, WeChatGUI=fallback)
+                module = SimpleNamespace(configure=Mock(), send=Mock(return_value=(False, reason)))
+                with patch.dict(sys.modules, {'bg_sender': module}):
+                    init(env)
+                    load_function('bg_send', env)
+                    load_function('send_text', env)
+                    self.assertFalse(env['send_text']('测试正文', '测试群'))
+                fallback.assert_not_called()
+                self.assertEqual(env['dead_chats'], set())
+                self.assertEqual(env['fail_streak'], {})
+
+
+if __name__ == '__main__':
+    unittest.main()

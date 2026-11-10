@@ -1,0 +1,130 @@
+<UserControl x:Class="WhaleLauncher.Views.StickerPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="Transparent">
+    <Grid Margin="28,24,32,20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <DockPanel Grid.Row="0" LastChildFill="False" Margin="0,0,0,12">
+            <TextBlock DockPanel.Dock="Left" Text="表情包" Style="{StaticResource H1}" VerticalAlignment="Center" />
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Content="打开总目录" Style="{StaticResource Ghost}" Click="OnOpenFolder"
+                        ToolTip="打开表情包库根目录（data\stickers）" />
+                <Button Content="⟳ 刷新" Style="{StaticResource Ghost}" Margin="8,0,0,0" Click="OnReload" />
+            </StackPanel>
+        </DockPanel>
+
+        <Border Grid.Row="1" Style="{StaticResource Card}" Padding="14,10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="380" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <!-- 第 1 行：开关 / 测试标题，左右对齐 -->
+                <WrapPanel Grid.Row="0" Grid.Column="0">
+                    <CheckBox x:Name="ChkEnabled" Content="启用表情包" VerticalAlignment="Center" Click="OnToggleEnabled" />
+                    <TextBlock Text="开启后，微信会先尝试前台发送" Style="{StaticResource Small}"
+                               Margin="10,0,0,0" VerticalAlignment="Center" />
+                    <TextBlock x:Name="DirHint" Style="{StaticResource Small}" Margin="14,0,0,0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                </WrapPanel>
+                <TextBlock Grid.Row="0" Grid.Column="2" Text="可选：真实消息测试" Style="{StaticResource H2}" Margin="16,0,0,0" />
+
+
+                <!-- 第 2 行：两边的说明，只讲怎么用，不讲实现原理 -->
+                <TextBlock Grid.Row="1" Grid.Column="0" Margin="0,8,16,0"
+                           Text="只有微信窗口在前台、账号校验通过时才会真的发；关掉开关会立刻取消排队的发送。"
+                           Style="{StaticResource Small}" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="1" Grid.Column="2" Margin="16,4,0,0"
+                           Text="会向微信发一条真实消息，可能短暂切换窗口。排队不代表送达，结果未确认时别重复发。"
+                           Style="{StaticResource Small}" TextWrapping="Wrap" />
+
+                <!-- 第 3 行：目录 / 接收会话，两个输入框同一行对齐 -->
+                <WrapPanel Grid.Row="2" Grid.Column="0" Margin="0,8,16,0">
+                    <TextBlock Text="目录" Style="{StaticResource Small}" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBox x:Name="TxtDir" Width="260" VerticalAlignment="Center" LostFocus="OnSaveStickerSettings"
+                             ToolTip="相对路径，分类是它下面的文件夹" />
+                </WrapPanel>
+                <WrapPanel Grid.Row="2" Grid.Column="2" Margin="16,8,0,0">
+                    <TextBlock Text="接收会话" Style="{StaticResource Small}" VerticalAlignment="Center" />
+                    <TextBox x:Name="TxtTestChat" Width="160" Margin="8,0,0,0"
+                             ToolTip="填微信里的备注名/昵称；默认用设置里的「测试发送到哪个会话」" />
+                    <Button Content="排队测试发送" Style="{StaticResource Primary}" Margin="8,0,0,0" Click="OnTestSend" />
+                </WrapPanel>
+
+                <!-- 第 4 行：表情包频率 / 必发 -->
+                <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3" Margin="0,10,16,0">
+                    <WrapPanel>
+                        <TextBlock Text="表情包频率" Style="{StaticResource Small}" VerticalAlignment="Center" />
+                        <Slider x:Name="SldDemand" Width="220" Margin="8,0,0,0" VerticalAlignment="Center"
+                                Minimum="0" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
+                                ValueChanged="OnDemandChanged"
+                                ToolTip="这一轮要不要提醒她带一张；不是最终发送概率" />
+                        <TextBlock x:Name="TxtDemandValue" Width="46" Margin="8,0,0,0" VerticalAlignment="Center"
+                                   Style="{StaticResource Small}" />
+                        <CheckBox x:Name="ChkEnsure" Content="没写标记也补一张（必发）" Margin="10,0,0,0" VerticalAlignment="Center"
+                                  ToolTip="命中频率的轮次，模型没写 [[sticker:分类]] 也由程序按语气补一张；难过/求助时不发" />
+                        <Button x:Name="BtnSaveDemand" Content="保存频率" Style="{StaticResource Ghost}"
+                                Margin="8,0,0,0" Click="OnSaveDemand" />
+                    </WrapPanel>
+                    <TextBlock x:Name="DemandHint" Style="{StaticResource Small}" Margin="0,6,0,0" TextWrapping="Wrap"
+                               Text="0 = 只靠模型自觉；70% ≈ 一半多轮次提醒；100% = 每轮都提醒。勾选「必发」后，命中轮次即使模型没写标记也会补一张（难过/求助除外）。" />
+                    <WrapPanel Margin="0,10,0,0">
+                        <CheckBox x:Name="ChkCollect" Content="自动收集收到的表情包" Click="OnToggleCollect" VerticalAlignment="Center" />
+                        <Button Content="打开收集文件夹" Style="{StaticResource Ghost}" Margin="10,0,0,0" Click="OnOpenCollected" />
+                    </WrapPanel>
+                    <TextBlock Text="原图去重，动图保留。独立于发送开关，收到的表情包保存在单独的文件夹里。" Style="{StaticResource Small}" TextWrapping="Wrap" Margin="0,6,0,0" />
+                    <TextBlock x:Name="CollectStatus" Style="{StaticResource Small}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                </StackPanel>
+
+                <Border Grid.Row="0" Grid.RowSpan="3" Grid.Column="1" Width="1"
+                        Background="{DynamicResource Line}" Margin="0,2" />
+            </Grid>
+        </Border>
+
+        <WrapPanel Grid.Row="2" Margin="0,12,0,0">
+            <StackPanel x:Name="Tabs" Orientation="Horizontal" VerticalAlignment="Center" />
+            <TextBox x:Name="TxtNewCat" Width="110" Margin="14,0,0,0" ToolTip="新分类的名字（文件夹会同名建出来）" />
+            <Button Content="＋ 新分类" Style="{StaticResource Ghost}" Margin="6,0,0,0" Click="OnAddCategory" />
+            <Button x:Name="BtnDelCat" Content="删除分类" Style="{StaticResource Ghost}" Margin="6,0,0,0"
+                    Visibility="Collapsed" Click="OnDeleteCategory"
+                    ToolTip="只从列表里去掉，文件夹和图片都保留" />
+            <Button Content="上传图片…" Style="{StaticResource Ghost}" Margin="10,0,0,0" Click="OnUpload"
+                    ToolTip="选 1~5 张图片存进当前分类（单张 4MB 以内，不会发消息）" />
+            <Button x:Name="BtnImportPresets" Content="导入预设表情包" Style="{StaticResource Ghost}"
+                    Margin="6,0,0,0" Click="OnImportPresets" IsEnabled="False"
+                    ToolTip="启动鲸鲸并开启表情包后可用。空图库会自动导入；已有图库可点这里添加，保留原图。" />
+            <Button x:Name="BtnOpenCat" Content="打开本分类文件夹" Style="{StaticResource Ghost}" Margin="6,0,0,0"
+                    Click="OnOpenCategoryFolder" ToolTip="打开当前分类的文件夹，把图拖进去即可" />
+            <TextBlock x:Name="QueueInfo" Style="{StaticResource Small}" Margin="14,0,0,0" VerticalAlignment="Center" />
+        </WrapPanel>
+
+        <Border Grid.Row="3" Style="{StaticResource Card}" Margin="0,12,0,0">
+            <Grid>
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Margin="12,10">
+                    <WrapPanel x:Name="GridHost" />
+                </ScrollViewer>
+                <TextBlock x:Name="EmptyHint" Style="{StaticResource Small}" HorizontalAlignment="Center" VerticalAlignment="Center"
+                           TextWrapping="Wrap" TextAlignment="Center" />
+            </Grid>
+        </Border>
+
+        <DockPanel Grid.Row="4" Margin="0,10,0,0">
+            <TextBlock x:Name="StatusText" DockPanel.Dock="Top" Style="{StaticResource Small}" TextWrapping="Wrap" />
+            <StackPanel x:Name="JobsHost" Margin="0,8,0,0" />
+        </DockPanel>
+    </Grid>
+</UserControl>

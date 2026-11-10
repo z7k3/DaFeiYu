@@ -1,0 +1,427 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const http = require('node:http');
+const stickers = require('../src/adapters/stickers');
+const { StickerService } = require('../src/services/stickerService');
+const { startServer } = require('../server');
+const { loadConfig } = require('../src/infra/config');
+const { Gateway: GatewayAdapter } = require('../src/adapters/gateway');
+const GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==', 'base64');
+function fixture(t, on = true) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whale-sticker-fix-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 80 }));
+  const cfg = loadConfig({ root, env: {} });
+  cfg.root = root;
+  cfg.features.stickers = on;
+  cfg.sticker.chances = { cute: 1, angry: 1, happy: 1 };
+  return { root, cfg };
+}
+function upload(cfg, root, emotion = 'other', name = '动画.gif', bytes = GIF) {
+  return stickers.upload(cfg, root, emotion, [{ name, data: bytes.toString('base64') }]);
+}
+/** 收集日志行，断言「有没有说、说了什么」，不依赖真实 logger */
+function loggerStub() {
+  const lines = [];
+  const push = (level) => (...args) => lines.push(level + ' ' + args.join(' '));
+  return { lines, info: push('info'), warn: push('warn'), debug: push('debug'), error: push('error') };
+}
+
+test('上传按情绪归档，保留 GIF 原始字节且同名不覆盖', (t) => {
+  const { root, cfg } = fixture(t);
+  const one = upload(cfg, root)[0];
+  assert.equal(one.emotion, 'happy');
+  assert.deepEqual(fs.readFileSync(path.join(root, 'data/stickers/开心', one.name)), GIF);
+  assert.equal(upload(cfg, root)[0].name, one.name, '重复上传应幂等');
+  assert.equal(stickers.categoryImages(stickers.stickerDir(cfg, root), 'angry').length, 0);
+  assert.equal(stickers.imagesFor(stickers.stickerDir(cfg, root), 'angry').length, 0, '不能拿别的情绪的图冒充');
+});
+
+test('上传拒绝伪装/超限/路径穿越/未知情绪；无有效批次不落盘', (t) => {
+  const { root, cfg } = fixture(t);
+  for (const [emotion, files] of [
+    ['constructor', [{ name: 'a.gif', data: GIF.toString('base64') }]],
+    ['other', [{ name: '../config.json', data: GIF.toString('base64') }]],
+    ['other', [{ name: 'a.png', data: GIF.toString('base64') }]],
+    ['other', [{ name: 'a.gif', data: Buffer.from('not image').toString('base64') }]],
+    ['other', [{ name: 'a.gif', data: '####' }]],
+    ['other', [{ name: 'a.gif', data: Buffer.alloc(stickers.MAX_FILE_BYTES + 1).toString('base64') }]],
+    ['other', new Array(stickers.MAX_UPLOAD_FILES + 1).fill({ name: 'a.gif', data: GIF.toString('base64') })],
+    ['other', [{ name: 'ok.gif', data: GIF.toString('base64') }, { name: 'bad.exe', data: '' }]],
+  ]) assert.throws(() => stickers.upload(cfg, root, emotion, files));
+  assert.equal(fs.existsSync(path.join(root, 'data/stickers')), false);
+  cfg.features.stickers = false;
+  assert.throws(() => upload(cfg, root), { statusCode: 404 });
+});
+
+test('旧通用仅归入开心，炸毛和傲娇不借图', (t) => {
+  const { root, cfg } = fixture(t);
+  upload(cfg, root, 'angry');
+  const dir = stickers.stickerDir(cfg, root);
+  assert.equal(stickers.categoryImages(dir, 'other').length, 0, '分类计数必须是精确的');
+  assert.equal(stickers.imagesFor(dir, 'other').length, 0, '该类没图也不拿别的情绪顶替');
+  fs.mkdirSync(path.join(dir, '通用'));
+  fs.writeFileSync(path.join(dir, '通用/g.gif'), GIF);
+  assert.equal(stickers.imagesFor(dir, 'other').length, 1);
+  assert.equal(stickers.categoryImages(dir, 'other').length, 1);
+  assert.equal(stickers.imagesFor(dir, 'cute').length, 0);
+});
+
+test('关闭开关取消已取出和未领取任务，重新开启不重放，重启不读旧队列', (t) => {
+  const { root, cfg } = fixture(t);
+  upload(cfg, root);
+  let service = new StickerService(cfg);
+  const first = service.enqueue('other', '文件传输助手');
+  const second = service.enqueue('other', '文件传输助手');
+  service.claim(first.id);
+  const generation = service.generation;
+  cfg.features.stickers = false; service.reconcile();
+  assert.throws(() => service.pending(), { statusCode: 404 });
+  cfg.features.stickers = true; service.reconcile();
+  assert.notEqual(service.generation, generation);
+  assert.deepEqual(service.pending(), []);
+  assert.throws(() => service.claim(second.id), { statusCode: 409 });
+  assert.throws(() => service.ack(first.id, 'confirmed'), { statusCode: 409 });
+  fs.writeFileSync(path.join(root, 'data/sticker-queue.json'), JSON.stringify([{ path: 'secret.txt', chat: 'wrong' }]));
+  service = new StickerService(cfg);
+  assert.deepEqual(service.pending(), []);
+});
+
+test('任务原子领取，仅一次；失败/未确认状态不伪装成成功，ACK不重复发送', (t) => {
+  const { root, cfg } = fixture(t);
+  upload(cfg, root);
+  const service = new StickerService(cfg);
+  const job = service.enqueue('other', '文件传输助手');
+  assert.equal(service.claim(job.id).status, 'sending');
+  assert.throws(() => service.claim(job.id), { statusCode: 409 });
+  assert.throws(() => service.ack(job.id, true), { statusCode: 400 });
+  const result = service.ack(job.id, 'unconfirmed', '数据库没有证据');
+  assert.equal(result.status, 'unconfirmed');
+  assert.equal(service.status().jobs[0].error, '数据库没有证据');
+  assert.throws(() => service.ack(job.id, 'confirmed'), { statusCode: 409 });
+  assert.deepEqual(service.pending(), []);
+});
+
+test('没有冷却：私聊也能连续发；同一会话同时只排一个任务', (t) => {
+  const { root, cfg } = fixture(t);
+  upload(cfg, root);
+  cfg.sticker.chances.happy = 1;
+  const service = new StickerService(cfg, { rng: () => 0 });
+  const msg = { platform: 'wechat', chatId: 'wxid-test', chatType: 'private' };
+  const first = service.plan(msg, '其他');
+  assert.equal(first.status, 'reserved', '私聊也要能自动发');
+  assert.equal(service.plan(msg, '其他'), null, '同一会话同时只排一个，避免连发刷屏');
+  assert.equal(service.pending().length, 0, '自动回复应等文字发完，不让轮询抢先发图');
+  service.claim(first.id); service.ack(first.id, 'confirmed');
+  // 立刻就能再发，不需要等十分钟
+  const second = service.plan(msg, '其他');
+  assert.ok(second, '确认后立刻可以再发（无冷却）');
+  service.claim(second.id); service.ack(second.id, 'confirmed');
+  assert.ok(service.plan(msg, '其他'), '再紧接着也还能发');
+  assert.equal(service.plan({ ...msg, platform: 'web' }, '其他'), null, '网页聊天不排表情包');
+});
+
+test('任务过期不重试，满队列明确报错而非静默丢任务', (t) => {
+  const { root, cfg } = fixture(t);
+  upload(cfg, root);
+  let now = 1;
+  const service = new StickerService(cfg, { now: () => now });
+  const first = service.enqueue('other', '文件传输助手'); service.claim(first.id);
+  for (let i = 1; i < 20; i++) service.enqueue('other', '测试会话' + i);
+  assert.throws(() => service.enqueue('other', '另一个测试会话'), { statusCode: 429 });
+  now += 5 * 60000 + 1;
+  assert.deepEqual(service.pending(), []);
+  assert.equal(service.jobs.get(first.id).status, 'unconfirmed');
+});
+
+async function live(t) {
+  const { root } = fixture(t, false);
+  fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify({ server: { port: 0, openBrowser: false }, watchConfig: false,
+    persona: { ownerName: '测试主人', master: { wxids: ['wxid-master'] } },
+    gateway: { wechat: { enabled: true, inboundToken: 'sticker-test-token' } } }));
+  const inst = await startServer({ root, env: { WHALE_LOG_FILE: '', WHALE_TEST_NO_SHELL: '1' }, port: 0, openBrowser: false });
+  t.after(() => inst.close());
+  async function request(route, body, token) {
+    const response = await fetch(inst.url + route, { method: body === undefined ? 'GET' : 'POST',
+      headers: { 'content-type': 'application/json', ...(token ? { 'x-bot-token': token } : {}) },
+      body: body === undefined ? undefined : JSON.stringify(body) });
+    return { status: response.status, body: await response.json() };
+  }
+  const toggle = (value) => request('/api/features', { key: 'stickers', value });
+  return { root, inst, request, toggle };
+}
+
+test('HTTP：默认关404；热开上传/分类/领取/结果；关闭取消任务且不改主人配置', async (t) => {
+  const { root, request, toggle } = await live(t);
+  assert.equal((await request('/api/stickers/status')).status, 404);
+  assert.equal((await request('/api/stickers/upload', { emotion: 'other', files: [] })).status, 404);
+  assert.equal((await toggle(true)).status, 200);
+  const up = await request('/api/stickers/upload', { emotion: 'other', files: [{ name: 'a.gif', data: GIF.toString('base64') }] });
+  assert.equal(up.status, 200);
+  const status = (await request('/api/stickers/status')).body;
+  assert.equal(status.emotions.find((e) => e.key === 'happy').count, 1);
+  assert.equal(status.emotions.find((e) => e.key === 'angry').count, 0);
+  assert.equal((await request('/api/stickers/pending')).status, 403);
+  const job = (await request('/api/stickers/test', { emotion: 'other', chat: '文件传输助手' })).body.queued;
+  assert.equal((await request('/api/stickers/claim', { id: job.id }, 'bad')).status, 403);
+  assert.equal((await request('/api/stickers/claim', { id: job.id }, 'sticker-test-token')).body.item.status, 'sending');
+  assert.equal((await request('/api/stickers/claim', { id: job.id }, 'sticker-test-token')).status, 409);
+  assert.equal((await request('/api/stickers/ack', { id: job.id, status: 'failed', error: '目标未打开' }, 'sticker-test-token')).status, 200);
+  assert.equal((await request('/api/stickers/status')).body.jobs[0].status, 'failed');
+  const queue = (await request('/api/stickers/status?queueOnly=1')).body;
+  assert.equal(queue.jobs[0].status, 'failed');
+  assert.equal(queue.emotions, undefined);
+  await request('/api/stickers/test', { emotion: 'other', chat: '文件传输助手' });
+  await toggle('false');
+  assert.equal((await request('/api/stickers/status')).status, 404, '字符串false也必须关');
+  await toggle(true);
+  assert.equal((await request('/api/stickers/pending', undefined, 'sticker-test-token')).body.items.length, 0);
+  const cfg = JSON.parse(fs.readFileSync(path.join(root, 'config.json'), 'utf8'));
+  assert.equal(cfg.persona.ownerName, '测试主人');
+  assert.deepEqual(cfg.persona.master.wxids, ['wxid-master']);
+});
+
+test('网关默认关回包真正无sticker字段，不给远程/其他平台发本机路径', async () => {
+  // No model, server, runtime or WeChat needed.
+  const gateway = new GatewayAdapter({ platform: 'wechat', options: {}, bot: {
+    handle: async () => ({ action: 'reply', reply: '你好', bubbles: ['你好'] }), stickerFor: () => null,
+  } });
+  const result = await gateway.handleInbound({ chat_id: 'wxid-x', text: 'hello' }, { local: true });
+  assert.equal(Object.hasOwn(result, 'sticker'), false);
+  gateway.bot.stickerFor = () => { throw new Error('must not be called remotely'); };
+  const remote = await gateway.handleInbound({ chat_id: 'wxid-x', text: 'hello' });
+  assert.equal(Object.hasOwn(remote, 'sticker'), false);
+});
+
+test('HTTP：自动回包带一次性任务，网页SSE不泄漏本地路径，网页聊天不占微信配额', async (t) => {
+  const { root, inst, request, toggle } = await live(t);
+  await toggle(true);
+  await request('/api/stickers/upload', { emotion: 'other', files: [{ name: 'a.gif', data: GIF.toString('base64') }] });
+  // 模型在正文里写了 [[sticker:其他]]，finalize 会剥掉标记并把分类带到 result
+  inst.runtime.bot.handle = async () => ({ action: 'reply', reply: '哈哈', bubbles: ['哈哈'], stickerCategory: '其他' });
+  const response = await fetch(inst.url + '/webhook/wechat', { method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-bot-token': 'sticker-test-token', 'x-whale-bridge': '1' },
+    body: JSON.stringify({ chat_id: 'wxid-test', text: '发个表情' }) });
+  const payload = await response.json();
+  assert.ok(payload.sticker?.id);
+  assert.equal(payload.sticker.status, 'reserved');
+  assert.equal((await request('/api/stickers/pending', undefined, 'sticker-test-token')).body.items.length, 0);
+  const web = await fetch(inst.url + '/api/chat', { method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-bot-token': 'sticker-test-token' },
+    body: JSON.stringify({ text: '在吗', sessionId: 'sticker-visibility' }) });
+  assert.equal((await web.text()).includes('"sticker"'), false);
+  assert.equal(inst.runtime.stickerService.jobs.size, 1, '网页聊天不该排队表情包');
+  await toggle(false);
+  const off = await fetch(inst.url + '/webhook/wechat', { method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-bot-token': 'sticker-test-token', 'x-whale-bridge': '1' },
+    body: JSON.stringify({ chat_id: 'wxid-test', text: '发个表情' }) });
+  assert.equal(Object.hasOwn(await off.json(), 'sticker'), false);
+});
+
+test('HTTP：微信私聊明确请求直接预留表情包，无需模型标记', async (t) => {
+  const { inst, request, toggle } = await live(t);
+  await toggle(true);
+  await request('/api/stickers/upload', { emotion: 'happy', files: [{ name: 'a.gif', data: GIF.toString('base64') }] });
+  const webhook = async (text, bridge = true) => {
+    const response = await fetch(inst.url + '/webhook/wechat', { method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bot-token': 'sticker-test-token', 'x-whale-bridge': bridge ? '1' : '0' },
+      body: JSON.stringify({ chat_id: 'wxid-test', sender_id: 'wxid-test', text }) });
+    return response.json();
+  };
+  const payload = await webhook('给我发个表情包');
+  assert.equal(payload.reply, '给你挑了一张');
+  assert.equal(payload.stickerOnly, true);
+  assert.equal(payload.outbound, undefined, '明确要图时不先发送文字');
+  assert.equal(payload.sticker?.emotion, 'happy');
+  assert.equal(payload.sticker?.chatUsername, 'wxid-test');
+  assert.equal(payload.sticker?.status, 'reserved');
+  assert.equal((await webhook('给我发个表情包')).sticker, undefined, '同一会话不能重复排队');
+  assert.equal((await webhook('给我发个表情包', false)).sticker, undefined);
+  assert.equal((await webhook('他说给我发个表情包')).sticker, undefined);
+  assert.equal(inst.runtime.stickerService.jobs.size, 1);
+});
+
+test('HTTP：上传请求尚在读取时关闭总闸，不允许存图或悄悄重排队', async (t) => {
+  const { root, inst, request, toggle } = await live(t);
+  await toggle(true);
+  const body = JSON.stringify({ emotion: 'other', files: [{ name: 'a.gif', data: GIF.toString('base64') }] });
+  let finish;
+  const result = new Promise((resolve, reject) => {
+    const req = http.request(inst.url + '/api/stickers/upload', { method: 'POST', headers: {
+      'content-type': 'application/json', 'content-length': Buffer.byteLength(body),
+    } }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    req.on('error', reject);
+    finish = () => req.end(body.slice(1));
+    req.write(body.slice(0, 1));
+  });
+  await toggle(false);
+  finish();
+  assert.equal(await result, 404);
+  assert.deepEqual(stickers.listImages(path.join(root, 'data/stickers')), []);
+});
+
+test('目录链接不能把上传和挑图重定向到表情包库外', (t) => {
+  const { root, cfg } = fixture(t);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'whale-sticker-outside-'));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'data/stickers'), { recursive: true });
+  const dir = stickers.stickerDir(cfg, root);
+  try { fs.symlinkSync(outside, path.join(dir, '开心'), process.platform === 'win32' ? 'junction' : 'dir'); }
+  catch (err) { if (['EPERM', 'EACCES'].includes(err.code)) { t.skip('无创建链接权限'); return; } throw err; }
+  assert.throws(() => upload(cfg, root));
+  fs.writeFileSync(path.join(outside, 'x.gif'), GIF);
+  assert.deepEqual(stickers.categoryImages(dir, 'happy'), []);
+});
+
+test('HTTP：缩略图只回传表情包目录里的真图，越界/未知情绪一律 404', async (t) => {
+  const { inst, request, toggle } = await live(t);
+  await toggle(true);
+  const up = await request('/api/stickers/upload', { emotion: 'other', files: [{ name: 'a.gif', data: GIF.toString('base64') }] });
+  const name = up.body.uploaded[0].name;
+  const ok = await fetch(`${inst.url}/api/stickers/image?emotion=other&name=${encodeURIComponent(name)}`);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get('content-type'), 'image/gif');
+  for (const query of ['emotion=other&name=../config.json', 'emotion=../x&name=a.gif', 'emotion=other&name=', 'emotion=nope&name=a.gif']) {
+    const r = await fetch(`${inst.url}/api/stickers/image?${query}`);
+    assert.equal(r.status, 404, query);
+  }
+});
+
+test('HTTP：可以删掉单张表情包；越界和未知情绪删不掉；能打开文件夹', async (t) => {
+  const { root, request, toggle } = await live(t);
+  await toggle(true);
+  const up = await request('/api/stickers/upload', { emotion: 'other', files: [{ name: 'a.gif', data: GIF.toString('base64') }] });
+  const name = up.body.uploaded[0].name;
+  const file = path.join(root, 'data/stickers/开心', name);
+  assert.ok(fs.existsSync(file));
+  assert.equal((await request('/api/stickers/delete', { emotion: 'other', name: '../config.json' })).status, 404);
+  assert.equal((await request('/api/stickers/delete', { emotion: 'nope', name })).status, 404);
+  assert.equal((await request('/api/stickers/delete', { emotion: 'other', name })).status, 200);
+  assert.equal(fs.existsSync(file), false, '文件要被真删掉');
+  assert.equal((await request('/api/stickers/delete', { emotion: 'other', name })).status, 404, '重复删要 404');
+  const folder = await request('/api/stickers/open-folder', {});
+  assert.equal(folder.status, 200);
+  assert.ok(folder.body.dir.endsWith('stickers'));
+});
+
+test('内置分类不能删；文件夹被删掉会自动补回来', async (t) => {
+  const { root, inst, request, toggle } = await live(t);
+  await toggle(true);
+  const dir = path.join(root, 'data/stickers');
+  for (const label of ['傲娇', '炸毛', '开心']) assert.ok(fs.existsSync(path.join(dir, label)), label + ' 应该已建好');
+  fs.rmSync(path.join(dir, '开心'), { recursive: true, force: true });
+  fs.rmSync(path.join(dir, '炸毛'), { recursive: true, force: true });
+  inst.runtime.stickerService.status();
+  for (const label of ['炸毛', '开心']) assert.ok(fs.existsSync(path.join(dir, label)), label + ' 被删后要补回来');
+  for (const label of ['傲娇', '炸毛', '开心']) {
+    const res = await request('/api/stickers/category', { action: 'remove', label });
+    assert.equal(res.status, 400, label + ' 不应该能删');
+    assert.match(res.body.error, /内置分类/);
+  }
+  // 没有「其他」这个内置分类了
+  const status = (await request('/api/stickers/status')).body;
+  assert.deepEqual(status.emotions.map((e) => e.label), ['傲娇', '炸毛', '开心']);
+});
+
+test('分类认不出：照发一张，记 fallbackFrom 并 warn 说明改发了哪类', (t) => {
+  const { root, cfg } = fixture(t);
+  upload(cfg, root);
+  const log = loggerStub();
+  const service = new StickerService(cfg, { rng: () => 0, logger: log });
+  const msg = { platform: 'wechat', chatId: 'wxid-a', chatType: 'private' };
+  const job = service.plan(msg, '猫猫头');
+  assert.ok(job, '认不出也要发得出去');
+  assert.equal(job.emotion, 'happy');
+  assert.equal(job.fallbackFrom, '猫猫头');
+  assert.ok(log.lines.some((line) => line.startsWith('warn') && line.includes('猫猫头') && line.includes('改发')), '要说明改发了哪一类');
+});
+
+test('有自定义分类时，兜底优先发用户自己建的分类里的图', (t) => {
+  const { root, cfg } = fixture(t);
+  upload(cfg, root);
+  fs.mkdirSync(path.join(root, 'data/stickers/猫猫'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data/stickers/猫猫/cat.gif'), GIF);
+  stickers.writeExtraCategories(cfg, root, [{ label: '猫猫' }]);
+  const service = new StickerService(cfg, { rng: () => 0 });
+  const job = service.plan({ platform: 'wechat', chatId: 'wxid-b', chatType: 'private' }, '认不出的分类');
+  assert.equal(job.emotion, 'x:猫猫');
+  assert.match(job.path, /猫猫/);
+  assert.equal(job.fallbackFrom, '认不出的分类');
+});
+
+test('图库全空：plan 返回 null，并说明该分类没有图', (t) => {
+  const { root, cfg } = fixture(t);
+  const log = loggerStub();
+  const service = new StickerService(cfg, { rng: () => 0, logger: log });
+  const job = service.plan({ platform: 'wechat', chatId: 'wxid-empty', chatType: 'private' }, '炸毛');
+  assert.equal(job, null);
+  assert.ok(log.lines.some((line) => line.includes('没有对应图片')));
+});
+
+test('总闸关着：plan 返回 null，一行表情包日志都没有', (t) => {
+  const { root, cfg } = fixture(t, false);
+  const log = loggerStub();
+  const service = new StickerService(cfg, { rng: () => 0, logger: log });
+  assert.equal(service.plan({ platform: 'wechat', chatId: 'wxid-off', chatType: 'private' }, '炸毛'), null);
+  assert.deepEqual(log.lines, []);
+});
+
+test('动作账本写清「原写分类」和实际发出去的分类', (t) => {
+  const { root, cfg } = fixture(t);
+  upload(cfg, root);
+  const events = [];
+  const store = {
+    appendEvent: (sessionKey, entry) => { const ts = events.length + 1; events.push({ sessionKey, ...entry, ts }); return { ts }; },
+    updateEvent: () => true,
+  };
+  const service = new StickerService(cfg, { rng: () => 0, store });
+  service.plan({ platform: 'wechat', chatId: 'wxid-note', chatType: 'private' }, '猫猫头');
+  const entry = events.find((item) => String(item.detail || '').includes('原写'));
+  assert.ok(entry, 'detail 要带上原写的分类，模型下一轮才知道自己发的是什么');
+  assert.match(entry.detail, /开心\/.+（原写「猫猫头」）/);
+});
+
+test('任务超时作废要留日志，不静默改状态', (t) => {
+  const { root, cfg } = fixture(t);
+  upload(cfg, root);
+  let now = 1000;
+  const log = loggerStub();
+  const service = new StickerService(cfg, { rng: () => 0, logger: log, now: () => now });
+  assert.ok(service.plan({ platform: 'wechat', chatId: 'wxid-timeout', chatType: 'private' }, '开心'));
+  now += 91 * 1000;
+  service.status();   // 触发 reconcile
+  assert.ok(log.lines.some((line) => line.startsWith('warn') && line.includes('超时作废') && line.includes('状态=cancelled')));
+});
+
+test('根目录还有图但迁移为 0：warn 说清它们不会被发送', async (t) => {
+  const { root, cfg } = fixture(t);
+  const dir = stickers.stickerDir(cfg, root);
+  fs.mkdirSync(path.join(dir, '开心'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'root-x.gif'), GIF);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'whale-sticker-out-'));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  // 把「开心」换成链接，迁移必然失败 → 走「迁移为 0 但根目录还有图」这一支
+  fs.rmSync(path.join(dir, '开心'), { recursive: true, force: true });
+  try { fs.symlinkSync(outside, path.join(dir, '开心'), process.platform === 'win32' ? 'junction' : 'dir'); }
+  catch (err) { if (['EPERM', 'EACCES'].includes(err.code)) { t.skip('无创建链接权限'); return; } throw err; }
+  const log = loggerStub();
+  const service = new StickerService(cfg, { logger: log });
+  // 迁移已经挪到 listen 之后（startMaintenance），这里显式跑一次
+  await service.startMaintenanceNow();
+  assert.ok(log.lines.some((line) => line.startsWith('warn') && line.includes('根目录还有')), log.lines.join('|'));
+});
+
+test('桥接：mock-only Python安全行为测试', (t) => {
+  const py = process.env.WHALE_TEST_PYTHON || (process.platform === 'win32'
+    ? path.join(__dirname, '..', 'runtime', 'python', 'python.exe') : 'python3');
+  if (process.platform === 'win32' && !fs.existsSync(py) && !process.env.WHALE_TEST_PYTHON) {
+    t.skip('未提供便携Python；可设 WHALE_TEST_PYTHON 运行纯mock桥接测试'); return;
+  }
+  const result = spawnSync(py, ['-B', path.join(__dirname, 'test_sticker_transport.py')], { stdio: 'inherit' });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0);
+});

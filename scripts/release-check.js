@@ -1,0 +1,182 @@
+'use strict';
+
+/**
+ * 发布前自检：打 zip 之前跑一遍，防止「代码改了但没进包」。
+ *
+ * 起因：3.0.3 的包里 web/index.html 还是旧的，导致「设置里找不到看图 API」，
+ * 而源目录 D: 里明明是好的 —— 因为打包时从一份没同步全的副本取的。
+ *
+ * 用法：node scripts/release-check.js [目录，默认项目根]
+ * 退出码：0 通过 / 1 有问题
+ */
+const fs = require('node:fs');
+const path = require('node:path');
+
+// 参数：第一个非 -- 开头的值是目录；--release 表示「这是发布树，不该有 data/config/runtime」
+const argv = process.argv.slice(2);
+const dirArg = argv.find((a) => !a.startsWith('--'));
+const root = path.resolve(dirArg || path.join(__dirname, '..'));
+const problems = [];
+const rows = [];
+
+function read(rel) {
+  try {
+    return fs.readFileSync(path.join(root, rel), 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+function check(name, ok, detail = '') {
+  rows.push({ name, ok, detail });
+  if (!ok) problems.push(name + (detail ? '：' + detail : ''));
+}
+
+function mustInclude(rel, needles) {
+  const text = read(rel);
+  if (!text) {
+    check(rel + ' 存在', false, '文件不存在');
+    return;
+  }
+  for (const [label, needle] of needles) {
+    check(`${rel} 含「${label}」`, text.includes(needle));
+  }
+}
+
+// 1) 看图（图片识别）这条链路
+mustInclude('src/http/routes/vision.js', [
+  ['看图测试接口', '/api/vision/test'],
+  ['返回 vision 状态', 'vision.status('],
+]);
+mustInclude('src/adapters/vision.js', [
+  ['Key 兜底解析', 'resolveKey'],
+  ['按文件头判格式', 'sniffMime'],
+  ['wxgf 提示', 'wxgf'],
+]);
+
+// 2) 主人识别
+mustInclude('src/core/master.js', [['判定函数', 'matchMaster']]);
+mustInclude('src/core/identity.js', [['剔除身份争执', 'stripMasterDispute']]);
+
+// 3) UIA 可诊断
+mustInclude('bridge/engine.py', [
+  ['ffmpeg 自检', 'ensure_ffmpeg_env'],
+  ['wxgf 转码', '_wxgf_to_jpg'],
+  ['失败原因解释', 'explain_uia_failure'],
+  ['中文路径提醒', '路径里有中文'],
+]);
+check('scripts/tools/uia-diag.py 存在', fs.existsSync(path.join(root, 'scripts', 'tools', 'uia-diag.py')));
+
+// 4) 包里不该有隐私/运行数据（只有 --release 时才检查；在开发目录里这些本来就有）
+const release = argv.includes('--release');
+if (release) {
+  check('没有 data/ 目录', !fs.existsSync(path.join(root, 'data')), '打包时要把 data/ 排除');
+  check('没有 config.json', !fs.existsSync(path.join(root, 'config.json')), '用户自己的配置不该进包');
+  check('没有 runtime/', !fs.existsSync(path.join(root, 'runtime')), '源码包不带运行时');
+  check('没有 wechatauto_db/', !fs.existsSync(path.join(root, 'wechatauto_db')), '微信数据库快照不该进包');
+} else {
+  console.log('（开发目录模式：跳过 data/、config.json、runtime/ 的检查；打包前加 --release 再跑）\n');
+}
+
+// 5) 版本号与 CHANGELOG 首条一致
+try {
+  const pkg = JSON.parse(read('package.json'));
+  const cl = read('CHANGELOG.md');
+  const m = cl.match(/^##\s*([0-9]+\.[0-9]+(?:\.[0-9]+){0,2})/m);
+  check('package.json 版本 = CHANGELOG 最新条目', Boolean(m) && m[1] === pkg.version,
+    `package=${pkg.version} changelog=${m ? m[1] : '没找到'}`);
+
+  // 6) 一个改动 = 一个版本号：不允许重复版本 / 跳号 / 空条目
+  const heads = [...cl.matchAll(/^##\s*((\d+)\.(\d+)(?:\.(\d+)(?:\.\d+)?)?)\s*$/gm)].map((x) => ({
+    raw: x[1], maj: Number(x[2]), min: Number(x[3]), pat: Number(x[4] || 0), at: x.index }));
+  const seen = new Map();
+  const dupes = [];
+  for (const h of heads) {
+    if (seen.has(h.raw)) dupes.push(h.raw);
+    seen.set(h.raw, true);
+  }
+  check('CHANGELOG 没有重复版本号', dupes.length === 0, dupes.length ? '重复：' + dupes.join(', ') : `${heads.length} 个版本`);
+
+  // 同一条主线（主.次 相同）里补丁号必须连续：3.0.0~3.0.15 不能缺 3.0.7。
+  // 只查「package.json 所在的那条线」——历史版本（比如从上游接手的 2.9.2）不一定连续。
+  const missing = [];
+  const line = `${pkg.version.split('.')[0]}.${pkg.version.split('.')[1]}`;
+  const pats = heads.filter((h) => `${h.maj}.${h.min}` === line).map((h) => h.pat);
+  if (pats.length) {
+    const max = Math.max(...pats);
+    for (let i = 0; i <= max; i += 1) if (!pats.includes(i)) missing.push(`${line}.${i}`);
+  }
+  check('版本号连续（不跳号）', missing.length === 0, missing.length ? '缺：' + missing.join(', ') : `${line}.x 共 ${pats.length} 个`);
+
+  // 每个版本都得有内容，不能只有标题
+  const empty = [];
+  for (let i = 0; i < heads.length; i += 1) {
+    const start = heads[i].at;
+    const end = i + 1 < heads.length ? heads[i + 1].at : cl.length;
+    const body = cl.slice(start, end).replace(/^##.*$/m, '').trim();
+    if (!body) empty.push(heads[i].raw);
+  }
+  check('每个版本都有说明内容', empty.length === 0, empty.length ? '空条目：' + empty.join(', ') : '');
+
+  // 7) 版本号必须在台面上可见：包名与启动横幅
+  try {
+    const build = read('scripts/build-release.ps1');
+    const dynamicPkg = /\$pkgName\s*=\s*"whale-girl-\$ver"/.test(build);
+    check('包名带完整版本号', dynamicPkg && !/'whale-girl-3\.0\.zip'/.test(build),
+      dynamicPkg ? 'whale-girl-$ver.zip' : '仍写死 whale-girl-3.0.zip');
+    const server = read('server.js');
+    check('启动横幅显示版本', /runtime\.version/.test(server) && /版本：/.test(server), '');
+  } catch (e) {
+    check('版本可见性检查可运行', false, e.message);
+  }
+} catch (e) {
+  check('package.json 可解析', false, e.message);
+}
+
+// 8) 通用复制规则排除了 PNG，预设必须单独进包；逐张校验，不能只检查清单还在。
+try {
+  const crypto = require('node:crypto');
+  const manifest = JSON.parse(read('assets/stickers/manifest.json'));
+  const files = manifest.files;
+  if (manifest.version !== 1 || !Array.isArray(files) || files.length !== 27) throw new Error('预设清单应包含 27 张图片');
+  if (new Set(files.map(item => item.file)).size !== files.length) throw new Error('预设清单包含重复文件');
+  for (const label of ['傲娇', '开心', '炸毛']) {
+    if (files.filter(item => item.file.startsWith(label + '/')).length !== 9) throw new Error(label + ' 应包含 9 张图片');
+  }
+  for (const item of files) {
+    if (!/^(傲娇|开心|炸毛)\/whale-[a-f0-9]{16}\.png$/.test(item.file)) throw new Error('预设文件路径无效');
+    const bytes = fs.readFileSync(path.join(root, 'assets', 'stickers', item.file));
+    if (crypto.createHash('sha256').update(bytes).digest('hex') !== item.sha256) throw new Error('预设图片缺失或校验失败：' + item.file);
+  }
+  check('预设表情包清单及图片完整', true, '三类各 9 张，27 张 SHA-256 一致');
+} catch (e) {
+  check('预设表情包清单及图片完整', false, e.message);
+}
+
+// 9) 不能把自己的隐私带进包里：密钥、真实 wxid、账号目录名、群号、手机号、邮箱、
+//    本机用户名路径，以及 exe/dll 里的调试路径。
+//    这些以前都漏过：BUGS.md 写了真实路径、真实小号目录名进了测试、带 PDB 路径的 exe
+//    进了仓库。规则与遍历统一收在 scripts/privacy-scan.js，这里只把它接进自检。
+try {
+  const privacy = require('./privacy-scan');
+  const result = privacy.scan(root);
+  const brief = result.findings.slice(0, 4).map((f) => `${f.file}（${f.rule}）`).join('、');
+  check('没有个人信息（密钥 / 真实 wxid / 群号 / 手机号 / 邮箱 / 本机用户名 / 二进制路径）',
+    result.findings.length === 0,
+    result.findings.length ? brief : `${result.files} 个文本 + ${result.binaries} 个二进制干净`);
+} catch (e) {
+  check('个人信息检查可运行', false, e.message);
+}
+
+const pad = (s, n) => String(s) + ' '.repeat(Math.max(0, n - String(s).length));
+console.log(`发布自检：${root}\n`);
+for (const r of rows) {
+  console.log(`${r.ok ? '✓' : '✗'} ${pad(r.name, 46)}${r.detail || ''}`);
+}
+console.log('');
+if (problems.length) {
+  console.error(`发现 ${problems.length} 个问题，先修再打包：`);
+  for (const p of problems) console.error('  - ' + p);
+  process.exit(1);
+}
+console.log(`全部通过（${rows.length} 项）`);

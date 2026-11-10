@@ -1,0 +1,64 @@
+# 运行时数据：包含 API Key、聊天记录、人设、词库、日志、微信数据库快照，绝不入库
+data/
+config.json
+wechatauto_logs/
+# 启动器更新器的工作备份（release.json / whale-http.js），属于运行时数据
+backup/
+wechatauto_db/
+
+# 包内自带的 Node + Python 运行时（发行包用，不入库；setup-runtime.ps1 装出来的）
+runtime/
+
+# 依赖 / 缓存
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 日志 / 临时产物
+*.log
+*.tmp
+*.zip
+dist/
+release/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 收集原图保留在本机；入库与发布只使用整理后的 assets/stickers。
+/鲸鲸表情包/
+
+# 微信安装包 / 本地工具（tools/ 是项目自己的热键脚本，要入库）
+# vendor/ 下是固定进仓库的上游源码（见 vendor/README.md），只忽略下载包与临时目录
+vendor/*.zip
+vendor/*.tar.gz
+vendor/tmp/
+scripts/node-path.local
+
+# 桥接 OCR 的临时截图
+wechatauto_ocr_tmp.png
+
+.obsidian/
+# 4.0 构建产物：启动器成品要入库，下载即用
+# （launcher/bin、launcher/obj 是中间产物，含本机绝对路径，不入库）
+launcher/bin/
+launcher/obj/
+launcher/publish/*.pdb
+
+# 项目内编译工具与审查产物
+.tools/
+artifacts/
+
+# 启动器回归测试的构建缓存
+tests/launcher/**/bin/
+tests/launcher/**/obj/
+
+# 便携运行环境随发行包提供，不提交 Python 依赖及运行时缓存
+runtime/
+
+# 本机备份与新增语音功能测试产物，不上传 GitHub
+/backup/
+/tests/voice-send/bin/
+/tests/voice-send/obj/
