@@ -22,10 +22,17 @@ const FRIENDLY = {
   429: '这家的额度/频率用完了（HTTP 429）。千问常见是免费额度用完，换 qwen3.8-flash 或 qwen3.7-flash 试试；别的服务商就是额度或限流。',
   404: '这个模型名服务商用不了（HTTP 404）。千问的话换成 qwen3.8-flash / qwen3.7-plus / qwen3.8-max 之一。',
   network: '信号被洋流卷走了…再说一次好不好？',
-  timeout: '人家潜得太深，回应慢了…等一下下再问我一次？',
+  timeout: ['人家潜得太深，回应慢了…等一下下再问我一次？', '深海信号有点堵…人家游回来再说一遍好不好？', '这会儿洋流太急啦，人家话都卡住了…过会儿再聊这句？'],
   empty: '咕噜…这次只吐出了个空泡泡，再说一遍好不好？',
   default: '呜…深海线路打结了，等会儿再来找人家嘛 (｡•́︿•̀｡)',
 };
+
+/** 值可以是字符串或数组（数组=每次随机挑一条）：超时这类高频提示，固定文案
+ *  连发两遍会像复读机（两条并行会话同时超时时尤其明显）。 */
+function friendlyPick(value) {
+  if (Array.isArray(value)) return value[Math.floor(Math.random() * value.length)] || value[0];
+  return value;
+}
 
 class LlmError extends Error {
   constructor(userMessage, { code = 'unknown', status = 0, retryable = false, detail = '' } = {}) {
@@ -657,7 +664,7 @@ class DeepSeekClient {
         (res) => resolve({ req, res })
       );
       req.setTimeout(this.timeoutMs, () => {
-        req.destroy(new LlmError(FRIENDLY.timeout, { code: 'timeout', detail: 'request timeout' }));
+        req.destroy(new LlmError(friendlyPick(FRIENDLY.timeout), { code: 'timeout', detail: 'request timeout' }));
       });
       req.on('error', (err) => {
         if (err instanceof LlmError) return reject(err);
@@ -913,7 +920,7 @@ class DeepSeekClient {
         if (signal && signal.aborted) {
           // 总超时（不是调用方主动取消）报成可识别的 timeout，别把「aborted」当文案发给用户
           throw deadline.timedOut
-            ? new LlmError(FRIENDLY.timeout, { code: 'timeout', detail: 'total timeout ' + deadline.totalMs + 'ms', retryable: false })
+            ? new LlmError(friendlyPick(FRIENDLY.timeout), { code: 'timeout', detail: 'total timeout ' + deadline.totalMs + 'ms', retryable: false })
             : new LlmError('aborted', { code: 'aborted' });
         }
         lastErr = err;
@@ -1046,7 +1053,7 @@ class DeepSeekClient {
     } catch (err) {
       // 等响应头阶段就被总超时打断：报 timeout，别让 LlmError('aborted') 冒给用户
       if (deadline.timedOut) {
-        throw new LlmError(FRIENDLY.timeout, { code: 'timeout', detail: 'stream total timeout ' + deadline.totalMs + 'ms', retryable: false });
+        throw new LlmError(friendlyPick(FRIENDLY.timeout), { code: 'timeout', detail: 'stream total timeout ' + deadline.totalMs + 'ms', retryable: false });
       }
       throw err;
     }
@@ -1096,7 +1103,7 @@ class DeepSeekClient {
     } catch (err) {
       // 中途断流也要区分：总超时抛 timeout（可识别），调用方主动取消静默返回
       if (deadline.timedOut) {
-        throw new LlmError(FRIENDLY.timeout, { code: 'timeout', detail: 'stream total timeout ' + deadline.totalMs + 'ms', retryable: false });
+        throw new LlmError(friendlyPick(FRIENDLY.timeout), { code: 'timeout', detail: 'stream total timeout ' + deadline.totalMs + 'ms', retryable: false });
       }
       if (err instanceof LlmError) throw err;
       if (signal && signal.aborted) return;

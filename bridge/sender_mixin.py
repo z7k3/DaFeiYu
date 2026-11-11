@@ -436,6 +436,18 @@ class SenderMixin:
             return False
         if not self.account_send_allowed('发送'):
             return False
+        # 连续相同回复折叠：两条并行会话同时撞上 LLM 超时/失败时，固定兜底文案会
+        # 一字不差地发两遍，群里看就是复读。90 秒内同会话同文本只发第一遍，
+        # 第二遍按「已送达」处理（不触发兜底通道，避免第三次重复）。
+        if not hasattr(self, '_last_sent'):
+            self._last_sent = {}
+        _dedupe_key = chat_username or chat_display_name
+        _prev_t, _prev_text = self._last_sent.get(_dedupe_key, (0, ''))
+        if text.strip() and text.strip() == _prev_text and G.time.time() - _prev_t < 90:
+            G.log('90 秒内已发过同样内容，折叠这次重复（不重复发送）→', chat_display_name)
+            self._last_sent[_dedupe_key] = (G.time.time(), text.strip())
+            return True
+        self._last_sent[_dedupe_key] = (G.time.time(), text.strip())
         with self.send_lock, G._SendStateScope(len(text)):
             if not self.send_policy_allows(chat_username, chat_display_name):
                 return False
