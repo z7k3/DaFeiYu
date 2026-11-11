@@ -542,7 +542,14 @@ class Bot {
       for (const [uid, value] of Object.entries(targets)) {
         if (nowMs - Number(value.ts || 0) > 60000) delete targets[uid];
       }
+      // 主人喊她的别名（config.persona.aliases，即启动器「别名/外号」一栏）→ 正是在叫她：
+      // 就算这条同时在跟别人说话（"@抚琴 刚才鲸鲸说的那个梗"），也不算 addressed_to_other，
+      // masterAlwaysReply 会接手——否则她会对主人的点名装聋。
+      const masterCalledHer = matchMaster(this.config, msg).isMaster
+        && (this.config.persona.aliases || []).some((a) => a && clean.text.includes(String(a)));
       if (atMe || msg.replyToBot) {
+        delete targets[msg.senderId];
+      } else if (masterCalledHer) {
         delete targets[msg.senderId];
       } else if (mentionedNames.length && !this.engagedSetHas(session, msg.senderId, nowMs)) {
         // 说话人正在和她的对话窗口内（engaged）时，提到别人名字只算「聊到那个人」，
