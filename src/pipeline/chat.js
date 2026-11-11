@@ -180,6 +180,16 @@ class Bot {
     return this.chainKeyFor({ platform: msg.platform, chatType: msg.chatType, chatId: msg.chatId });
   }
 
+  /** 说话人是否在她的「正在对话」窗口内（engagedMinutes 内说过话/被回复过）。 */
+  engagedSetHas(session, senderId, nowMs) {
+    const set = session && session.state && session.state.engagedSet;
+    if (!set) return false;
+    const ts = Number(set[String(senderId || '')] || 0);
+    if (!ts) return false;
+    const win = Math.max(1, Number(this.config.group.engagedMinutes) || 6) * 60000;
+    return nowMs - ts <= win;
+  }
+
   /**
    * 主人/群友在微信里直接教她：写知识库（分层与配额见 src/kb/store.js）。
    * 主人 → 全局条目（设定/规则）；群友 → 只能写「关于他自己」的条目（防污染）。
@@ -534,10 +544,12 @@ class Bot {
       }
       if (atMe || msg.replyToBot) {
         delete targets[msg.senderId];
-      } else if (mentionedNames.length) {
+      } else if (mentionedNames.length && !this.engagedSetHas(session, msg.senderId, nowMs)) {
+        // 说话人正在和她的对话窗口内（engaged）时，提到别人名字只算「聊到那个人」，
+        // 不算「在跟那个人说话」——否则评图/转述场景会被误判成 addressed_to_other 漏答。
         targets[msg.senderId] = { names: mentionedNames, ts: nowMs };
         msg.directedElsewhere = true;
-      } else if (targets[msg.senderId] && /你|您/.test(clean.text)) {
+      } else if (targets[msg.senderId] && /你|您/.test(clean.text) && !this.engagedSetHas(session, msg.senderId, nowMs)) {
         msg.directedElsewhere = true;
         msg.inferredTargetNames = targets[msg.senderId].names;
       }
@@ -707,7 +719,8 @@ class Bot {
       const namedHer = guard ? bareRobot || pointedRobot : /(鲸鲸|小鲸|肥鱼|机器人|人机|bot)/i.test(said);
       const talkingToHer =
         Boolean(msg.replyToBot) ||
-        (String(state.engagedBy || '') === String(msg.senderId || '') && Number(state.engagedUntil) > nowMs);
+        (String(state.engagedBy || '') === String(msg.senderId || '') && Number(state.engagedUntil) > nowMs) ||
+        this.engagedSetHas(session, msg.senderId, nowMs);
       // L1：这条明明在跟别人说话（@了别人 / 出现其他成员名字 / 第三人称指代）→ 不算骂她
       let talkingToOthers = false;
       if (guard) {
@@ -735,6 +748,16 @@ class Bot {
     // 不能让旁人的闲聊把窗口续下去。
     if (isGroup && ['addressed', 'directed', 'engaged', 'insulted'].includes(triggerResult.reason)) {
       state.engagedUntil = nowMs + Math.max(1, Number(this.config.group.engagedMinutes) || 6) * 60000;
+    }
+    // 刚和她说上话的人（含 freeChat 抽中的）都进「正在对话」集合：接下来 TA 的追问
+    // 不再被当成旁听/对别人说话（单值 engagedBy 在两人同时对话时会漏）。
+    if (isGroup && triggerResult.wake) {
+      const set = session.state.engagedSet || (session.state.engagedSet = {});
+      set[String(msg.senderId || '')] = nowMs;
+      const win = Math.max(1, Number(this.config.group.engagedMinutes) || 6) * 60000;
+      for (const [u, ts] of Object.entries(set)) {
+        if (nowMs - Number(ts) > win) delete set[u];
+      }
     }
     if (muted) {
       return { action: 'ignore', reason: 'muted', key, msg, atMe };
@@ -947,7 +970,7 @@ class Bot {
     // 只有在正跟她对话（@她 / 回复她 / 同一个人的接话窗口）时，「你」才指向她。
     const inConversationWithSender =
       Boolean(atMe || msg.replyToBot) ||
-      (isGroup && String(state.engagedBy || '') === String(msg.senderId || '') && Number(state.engagedUntil) > nowMs);
+      (isGroup && ((String(state.engagedBy || '') === String(msg.senderId || '') && Number(state.engagedUntil) > nowMs) || this.engagedSetHas(session, msg.senderId, nowMs)));
     // 直接点名她/叫机器人，无论谁说的都算
     const namedHer = /(鲸鲸|小鲸|肥鱼|机器人|人机|bot)/i.test(heardText);
     // 正在跟她对话的人，哪怕只说「傻逼」两个字、不带「你」不带名字，也是在骂她；

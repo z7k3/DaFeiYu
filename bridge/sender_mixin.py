@@ -456,9 +456,24 @@ class SenderMixin:
                         G.log('发送成功（后台通道，%.1fs）→ %s' % (G.time.time() - t_start, chat_display_name))
                         return True
                 except G.DraftDirtyError as e:
+                    # 脏输入高发于「用户此刻正在微信里打字」：输入法组合吞掉 WM_CHAR，回读为空。
+                    # 探测失败时输入已被重置，等 2.5 秒重试一次同一通道是安全的；再失败才放弃。
                     allow_mark_dead = False
-                    G.log_error('发送暂停：%s' % e)
-                    return False
+                    G.log('发送暂停（%s），2.5 秒后重试一次后台通道' % e)
+                    G.time.sleep(2.5)
+                    G.touch()
+                    try:
+                        if self.bg_send(text, chat_display_name, chat_username):
+                            self._mark_send_ok(chat_username)
+                            G.log('发送成功（后台通道重试，%.1fs）→ %s' % (G.time.time() - t_start, chat_display_name))
+                            return True
+                        G.log_error('后台通道重试后仍未发出，放弃这条')
+                        return False
+                    except G.ChatIdentityError as e2:
+                        G.log_error('会话核对没通过，这条不发（%s）：%s' % (chat_display_name, e2))
+                        return False
+                    except Exception as e2:
+                        G.log('后台通道重试异常，继续用旧通道：', repr(e2))
                 except G.ChatIdentityError as e:
                     G.log_error('会话核对没通过，这条不发（%s）：%s' % (chat_display_name, e))
                     return False
