@@ -427,8 +427,13 @@ class DeepSeekClient {
       this._saveCaps(modeOn ? { on: used } : { off: used });
     }
     if (!modeOn && reasoningTokens > 0) {
-      // 关了还在想：记下来，后续直接按思考给预算
-      this._saveCaps({ offThinks: true, offReasoningTokens: reasoningTokens });
+      // 关了还在想：记下来，后续直接按思考给预算。取历史最大值——思考长度随
+      // 输入波动（上次 1006 这次 3200），用「最后一次」会导致预算震荡、反复撞墙。
+      const prevCaps = this._capsFor();
+      this._saveCaps({
+        offThinks: true,
+        offReasoningTokens: Math.max(Number(prevCaps && prevCaps.offReasoningTokens) || 0, reasoningTokens),
+      });
     }
     if (maxTokens > 0 && reasoningTokens / maxTokens > 0.7) {
       this._bumpCeiling(`思考占用 ${Math.round((reasoningTokens / maxTokens) * 100)}%`);
@@ -856,6 +861,9 @@ class DeepSeekClient {
             thinkingFallback = true;
             modeOn = false;
             forcedBudget = Number(payload.max_tokens || payload.max_completion_tokens) || 0;
+            // 重试别沿用同一个天花板：这次思考到上限都没写完，说明它想要的思考空间
+            // 超过了预算——重试要加上内容余量（封顶 6000），否则同样空响应再来一遍。
+            forcedBudget = Math.min(6000, forcedBudget + 1200);
             resetCandidates();
             this._bumpCeiling('空响应且思考吃满');
             this.logger && this.logger.warn(`模型返回${emptyDetail}，思考吃满预算，切到关思考档重试一次`);
