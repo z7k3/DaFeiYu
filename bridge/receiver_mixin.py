@@ -37,6 +37,27 @@ def parse_quote(content):
     }
 
 
+# 收集的表情包自动分类：识别文本（emoji_vision 的描述）里带情绪词，关键词映射到
+# 发送分类——模型下次就能用 [[sticker:分类名]] 引用群里学来的表情包。
+# 顺序即优先级（先匹配更独特的情绪）；都不命中落「收集」兜底。
+_STICKER_CATEGORY_RULES = [
+    ('炸毛', '生气|发怒|愤怒|暴躁|炸毛|青筋|冒火|气鼓鼓|涨红'),
+    ('傲娇', '傲娇|撅嘴|嘟嘴|哼|不理你|别扭|得意|嫌弃|不屑|傲慢'),
+    ('委屈', '委屈|想哭|流泪|伤心|难过|呜呜'),
+    ('无语', '无语|尴尬|流汗|无奈|斜眼|白眼|省略号|麻了'),
+    ('可爱', '呆萌|可爱|萌|乖巧|委屈巴巴|水汪汪'),
+    ('开心', '微笑|笑|开心|高兴|兴奋|比心|喜欢|愉快'),
+]
+
+def classify_sticker(desc):
+    """按识别文本把表情包映射到分类名；都不命中返回「收集」兜底。"""
+    s = String = str(desc or '')
+    for name, keywords in _STICKER_CATEGORY_RULES:
+        if _re.search(keywords, s):
+            return name
+    return '收集'
+
+
 class ReceiverMixin:
 
     def _get_media(self):
@@ -205,6 +226,25 @@ class ReceiverMixin:
                 return ''
             text = str(data.get('text') or '').strip()[:1200]
             G.log('表情包识别（%d帧）：' % frames, text[:80])
+            # 收集的表情包自动分类：识别文本已带情绪词，映射到发送分类，模型下次
+            # 就能用 [[sticker:分类名]] 引用群里学来的表情包。sha256 命名天然去重，
+            # 每类封顶 200 张；分类失败不影响识别回复。
+            if getattr(G, 'STICKER_COLLECT', False) and text:
+                try:
+                    _cat = classify_sticker(text)
+                    _use_dir = G.os.path.join(G.ROOT, 'data', 'stickers', _cat)
+                    G.os.makedirs(_use_dir, exist_ok=True)
+                    import hashlib as _hl
+                    _head = bytes(raw[:4])
+                    _ext = '.gif' if _head.startswith(b'GIF8') else ('.jpg' if _head.startswith(b'\xff\xd8') else '.png')
+                    _name = _hl.sha256(raw).hexdigest() + _ext
+                    _dst = G.os.path.join(_use_dir, _name)
+                    if not G.os.path.exists(_dst) and len(G.os.listdir(_use_dir)) < 200:
+                        with open(_dst, 'wb') as _f:
+                            _f.write(raw)
+                        G.log('表情包已自动分类：', _cat, '|', text[:40])
+                except Exception as _exc:
+                    G.log_throttled('sticker-classify', '表情包自动分类失败（不影响识别回复）：', repr(_exc), ttl=600)
             return text
         except Exception as exc:
             if isinstance(msg, dict):
