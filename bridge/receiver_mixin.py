@@ -326,17 +326,20 @@ class ReceiverMixin:
                     return
                 content = '（对方发了一条语音，说的是：%s）' % said
             if mtype not in ('文本', '语音', '图片', '表情', '动画表情'):
-                if '移出群聊' in content or '移出' in content:
-                    # 确定性证据：永久拉黑（S3 的 dict 里用 inf 表示不到期）
-                    self.dead_chats[username] = float('inf')
-                    G.log('被移出群聊，停掉这个会话：', self.display_name(username))
-                    return
                 _low = content.lower()
                 if 'finderfeed' in _low or '<type>51</type>' in _low or ('视频号' in content and '<url>' in _low):
                     G.log('收到视频号卡片，装死（不识别不回）')
                     return
-                # 引用消息优先于链接卡片：正文在 <title>，被引用人在 <refermsg>。
+                # 引用解析必须最先行：引用 XML 里含任何用户文字（可能带「移出」二字、
+                # 带 <url>）——不先解析的话会被下面的拉黑/链接分支误处理。
                 _quote = parse_quote(content)
+                if not _quote and '移出群聊' in content:
+                    # 确定性证据：永久拉黑（S3 的 dict 里用 inf 表示不到期）。只认系统
+                    # 提示的全词「移出群聊」且非引用——旧版用 '移出' 二字匹配整段 XML，
+                    # 用户引用的正常原文里带「移出」就会把整个会话永久误杀。
+                    self.dead_chats[username] = float('inf')
+                    G.log('被移出群聊，停掉这个会话：', self.display_name(username))
+                    return
                 if _quote:
                     _ref_body = G.fix_garbled(_quote['quoted'])
                     try:
@@ -417,7 +420,9 @@ class ReceiverMixin:
             if is_group:
                 # 有引用时只从「回复正文」提取 @ 对象：引用块里 @ 的人是话题对象（被引用的
                 # 是 TA 的消息），不是这条消息的说话对象——否则会被误判 addressed_to_other。
-                _mention_source = _quote_reply_text if _quote_reply_text else _at_text
+                # 有引用时只认回复正文里的 @（引用正文为空=无 @，绝不能回退整段 XML——
+                # 里面的 @ 全是引用块带来的，会把话题对象误当成说话对象）。
+                _mention_source = _quote_reply_text if _quote_name else _at_text
                 for _hit in _mention_re.findall('@\\s*([^\\s@，,：:！!~～…?？。—]+)', _mention_source):
                     _name = str(_hit).strip()
                     if _name and _name not in self.aliases and (_name not in _mentioned_names):

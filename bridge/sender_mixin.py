@@ -457,17 +457,26 @@ class SenderMixin:
                         return True
                 except G.DraftDirtyError as e:
                     # 脏输入高发于「用户此刻正在微信里打字」：输入法组合吞掉 WM_CHAR，回读为空。
-                    # 探测失败时输入已被重置，等 2.5 秒重试一次同一通道是安全的；再失败才放弃。
+                    # 探测失败时输入已被重置，等 2.5 秒重试一次同一通道是安全的。
                     allow_mark_dead = False
                     G.log('发送暂停（%s），2.5 秒后重试一次后台通道' % e)
                     G.time.sleep(2.5)
                     G.touch()
+                    # bg_send 内部最多打 2 遍 + 编码探测，重试等于最多 4 遍打字——预算必须
+                    # 按「重打一遍」抬升，否则看门狗会在重试中途把整轮发送强杀掉。
+                    G.ensure_budget(min(180.0, 2.5 * (len(text) * 0.16 + 8.0) + 15.0))
                     try:
                         if self.bg_send(text, chat_display_name, chat_username):
                             self._mark_send_ok(chat_username)
                             G.log('发送成功（后台通道重试，%.1fs）→ %s' % (G.time.time() - t_start, chat_display_name))
                             return True
-                        G.log_error('后台通道重试后仍未发出，放弃这条')
+                        # 重试失败但非脏原因（tree_not_ready 等）→ 与首次行为一致放行通道矩阵；
+                        # 本条保持 allow_mark_dead=False（失败不额外计入拉黑记账）。
+                        G.log('后台通道重试仍未发出，转前台通道矩阵')
+                    except G.DraftDirtyError as e2:
+                        # 第二次脏输入绝不能落进 except Exception 拿着残留草稿走前台——
+                        # 半截草稿+新正文会拼成一条发出去（send_state 的发送契约）。
+                        G.log_error('后台通道重试仍是脏输入，放弃这条：%s' % e2)
                         return False
                     except G.ChatIdentityError as e2:
                         G.log_error('会话核对没通过，这条不发（%s）：%s' % (chat_display_name, e2))
@@ -622,6 +631,10 @@ class SenderMixin:
         if not self.account_send_allowed('@ 成员'):
             return False
         with self.send_lock, G._SendStateScope(len(text)):
+            # S1 同款：@ 成员走选人面板，目标不在列表顶部时全程可达 40 秒以上——
+            # 不抬预算/不打心跳的话，看门狗会把正常的 @ 发送误杀。
+            G.ensure_budget(min(180.0, 120.0 + len(text) * 0.16))
+            G.touch()
             if not self.send_policy_allows(chat_username, chat_display_name):
                 return False
             if not self.sticker_quarantine_allows(chat_username, chat_display_name):

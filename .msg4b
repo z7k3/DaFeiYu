@@ -1,5 +1,0 @@
-﻿- src/kb/store.js：主人全局条目/群友本人条目（按 wxid 命名空间硬隔离，配额 20条/人）/自喂文档分块；BM25 中文二元分词（标点剥除修复跨标点匹配）+ 相对阈值（小语料 IDF 塌缩自适应）
-- pipeline/chat：tryTeach 教学指令（主人记住：→全局；群友以后叫我X/记住：→本人条目；忘掉：删除；称呼同步人物卡 nickname 立即生效）；每条消息 BM25 检索 <1ms 注入 msg.kbEntries
-- persona：kbContext 注入块（静态+旧路径），可信度优先级：知识库 > 自动记忆 > 联网搜索；防注入边界
-- http/routes/kb：管理 API（status/reload/docs 上传删除，loopback-only）
-- app：kbStore.init 接线

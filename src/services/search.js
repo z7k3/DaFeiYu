@@ -119,6 +119,8 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
     if (policy.DOMAINS[intent.site]) q = q.replace(/\bsite:[a-z0-9.-]+/gi, '').trim() + ' site:' + policy.DOMAINS[intent.site];
     const value = await call('web', () => providers.searchResult(q, { ...options(), limit: 4,
       maxAgeDays: effectiveMaxAgeDays(`${text} ${q}`, intent.fresh, intent.timeRange) }));
+    // deadline 先到时 race 会整体 reject——已经拿到的结果不能跟着丢，先留在这里。
+    if (value && value.items && value.items.length) partial = value;
     // 原文类查询：搜索摘要经常只剩「歌名页/目录页」（用户看到的「都是链接没正文」就是
     // 这个）。抓前两条非百科结果页的正文补进资料——复用读链接的 SSRF 防护和缓存；
     // 死链/失效页的「正文」是站点提示语，必须剔除，不然反而污染资料。
@@ -145,6 +147,7 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
     return finish(value);
   };
   let timer, abort;
+  let partial = null;   // run() 里已经成功拿到、但整体 deadline 先到的部分结果
   try {
     return await Promise.race([
       Promise.resolve().then(run),
@@ -157,6 +160,8 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
   } catch (err) {
     const info = errorInfo(err);
     say('failed', info);
+    // 超时/中止时若已有部分结果，照常 finish——4 条相关摘要比一条 failed 有用得多。
+    if (partial && partial.items && partial.items.length) return finish(partial);
     return finish(result([], { status: 'failed', reason: info.code }));
   } finally {
     clearTimeout(timer);

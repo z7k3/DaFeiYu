@@ -201,6 +201,12 @@ def fix_garbled(text):
 
 def log_throttled(key, *args, ttl=600, emit=None):
     now = time.time()
+    # media-fail:{msg_id} 这类 key 每条失败消息加 2 个条目，数月不重启会慢慢涨——
+    # 过千条时清掉一小时前的旧条目，纯节流表不影响任何行为。
+    if len(_THROTTLE_LOG) > 1000:
+        cutoff = now - 3600
+        for k in [k for k, v in _THROTTLE_LOG.items() if isinstance(v, float) and v < cutoff]:
+            _THROTTLE_LOG.pop(k, None)
     last = _THROTTLE_LOG.get(key) or 0
     if now - last < ttl:
         _THROTTLE_LOG['__skip_' + key] = _THROTTLE_LOG.get('__skip_' + key, 0) + 1

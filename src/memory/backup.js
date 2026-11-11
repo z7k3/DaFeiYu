@@ -117,7 +117,10 @@ function summarize(bundle) {
 }
 
 function writeSnapshot(root, reason = 'manual') {
-  const bundle = collect(root, { withSecrets: true });
+  // 定时/启动快照默认脱敏：data/backups/ 最多保留 20 份，明文 Key 长期躺在磁盘上
+  // （网盘同步/误导诊断包）就是泄露面。恢复流程本来就会用当前 settings 合并回填，
+  // 快照里不含 Key 不影响恢复；确需带密钥的完整备份走导出日志包的显式选项。
+  const bundle = collect(root, { withSecrets: false });
   const { sessions, messages } = summarize(bundle);
   if (!sessions && !messages && reason !== 'manual') return null;
 

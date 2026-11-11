@@ -201,6 +201,10 @@ class Bot {
     const uid = String(msg.senderId || '').trim();
     if (!text || !uid) return null;
     const isMaster = msg.isMaster === true;
+    // 群聊只认「明确叫到她」或主人的教学：普通群聊句里 "叫我看看/别叫我等太久"
+    // 这类口语会命中教学正则，写出垃圾条目还回一句莫名其妙的确认。私聊对象
+    // 唯一（对面就是在教自己），不受此限。
+    if (msg.chatType === 'group' && !(atMe || isMaster)) return null;
     const by = isMaster ? 'master' : uid;
 
     // 遗忘：「忘掉：X」——主人删全局，群里删自己的

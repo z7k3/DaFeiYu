@@ -198,19 +198,20 @@ class StickerMixin:
             outcome = G.sticker_result('failed', 'claimed job identity did not match the request')
         else:
             outcome = self.send_sticker(claimed.get('path'), claimed.get('chat') or '', claimed.get('chatUsername') or '', claimed.get('generation'), job_id)
-        if self.sticker_gate(item.get('generation')):
-            payload = {'id': job_id, 'status': outcome['status'], 'error': outcome['error']}
-            for attempt in range(3):
-                try:
-                    resp = G.LOCAL_HTTP.post(self.sticker_base + '/api/stickers/ack', json=payload, headers=self.sticker_headers, timeout=8)
-                    if getattr(resp, 'status_code', 0) in (200, 404, 409):
-                        break
-                except Exception as exc:
-                    if attempt == 2:
-                        G.log_throttled('sticker-ack-fail', '表情包结果没能写回服务端（不影响已经发出的消息）：' + repr(exc), ttl=300)
-                G.time.sleep(0.4)
-            if self.sticker_config_now() is not None:
-                G.log('表情包结果：', outcome['status'], outcome['error'])
+        # ack 是「结果回执」不是发送：gate（开关/代际）变了也必须写回，否则服务端的
+        # job 永远停在 sending，之后开关再打开会误判重发。只报结果，不带任何内容。
+        payload = {'id': job_id, 'status': outcome['status'], 'error': outcome['error']}
+        for attempt in range(3):
+            try:
+                resp = G.LOCAL_HTTP.post(self.sticker_base + '/api/stickers/ack', json=payload, headers=self.sticker_headers, timeout=8)
+                if getattr(resp, 'status_code', 0) in (200, 404, 409):
+                    break
+            except Exception as exc:
+                if attempt == 2:
+                    G.log_throttled('sticker-ack-fail', '表情包结果没能写回服务端（不影响已经发出的消息）：' + repr(exc), ttl=300)
+            G.time.sleep(0.4)
+        if self.sticker_config_now() is not None:
+            G.log('表情包结果：', outcome['status'], outcome['error'])
         return outcome
 
     def sticker_test_loop(self):

@@ -74,7 +74,13 @@ function docsSignature() {
   try {
     const entries = fs.readdirSync(docsDir(), { withFileTypes: true })
       .filter(e => e.isFile() && /\.(txt|md)$/i.test(e.name));
-    return entries.map(e => e.name + ':' + e.mtimeMs + ':' + e.size).join('|');
+    // Dirent 没有 mtimeMs/size（实测 undefined）——签名会退化成「文件名集合」，
+    // 改文件内容不触发重载。必须 statSync 才能感知内容变更。
+    return entries.map(e => {
+      let sig = e.name;
+      try { const st = fs.statSync(path.join(docsDir(), e.name)); sig += ':' + st.mtimeMs + ':' + st.size; } catch { /* 删了就算了 */ }
+      return sig;
+    }).join('|');
   } catch {
     return '';
   }
@@ -272,7 +278,11 @@ function query(text, { uid = '', k = 3 } = {}) {
 
 function indexTerms(text) {
   const terms = tokenize(text);
-  return { terms, len: terms.length || 1 };
+  const tf = {};
+  for (const t of terms) tf[t] = (tf[t] || 0) + 1;
+  // tf 必须带：bm25Search 对没有 tf 的块直接跳过——不带的后果是全局条目
+  // 超过 5 条后检索恒为空（主人第 6 条起的教学全部失效，且极难自查）。
+  return { terms, len: terms.length || 1, tf };
 }
 
 function maybeReloadDocs() {

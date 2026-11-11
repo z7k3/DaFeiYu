@@ -366,7 +366,9 @@ class LoopMixin:
                 try:
                     payload = {'platform': 'wechat', 'uia': uia_now, 'rest': resting, 'listener': self.listener_alive(), 'ffmpeg': self.ffmpeg_available(), 'account': self.db.account, 'account_wxid': self.db.wxid, 'account_nick': self._self_nick, 'account_ok': bool(self.ACCOUNT.get('verified')), 'account_why': str(self.ACCOUNT.get('why') or ''), 'account_guard': bool(G.ACCOUNT_GUARD), 'window': self.wechat_window_state()}
                 except Exception:
-                    payload = {'platform': 'wechat', 'uia': bool(uia_now), 'rest': resting, 'listener': self.listener_alive(), 'degraded': True}
+                    # degraded 心跳里不能再调任何方法（listener_alive 也可能抛）——全用常量，
+                    # 保证这条 POST 必发：桥接活着比字段精确更重要。
+                    payload = {'platform': 'wechat', 'uia': bool(uia_now), 'rest': resting, 'listener': None, 'degraded': True}
                 headers = {'x-whale-bridge': '1'}
                 if self.token:
                     headers['x-bot-token'] = self.token
