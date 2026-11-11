@@ -1,6 +1,40 @@
 # -*- coding: utf-8 -*-
 """Bridge runtime mixin: ReceiverMixin."""
+import re as _re
+
 import engine as G
+
+
+# 引用消息（微信 4.x：type 49 复合码，appmsg type 57）在 XML 里带 <refermsg> 块：
+# <title>=回复正文，<refermsg> 里 displayname/chatusr/content = 被引用人/ID/原文。
+# 之前这类消息整条被丢弃（不在白名单类型里、也没有 <url>）——「引用 + 追问」
+# 场景她完全看不见。现在解析成一行「引用 X 的消息：「原文」」+ 回复正文。
+_QUOTE_TYPE_RE = _re.compile(r'<type>\s*57\s*</type>')
+_REFERMSG_RE = _re.compile(r'<refermsg>([\s\S]*?)</refermsg>')
+_TAG_RE = _re.compile(r'<[^>]+>')
+
+
+def parse_quote(content):
+    """解析引用消息 XML；不是引用返回 None，是引用返回 {name, uid, quoted, reply}。"""
+    if not content or '<refermsg>' not in content or not _QUOTE_TYPE_RE.search(content):
+        return None
+
+    def pick(tag, hay):
+        m = _re.search('<' + tag + r'>([\s\S]*?)</' + tag + '>', hay or '')
+        v = (m.group(1) if m else '').replace('<![CDATA[', '').replace(']]>', '')
+        return _TAG_RE.sub('', v).strip()
+
+    ref = ''
+    m = _REFERMSG_RE.search(content)
+    if m:
+        ref = m.group(1)
+    quoted = pick('content', ref)
+    return {
+        'name': pick('displayname', ref) or pick('nickname', ref),
+        'uid': pick('chatusr', ref),
+        'quoted': quoted,
+        'reply': pick('title', content),
+    }
 
 
 class ReceiverMixin:
@@ -269,6 +303,8 @@ class ReceiverMixin:
                 return
             mtype = msg.get('type') or ''
             content = G.fix_garbled((msg.get('content') or '').strip())
+            # 引用消息解析结果（非文本分支填充；文本消息恒为空）
+            _quote_uid, _quote_name, _quote_is_bot, _quote_reply_text = '', '', False, ''
             is_emoji = mtype in ('表情', '动画表情') or (mtype == '图片' and '<emoji' in content)
             if is_emoji:
                 desc = self.describe_emoji(msg)
@@ -299,14 +335,30 @@ class ReceiverMixin:
                 if 'finderfeed' in _low or '<type>51</type>' in _low or ('视频号' in content and '<url>' in _low):
                     G.log('收到视频号卡片，装死（不识别不回）')
                     return
-                import re as _re
-                mu = _re.search('<url>(.*?)</url>', content, _re.S)
-                mt = _re.search('<title>(.*?)</title>', content, _re.S)
-                if mu:
+                # 引用消息优先于链接卡片：正文在 <title>，被引用人在 <refermsg>。
+                _quote = parse_quote(content)
+                if _quote:
+                    _ref_body = G.fix_garbled(_quote['quoted'])
+                    try:
+                        _ref_body = G._GROUP_SENDER_PREFIX_RE.sub('', _ref_body, count=1).strip()
+                    except Exception:
+                        pass
+                    _ref_body = _ref_body[:300] or '（媒体消息，无文字）'
+                    _quote_name = _quote['name'] or '对方'
+                    _quote_uid = _quote['uid'] or ''
+                    _quote_is_bot = bool(_quote_uid and _quote_uid == getattr(self, 'me', ''))
+                    _reply_body = G.fix_garbled(_quote['reply'] or '').strip()
+                    _quote_reply_text = _reply_body
+                    content = ('（引用 %s 的消息：「%s」）\n%s' % (_quote_name, _ref_body, _reply_body)).strip()
+                    G.log('收到引用消息：引用了 %s 的「%s」' % (_quote_name, _ref_body[:30]))
+                else:
+                    import re as _re
+                    mu = _re.search('<url>(.*?)</url>', content, _re.S)
+                    if not mu:
+                        return
+                    mt = _re.search('<title>(.*?)</title>', content, _re.S)
                     title = (mt.group(1).strip() if mt else '')[:60]
                     content = '分享了一个链接：%s %s' % (title, mu.group(1).strip())
-                else:
-                    return
             if G.ONLY_CHATS:
                 try:
                     if self.display_name(username) not in G.ONLY_CHATS:
@@ -363,12 +415,15 @@ class ReceiverMixin:
                     G.log('补问题失败：', repr(e))
             _mentioned_names = []
             if is_group:
-                for _hit in _mention_re.findall('@\\s*([^\\s@，,：:！!~～…?？。—]+)', _at_text):
+                # 有引用时只从「回复正文」提取 @ 对象：引用块里 @ 的人是话题对象（被引用的
+                # 是 TA 的消息），不是这条消息的说话对象——否则会被误判 addressed_to_other。
+                _mention_source = _quote_reply_text if _quote_reply_text else _at_text
+                for _hit in _mention_re.findall('@\\s*([^\\s@，,：:！!~～…?？。—]+)', _mention_source):
                     _name = str(_hit).strip()
                     if _name and _name not in self.aliases and (_name not in _mentioned_names):
                         _mentioned_names.append(_name)
             G.log('收到', '群' if is_group else '私聊', self.display_name(username), '←', nickname, '（%d 字）' % len(content))
-            payload = {'chat_id': username, 'chat_type': 'group' if is_group else 'private', 'user_id': sender or 'unknown', 'senderId': sender or 'unknown', 'sender_id': sender or 'unknown', 'senderName': nickname, 'nickname': nickname, 'text': content, 'msg_id': '%s:%s:%s' % (username, msg.get('shard') or '', msg.get('local_id')), 'at_me': addressed, 'mentioned_names': _mentioned_names, 'chat_title': self.display_name(username) if is_group else ''}
+            payload = {'chat_id': username, 'chat_type': 'group' if is_group else 'private', 'user_id': sender or 'unknown', 'senderId': sender or 'unknown', 'sender_id': sender or 'unknown', 'senderName': nickname, 'nickname': nickname, 'text': content, 'msg_id': '%s:%s:%s' % (username, msg.get('shard') or '', msg.get('local_id')), 'at_me': addressed, 'reply_to_name': _quote_name, 'reply_to_user_id': _quote_uid, 'reply_to_bot': _quote_is_bot, 'mentioned_names': _mentioned_names, 'chat_title': self.display_name(username) if is_group else ''}
             try:
                 headers = {'x-whale-bridge': '1'}
                 if self.token:
