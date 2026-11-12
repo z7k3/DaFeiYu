@@ -260,6 +260,7 @@ const DEFAULT_CONFIG = {
     freeChatChance: 0.06,
     cooldownSec: 0,
     masterAlwaysReply: true,
+    careReply: true,
     engagedMinutes: 6,
     silentMinutes: 10,
     maxRepliesPerMinute: 15,

@@ -53,6 +53,7 @@ const FIELDS = {
   'group.silentMinutes': { type: 'int', min: 1, max: 10080 },
   'group.engagedMinutes': { type: 'int', min: 1, max: 1440 },
   'group.masterAlwaysReply': { type: 'bool' },
+  'group.careReply': { type: 'bool' },
 
   // ---- 表情包 ----
   // 只控制“这一轮要不要在尾部提醒她带一张”，不按概率替模型选图；0 = 只靠模型自觉。

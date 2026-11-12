@@ -38,6 +38,7 @@ const { extractMentionNames } = require('../core/mentions');
 const { COMMAND_HELP, extractCommand } = require('../core/commands');
 const { cannedReply, dismissReply } = require('./stages/canned');
 const reminderCore = require('../core/reminder');
+const careRouter = require('../core/careRouter');
 const stickers = require('../adapters/stickers');
 const voiceReply = require('../core/voiceReply');
 const envInfo = require('../services/envInfo');
@@ -178,6 +179,29 @@ class Bot {
     // 拼法只此一处：handle() 的串行链、HTTP 的「回复中不许清空」守卫都必须走 chainKeyFor，
     // 各写各的早晚会再错位（routes/memory.js 就拿 chatId 查过带平台前缀的键，守卫全程失效）
     return this.chainKeyFor({ platform: msg.platform, chatType: msg.chatType, chatId: msg.chatId });
+  }
+
+  /**
+   * 关怀路由：判断一条非召唤群消息是否在表达关心/慰问/健康/情绪支持。
+   * 语义判断走一次短 LLM 调用（任何表达方式都能覆盖，不是关键词表）；
+   * 每会话 30 秒路由冷却、10 分钟关怀回应回收，防关怀刷屏。
+   */
+  async routeCare({ clean, key }) {
+    if (!this.llm || this.llm.isMock) return null;
+    const text = String((clean && clean.text) || '').trim();
+    if (!text || text.length < 4 || text.length > 80) return null;
+    const nowMs = Date.now();
+    this._careCheckAt = this._careCheckAt || {};
+    this._careReplyAt = this._careReplyAt || {};
+    if (nowMs - Number(this._careCheckAt[key] || 0) < 30000) return null;   // 路由调用节流
+    if (nowMs - Number(this._careReplyAt[key] || 0) < 600000) return null;  // 刚关怀回应过，防刷屏
+    this._careCheckAt[key] = nowMs;
+    const out = await careRouter.routeCare(this.llm, text, { timeoutMs: 2500 });
+    if (out && out.care) {
+      this._careReplyAt[key] = nowMs;
+      return { wake: true };
+    }
+    return null;
   }
 
   /** 说话人是否在她的「正在对话」窗口内（engagedMinutes 内说过话/被回复过）。 */
@@ -751,6 +775,21 @@ class Bot {
       if (guard && talkingToOthers && this.logger) {
         this.logger.info(`[group] 判定在跟别人说话，不接：${said.slice(0, 24)}`);
       }
+    }
+    // 关怀检测（语义路由）：非召唤消息如果是在表达关心/慰问/健康/情绪支持，
+    // 也值得温柔回应——requireAt 的沉默在关怀场景（群友生病、互相叮嘱）会显得冷漠。
+    // LLM 语义判断而非关键词表，任何表达方式都能覆盖；路由冷却 + 回应回收防刷屏。
+    if (!triggerResult.wake && isGroup && !atMe && !msg.isMaster
+        && this.config.group.careReply !== false && hasText && !msg.recycled) {
+      try {
+        const care = await this.routeCare({ msg, clean, key });
+        if (care && care.wake) {
+          triggerResult.wake = true;
+          triggerResult.reason = 'care';
+          msg.careReply = true;
+          if (this.logger) this.logger.info('[care] 关怀语义命中，转为温柔回应：' + String(clean.text || '').slice(0, 24));
+        }
+      } catch { /* 关怀路由失败不影响原有判定 */ }
     }
     if (!triggerResult.wake) {
       return { action: 'ignore', reason: triggerResult.reason, key, msg, atMe };

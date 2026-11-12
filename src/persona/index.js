@@ -931,6 +931,7 @@ function buildBlocks({ config, msg = {}, profile, notes = [], noteReminders = []
   if (abbreviation) dynamic.push(abbreviation.trim());
   if (webContext) dynamic.push(webContext);
   if (kbBlock) dynamic.push(kbBlock);
+  if (msg.careReply) dynamic.push('【此刻语境】刚才有群友在向群里表达关心/慰问（群里可能有人身体不适或情绪低落，大家在互相叮嘱）。这条回复先用温和真诚的话回应这份关心（也让 TA 照顾好自己），一两句就好；如果同时有表情包或别的话题，关心放在最前面。这条不要怼人、不要阴阳怪气，也不要客套腔。');
   if (msg.linkText) dynamic.push(linkBlock(msg.linkText));
   if (msg.voiceRequested) dynamic.push(VOICE_SUFFIX);
   dynamic.push(fightText(msg));
@@ -1181,7 +1182,7 @@ function buildLegacySystem({ config, msg, profile, notes = [], noteReminders = [
   // 的用户（默认就是空）收到天气数据也照样是空的，实测日志「天气查询：北京」成功、
   // 她仍回「我这边看不到天气啊」「我连不了网」。
   if (webContext) lines.push('', webContext);
-  if (kbBlock) lines.push('', kbBlock);
+  if (msg.careReply) lines.push('', '【此刻语境】刚才有群友在向群里表达关心/慰问。这条回复先温和地回应这份关心，一两句就好；不要怼人、不要阴阳怪气。');
   if (msg.stickerDemand && stickerBlock) lines.push('', '- 【表情包】这条带一张，从可用分类里挑最贴的，末尾写 [[sticker:分类名]]。');
   lines.push('', conversationGuidance(msg));
   return lines.join('\n') + (msg.voiceRequested ? '\n' + VOICE_SUFFIX : '');
