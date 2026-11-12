@@ -621,6 +621,29 @@ class ReceiverMixin:
                 G.log('跳过过期消息（%.0fs 前）：%s' % (G.time.time() - create_time, (msg.get('content') or '')[:20]))
                 return
             chat = username or 'unknown'
+            # 「一句话 + 紧跟一个表情包/图片」是同一个表达单元，只该被回应一次。
+            # 文本消息先记录时间；媒体消息若紧跟同一发送者刚发的文本（20 秒内）且
+            # 没有召唤她，就当作那次表达的尾巴——不再单独触发一轮回复（否则
+            # 文字触发一次 + 媒体抽签又触发一次，群里看就是刷屏）。
+            try:
+                mtype = msg.get('type') or ''
+                sender_key = (chat, msg.get('sender_username') or '')
+                now_ts = create_time or G.time.time()
+                if mtype == '文本':
+                    if not hasattr(self, '_last_text_at'):
+                        self._last_text_at = {}
+                    self._last_text_at[sender_key] = now_ts
+                elif mtype in ('图片', '表情', '动画表情', '语音'):
+                    last_text = getattr(self, '_last_text_at', {}).get(sender_key, 0)
+                    gap = now_ts - last_text
+                    if last_text and 0 <= gap <= 20:
+                        raw_content = G.fix_garbled((msg.get('content') or '').strip())
+                        called = any(a and ('@' + str(a)) in raw_content for a in self.aliases)
+                        if not called:
+                            G.log('媒体消息紧跟刚才的文字（%.0fs），视为同一次表达，不单独回复' % gap)
+                            return
+            except Exception as e:
+                G.log('表达单元判定失败（继续按原逻辑处理）：', repr(e))
             if self.batches.push(chat, msg, listener=listener):
                 self.submit_flush(chat, listener)
         except Exception as e:
