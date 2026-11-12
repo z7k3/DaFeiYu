@@ -621,15 +621,19 @@ class ReceiverMixin:
                 G.log('跳过过期消息（%.0fs 前）：%s' % (G.time.time() - create_time, (msg.get('content') or '')[:20]))
                 return
             chat = username or 'unknown'
-            if self.batches.push(chat, msg):
-                try:
-                    queued = self.pipeline.submit(chat, self.flush_chat, chat, listener)
-                except Exception:
-                    queued = False
-                if not queued:
-                    self.batches.release(chat)
+            if self.batches.push(chat, msg, listener=listener):
+                self.submit_flush(chat, listener)
         except Exception as e:
             G.log('提交消息处理失败：', repr(e))
+
+    def submit_flush(self, chat, listener):
+        """把会话攒批投递给管线；投递失败时放回待处理（断句定时器/下条消息会再试）。"""
+        try:
+            queued = self.pipeline.submit(chat, self.flush_chat, chat, listener)
+        except Exception:
+            queued = False
+        if not queued:
+            self.batches.release(chat)
 
     def recent_chats(self, limit=2, within=1800):
         out = []

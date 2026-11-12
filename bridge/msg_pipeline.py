@@ -26,6 +26,7 @@
 `python scripts/bridge-pipeline-selftest.py` 验证。
 """
 
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +57,40 @@ def mergeable(messages):
     return len(messages) > 1 and all((m.get("type") or "") == "文本" for m in messages)
 
 
+# —— 断句等待：把「一句话拆成几条发」的碎片等齐 ———
+
+# 句中出现这些词且没有句末标点：大概率话没说完（「上班已经上到」）
+_INCOMPLETE_CONN_RE = re.compile(
+    r'已经|还没|还没有|刚刚|正在|我想|我想说|我感觉|感觉|觉得|但是|可是|然后|因为|所以|'
+    r'就是|准备|打算|要不要|是不是|能不能|会不会|好不好'
+)
+_SENTENCE_END_RE = re.compile(r'[。！？!?~～⁉⁇]$')
+
+def _text_of(item):
+    it = item or {}
+    return str(it.get('content') or it.get('text') or '')
+
+def looks_incomplete(text):
+    """这条像不像被拆成两半的前半段。
+
+    有句末标点（。！？~…）结尾 → 默认说完；以逗号/冒号收尾 → 明显还有下半句；
+    句中含续接词（已经/还没/但是…）→ 大概率没说完；又短（≤14 字）又没有任何
+    标点 → 群聊连发习惯下的碎片，等一等。
+    """
+    s = (text or '').strip()
+    if not s or len(s) > 40:
+        return False
+    if _SENTENCE_END_RE.search(s):
+        return False
+    if s[-1] in '，,、：:—-':
+        return True
+    # 续接词只在 ≤20 字的消息里才算信号：长句不带标点的人本来就不打标点，
+    # 「但是」「已经」出现在完整长句里太常见，按它判定会误延迟。
+    if len(s) <= 20 and _INCOMPLETE_CONN_RE.search(s):
+        return True
+    return len(s) <= 14
+
+
 class MessageBatches:
     """按会话攒消息：等这个会话的上一轮跑完，再整批交出去。
 
@@ -70,18 +105,32 @@ class MessageBatches:
     顺序跑」。push 返回 True 时，调用方才需要向 Pipeline 投一次 flush。
     """
 
-    def __init__(self, limit=8, log=None):
+    def __init__(self, limit=8, log=None, flush_due=None,
+                 incomplete_wait=8.0, incomplete_max=20.0):
         self.limit = max(1, int(limit))
         self.log = log or (lambda *a: None)
+        # 断句等待到期时回调 flush_due(chat, listener)：等同一个人发完下半句再投递
+        self.flush_due = flush_due
+        self.incomplete_wait = max(0.0, float(incomplete_wait))
+        self.incomplete_max = max(self.incomplete_wait, float(incomplete_max))
         self._guard = threading.Lock()
+        self._timers = {}       # chat -> 断句等待的 Timer
+        self._listeners = {}    # chat -> 最后一条消息的 listener（延迟投递要用）
+        self._wait_started = {} # chat -> 等待开始时间（顺延封顶用）
         self._pending = {}          # chat -> [msg]
         self._flush_queued = set()  # 已经排了 flush、还没被 take 的会话
         self.stats = {"in": 0, "batches": 0, "merged": 0, "dropped": 0}
 
-    def push(self, chat, item):
-        """攒一条。返回 True 表示这个会话还没有排队的 flush，调用方要投一个。"""
+    def push(self, chat, item, listener=None):
+        """攒一条。返回 True 表示这个会话还没有排队的 flush，调用方要投一个。
+
+        首条消息如果像「拆成两半的前半段」（looks_incomplete），不立即投：起定时器
+        等 incomplete_wait 秒，等同一个人发完下半句，再由 flush_due 一次性投递。
+        等待期间同一个人又发碎片且仍未说完 → 顺延等待（总量 incomplete_max 封顶）。
+        """
         chat = chat or "_"
         with self._guard:
+            self._listeners[chat] = listener
             q = self._pending.setdefault(chat, [])
             q.append(item)
             self.stats["in"] += 1
@@ -93,7 +142,22 @@ class MessageBatches:
                 self.log("会话 %s 一轮攒了超过 %d 条，丢掉最早的一条" % (chat, self.limit))
             if chat not in self._flush_queued:
                 self._flush_queued.add(chat)
+                if self.flush_due and self.incomplete_wait > 0 and looks_incomplete(_text_of(item)):
+                    self._arm_wait(chat, self.incomplete_wait)
+                    self.log('像拆成两半的前半段，等 %.0f 秒看下半句：%s'
+                             % (self.incomplete_wait, _text_of(item)[:24]))
+                    return False
                 return True
+            # 等待期间同一个人又发碎片且仍未说完 → 顺延（总量封顶，避免无限等）
+            if chat in self._timers and self.flush_due and self.incomplete_wait > 0 \
+                    and looks_incomplete(_text_of(item)):
+                elapsed = time.time() - self._wait_started.get(chat, time.time())
+                extra = min(self.incomplete_wait, max(0.0, self.incomplete_max - elapsed))
+                if extra > 0.5:
+                    old_timer = self._timers.get(chat)
+                    if old_timer:
+                        old_timer.cancel()
+                    self._arm_wait(chat, extra)
             return False
 
     def take(self, chat):
@@ -105,11 +169,31 @@ class MessageBatches:
         chat = chat or "_"
         with self._guard:
             self._flush_queued.discard(chat)
+            self._timers.pop(chat, None)
             items = self._pending.pop(chat, [])
             if items:
                 self.stats["batches"] += 1
                 self.stats["merged"] += max(0, len(items) - 1)
         return items
+
+    def _arm_wait(self, chat, delay):
+        self._wait_started[chat] = time.time()
+        t = threading.Timer(delay, self._fire_wait, args=(chat,))
+        t.daemon = True
+        self._timers[chat] = t
+        t.start()
+
+    def _fire_wait(self, chat):
+        with self._guard:
+            self._timers.pop(chat, None)
+            listener = self._listeners.get(chat)
+        # 回调必须在锁外调：submit → worker → take 会再进 _guard，同线程重入会死锁
+        cb = self.flush_due
+        if cb:
+            try:
+                cb(chat, listener)
+            except Exception as e:
+                self.log('断句等待触发的投递失败：', repr(e))
 
     def release(self, chat):
         """放弃「已排 flush」的标记（投递失败时用）。消息仍留在待处理里。"""
