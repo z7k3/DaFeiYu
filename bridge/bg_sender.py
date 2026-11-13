@@ -553,8 +553,7 @@ class WeChatSender:
         直接发 UTF-16 码点会乱码（`鲸` U+9CB8 → `笢`），所以调用方必须
         先 `encode("gbk")` 再逐字节发。
         """
-        self._post(WM_SETFOCUS, 0, 0)              # 伪焦点（§4.5）
-        time.sleep(TIMING["focusGap"])
+        _pseudo_focus(self)
         for b in payload:
             self._post(WM_CHAR, b, 1)
             time.sleep(char_gap)
@@ -562,8 +561,7 @@ class WeChatSender:
 
     def type_units(self, units, char_gap=0.04):
         """逐个投递 UTF-16 码元（微信 4.2+ 的 WM_CHAR 语义）。"""
-        self._post(WM_SETFOCUS, 0, 0)
-        time.sleep(TIMING["focusGap"])
+        _pseudo_focus(self)
         for u in units:
             self._post(WM_CHAR, u, 1)
             time.sleep(char_gap)
@@ -1063,6 +1061,79 @@ def _uia_write(edit, text):
         return True
     except Exception:
         return False
+
+
+# 伪焦点 WM_SETFOCUS 默认不再发：2026-11-13 实测（不打伪焦点 WM_CHAR 照样写进
+# 输入框），而它是「发送时窗口自己被激活到最前」的可疑来源之一。万一某台微信
+# 不打焦点就收不到字，send() 的第二次尝试会自动把它打开（见 _PSEUDO_FOCUS）。
+_PSEUDO_FOCUS = {'on': False}
+
+
+def _pseudo_focus(sender):
+    if not _PSEUDO_FOCUS['on']:
+        return
+    sender._post(WM_SETFOCUS, 0, 0)
+    time.sleep(TIMING["focusGap"])
+
+
+# 见过「回車提交无效」的窗口（例如微信设成了 Ctrl+Enter 发送）：记下来，
+# 之后直接点按钮，不再每条都先试一次回车再回退。
+_ENTER_SEND_BAD = set()
+_VK_RETURN = 0x0D
+_WM_KEYDOWN, _WM_KEYUP = 0x0100, 0x0101
+
+
+def _enter_send_ok(hwnd):
+    try:
+        return int(hwnd or 0) not in _ENTER_SEND_BAD
+    except Exception:
+        return True
+
+
+def _post_enter(hwnd, log=None):
+    """给聊天输入框投递一次回车（不抢前台）。
+
+    点击发送按钮是鼠标消息，微信（Qt）收到后会把窗口激活到最前面——用户正在用
+    别的窗口时很打断。回车是键盘消息，提交消息但不激活窗口（实测有效）。
+    """
+    try:
+        user32_ = ctypes.windll.user32
+        h = wintypes.HWND(int(hwnd))
+        lp = 1 | (0x1C << 16)          # repeat=1 + Enter 的扫描码
+        ok1 = user32_.PostMessageW(h, _WM_KEYDOWN, _VK_RETURN, lp)
+        time.sleep(0.06)
+        ok2 = user32_.PostMessageW(h, _WM_KEYUP, _VK_RETURN, lp | (1 << 30) | (1 << 31))
+        return bool(ok1 and ok2)
+    except Exception as e:
+        if log:
+            log("后台通道：回车提交失败 %r" % (e,))
+        return False
+
+
+def _send_by_enter(hwnd, sender, log=None, wait=1.4):
+    """尝试用回车提交；成功（输入框清空）返回 True，失败返回 False。"""
+    if not _enter_send_ok(hwnd):
+        return False
+    if not _post_enter(hwnd, log):
+        return False
+    deadline = time.time() + max(0.4, float(wait))
+    while time.time() < deadline:
+        time.sleep(0.12)
+        if _is_blank(_composer_value(hwnd)):
+            return True
+    # 没清空：可能是这台微信设成了 Ctrl+Enter 发送，回车变成了换行。
+    # 记住这个窗口，把换行删掉再交给点击按钮的路径。
+    try:
+        _ENTER_SEND_BAD.add(int(hwnd or 0))
+    except Exception:
+        pass
+    if log:
+        log("后台通道：回车没有提交（可能设成了 Ctrl+Enter 发送），改用点击发送按钮")
+    try:
+        _clear_composer(hwnd)
+    except Exception:
+        pass
+    return False
 
 
 def _type_text(sender, edit, text, *, mode, char_gap=0.04,
@@ -1579,7 +1650,6 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
                     return False, "input_not_empty"
                 if _clear_composer(hwnd, info["edit"]):
                     log("后台通道：清掉上次没发出去的残留草稿，继续发送")
-                    log("后台通道：清掉残留草稿后继续发送")
                     info = read_ui(hwnd)
                     if info["edit"] is None:
                         return False, "no_input_field"
@@ -1653,6 +1723,11 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
                     return False, "input_dirty"
                 if attempt:
                     return False, "content_mismatch"
+                # 第一遍没写进去：很可能是这台微信需要伪焦点才收 WM_CHAR。
+                # 打开伪焦点再试一遍（默认关，因为它可能让窗口自己被激活）。
+                if not _PSEUDO_FOCUS['on']:
+                    _PSEUDO_FOCUS['on'] = True
+                    log("后台通道：第一遍没写进输入框，打开伪焦点 WM_SETFOCUS 再试一次")
                 # 纯 ASCII 或仅有空白差异时，改字节编码解决不了这次回读问题。
                 if expected.isascii() or (observed and observed.split() == expected.split()):
                     return False, "content_mismatch"
@@ -1673,11 +1748,43 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             if skipped:
                 log("后台通道：GBK 编不了 %d 个字符，已跳过" % len(skipped))
             xy = info["send_xy"]
-            if xy is None:
+            if xy is None and not _enter_send_ok(hwnd):
                 sender.end_input()
                 log("后台通道：打完字找不到发送按钮，草稿可能残留在输入框")
                 return False, "input_dirty"
-            sender.click_screen(*xy)
+            # 优先用回车提交：点击发送按钮会让微信（Qt）自己激活窗口，用户看到
+            # 「回个消息微信闪到最前面」。回车是发给输入框的键消息，实测能提交且
+            # 不激活窗口（2026-11-13 实验：PostMessage WM_KEYDOWN/UP VK_RETURN 后
+            # 输入框清空、消息真的发出去了）。
+            sent_by_enter = _send_by_enter(hwnd, sender, log)
+            if not sent_by_enter:
+                # 回车没提交（可能这台微信设成了 Ctrl+Enter 发送，回车变成了换行）。
+                # _send_by_enter 已经清过输入框，这里必须把正文重新打进去再点按钮，
+                # 否则会点着空框「发送」——验证看到空框还会误判成功，消息静默丢失。
+                retry_info = read_ui(hwnd)
+                if _composer_text(retry_info.get("value")) != expected:
+                    if retry_info.get("edit") is None:
+                        sender.end_input()
+                        log("后台通道：回车回退时找不到输入框，停止发送")
+                        return False, "input_dirty"
+                    ok2, _sk2 = _type_text(sender, retry_info.get("edit"), text,
+                                           mode=mode, char_gap=char_gap,
+                                           strip_unencodable=strip_unencodable, log=log)
+                    if not ok2:
+                        sender.end_input()
+                        return False, "input_dirty"
+                    time.sleep(TIMING["sendEnabled"])
+                    retry_info = read_ui(hwnd)
+                    if _composer_text(retry_info.get("value")) != expected:
+                        sender.end_input()
+                        log("后台通道：回车回退后正文没打进去，停止发送")
+                        return False, "input_dirty"
+                xy = retry_info.get("send_xy") or xy
+                if xy is None:
+                    sender.end_input()
+                    log("后台通道：回车没发出去且找不到发送按钮，草稿可能残留在输入框")
+                    return False, "input_dirty"
+                sender.click_screen(*xy)
             if not expected.isascii():
                 _remember_char_mode(hwnd, mode, log)
             time.sleep(TIMING["afterClick"])
