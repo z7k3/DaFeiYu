@@ -604,7 +604,7 @@ class ReceiverMixin:
             except Exception:
                 _ids = set()
             _payload_names = [n for n in (_names or []) if n not in _ids]
-            payload = {'chat_id': username, 'chat_type': 'group' if is_group else 'private', 'user_id': sender or 'unknown', 'senderId': sender or 'unknown', 'sender_id': sender or 'unknown', 'senderName': nickname, 'nickname': nickname, 'text': content, 'msg_id': '%s:%s:%s' % (username, msg.get('shard') or '', msg.get('local_id')), 'at_me': addressed, 'reply_to_name': _quote_name, 'reply_to_user_id': _quote_uid, 'reply_to_bot': _quote_is_bot, 'mentioned_names': _mentioned_names, 'self_names': _payload_names, 'self_names': _payload_names, 'chat_title': self.display_name(username) if is_group else ''}
+            payload = {'chat_id': username, 'chat_type': 'group' if is_group else 'private', 'user_id': sender or 'unknown', 'senderId': sender or 'unknown', 'sender_id': sender or 'unknown', 'senderName': nickname, 'nickname': nickname, 'text': content, 'msg_id': '%s:%s:%s' % (username, msg.get('shard') or '', msg.get('local_id')), 'at_me': addressed, 'reply_to_name': _quote_name, 'reply_to_user_id': _quote_uid, 'reply_to_bot': _quote_is_bot, 'mentioned_names': _mentioned_names, 'self_names': _payload_names, 'chat_title': self.display_name(username) if is_group else '', 'reply_body': _quote_reply_text if _quote_name else ''}
             try:
                 headers = {'x-whale-bridge': '1'}
                 if self.token:

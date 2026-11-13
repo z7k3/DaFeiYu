@@ -599,7 +599,9 @@ class Bot {
     const mentionedNames = isGroup
       ? addressing.filterSelfMentions([
         ...(Array.isArray(msg.mentionedNames) ? msg.mentionedNames : []),
-        ...extractMentionNames(isAdminSpell ? msg.text : rawText, persona.aliasList(this.config, selfNames)),
+        // 引用消息只看本条正文：引用块里的 @ 是话题对象（被引用那条的原话），
+        // 不是这条消息的说话对象；混进来会让她误判「在跟别人说话」而不回。
+        ...extractMentionNames(isAdminSpell ? msg.text : (msg.replyBody || rawText), persona.aliasList(this.config, selfNames)),
       ], selfNames).slice(0, 4)
       : addressing.filterSelfMentions(msg.mentionedNames, selfNames).slice(0, 4);
     msg.mentionedNames = mentionedNames;
@@ -816,7 +818,24 @@ class Bot {
     await this.messagePlugins.run('chat.received', pluginInput);
     const pluginTrigger = await this.messagePlugins.run('chat.pre_reply', pluginInput);
     if (pluginTrigger.action === 'skip') return { action: 'ignore', reason: 'plugin_skip', key, msg, atMe };
-    const triggerResult = this.computeTrigger({ msg, atMe, clean, isGroup, state, nowMs, isMaster, muted });
+    // 上一条消息是不是她自己发的（且刚发不久）：决定了对方说「你」时是不是在说她。
+    // 例子：她刚回完一句，群里接着说「那我超级反弹你不炸了」——没有她名字、也没有 @，
+    // 但上一句就是她说的，「你」显然指她。没这个信号时 groupAddressGuard 会当成
+    // 「在跟别人说话」直接跳过（用户实见：这两句都没回）。
+    let botSpokeLast = false;
+    if (isGroup) {
+      try {
+        const recent = this.store.messages(key, 4) || [];
+        for (let i = recent.length - 1; i >= 0; i -= 1) {
+          const m = recent[i];
+          if (!m || !m.role) continue;
+          botSpokeLast = m.role === 'assistant'
+            && nowMs - Number(m.ts || 0) <= 10 * 60000;
+          break;
+        }
+      } catch { /* 读不到历史就按没有这个信号处理 */ }
+    }
+    const triggerResult = this.computeTrigger({ msg, atMe, clean, isGroup, state, nowMs, isMaster, muted, botSpokeLast });
     if (pluginTrigger.action === 'wake' && !['silent', 'minute_cap', 'no_text'].includes(triggerResult.reason)) {
       triggerResult.wake = true;
       triggerResult.reason = 'plugin';

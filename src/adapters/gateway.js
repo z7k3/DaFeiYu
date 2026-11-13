@@ -62,6 +62,8 @@ function normalizeInbound(payload, platform) {
     replyToName: String(replyToName || ''),
     replyToUserId: String(replyToUserId || ''),
     mentionedNames: Array.isArray(mentions) ? mentions : [],
+    // 本条消息的纯正文（引用消息时不含引用块里的原文）
+    replyBody: String(firstDefined(body, ['reply_body', 'replyBody']) || ''),
     selfNames: Array.isArray(selfNames) ? selfNames.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 20) : [],
     msgId: String(firstDefined(body, ['msg_id', 'msgId', 'message_id', 'messageId', 'id']) ?? ''),
     chatTitle: String(firstDefined(body, ['chat_title', 'chatTitle', 'room_name', 'roomName', 'group_name', 'groupName', 'title']) ?? ''),

@@ -22,7 +22,7 @@ const INSULT_LOOSE_RE = /臭|破|烂|没用|闭嘴|烦人|装什么|什么玩意
  * @param {object} bot  需要 bot.config / bot.store / bot.rng
  * @param {{msg:object, atMe:boolean, clean:{text:string}, isGroup:boolean, state:object, nowMs:number, isMaster:boolean, key:string}} args
  */
-function computeTrigger(bot, { msg, atMe, clean, isGroup, state, nowMs, isMaster, key, muted = false }) {
+function computeTrigger(bot, { msg, atMe, clean, isGroup, state, nowMs, isMaster, key, muted = false, botSpokeLast = false }) {
   if (!isGroup) return { wake: true, reason: 'private' };
   // 静音优先：静音期间的消息不能清静默、不能开接话窗口，也不能产生任何状态副作用。
   if (muted) return { wake: false, reason: 'muted' };
@@ -77,6 +77,11 @@ function computeTrigger(bot, { msg, atMe, clean, isGroup, state, nowMs, isMaster
     if (!guardOn && justSpoke && toHer && txt.length <= 60) return { wake: true, reason: 'engaged_group' };
     if (guardOn && justSpoke && namedHerIn(txt, names) && !talking && txt.length <= 60) {
       return { wake: true, reason: 'engaged_group' };
+    }
+    // 上一句就是她说的，对方紧接着用「你」接话，且没提别人 → 就是在跟她说。
+    // 只靠「要有她名字」会把这种最自然的接话全漏掉（用户实见：两句都没回）。
+    if (guardOn && justSpoke && botSpokeLast && !talking && /你|你们/.test(txt) && txt.length <= 60) {
+      return { wake: true, reason: 'engaged_reply' };
     }
     return { wake: false, reason: 'engaged_side_chatter' };
   }
