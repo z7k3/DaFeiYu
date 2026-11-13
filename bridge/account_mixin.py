@@ -384,17 +384,34 @@ class AccountMixin:
                 pass
         return g
 
+    def _quiet_patches(self, gui):
+        """给窗口驱动装上「后台模式」补丁：不动别人的窗口、不抢前台。
+
+        以前只在 UIA 通道（uia_send）里装，表情包/@成员走的是同一个 gui 的
+        wechatauto 接口，于是那些路径照样会 ensure_visible() 把微信抬到最前面，
+        用户看到「回个消息窗口跳出来」。所以在创建驱动时就装好。
+        """
+        self.install_no_minimize(gui)
+        if not G.BACKGROUND_SEND:
+            return gui
+        try:
+            u = gui._get_uia() if hasattr(gui, '_get_uia') else None
+            if u is not None:
+                self.install_quiet_uia(u)
+                self.UIA_CACHE['u'] = u
+        except Exception as e:
+            G.log('后台模式补丁（UIA）没打上（行为不变）：', repr(e))
+        return gui
+
     def new_window_driver(self):
         hwnd = int(self.ACCOUNT.get('hwnd') or 0) if self.ACCOUNT.get('verified') else 0
         if hwnd:
             gui = self.WeChatGUI(hwnd=hwnd)
-            self.install_no_minimize(gui)
-            return gui
+            return self._quiet_patches(gui)
         if getattr(self, 'acct', ''):
             raise RuntimeError('尚未确认已选微信账号的窗口')
         gui = self.WeChatGUI()
-        self.install_no_minimize(gui)
-        return gui
+        return self._quiet_patches(gui)
 
     def selected_window_ready(self):
         if not getattr(self, 'acct', ''):
