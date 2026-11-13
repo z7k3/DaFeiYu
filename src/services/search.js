@@ -84,11 +84,28 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
       routeFailed: Boolean(route.failed), budgetMs: options().timeoutMs });
     const intent = policy.intent(text, route);
     let q = intent.query;
+    if (route.failed) {
+      // 路由挂了 → 用关键词规则选源，但查询词必须清洗成能搜的形式。
+      // 以前直接拿原句搜：'你知道CS去年的top20名单吗' 这种问句会把 '你知道…吗' 一起搜，
+      // 命中率极差（实测第一次 10 条全被相关性过滤拒掉，得多打两次搜索）。
+      try {
+        const cleaned = quality.cleanQuery(q);
+        if (cleaned && cleaned !== q) {
+          say('query_rewrite', { reason: 'router_failed', from: q.length, to: cleaned.length });
+          q = cleaned;
+        }
+      } catch { /* 清洗失败就用原句 */ }
+    }
     // 天气/热榜这类专用接口常要两次串行请求（地理编码 → 预报）：只分剩余预算的
     // 60% 会在慢网络下必然超时，然后退化去搜网页拿到「城市百科」这种垃圾证据。
     // 给到至少 6 秒，同时仍受总 deadline 约束。
-    const specializedDeadline = Math.min(deadline,
-      Date.now() + Math.max(6000, Math.floor(options().timeoutMs * 0.85)));
+    // 专用接口的预算要给「网页回退」留一份：天气要串行打两次（地理编码→预报），
+    // 全吃光的话失败后就只能直接报 empty（实测：700ms 预算下网页回退一次都跑不了）。
+    const totalBudget = Math.max(0, Number(options().timeoutMs) || 0);
+    const webReserve = Math.min(2500, Math.floor(totalBudget * 0.25));
+    const specializedDeadline = Math.min(
+      deadline - webReserve,
+      Date.now() + Math.max(1500, Math.floor(totalBudget * 0.75)));
     const specializedOptions = () => ({ ...options(), deadline: specializedDeadline,
       timeoutMs: Math.max(0, specializedDeadline - Date.now()) });
     if (intent.kind === 'weather') {
@@ -107,13 +124,24 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
       if (!city && !unresolvedCity) city = String(config.city || '').trim();
       if (!city && !unresolvedCity && active()) city = await locate('ip-city', () => places.ipCity(specializedOptions())) || '';
       if (city && active()) {
-        const value = await call('open-meteo', () => providers.weatherResult(city, { ...specializedOptions(), ...(place ? { place } : {}) }));
+        // open-meteo 只拿专用预算的 55%：它被墙/重置时还要给 wttr 兜底留时间。
+        const omLeft = Math.max(0, specializedDeadline - Date.now());
+        const omDeadline = Date.now() + Math.floor(omLeft * 0.55);
+        const value = await call('open-meteo', () => providers.weatherResult(city, {
+          ...specializedOptions(),
+          deadline: Math.min(specializedDeadline, omDeadline),
+          ...(place ? { place } : {}),
+        }));
         if (value.status === 'ok') return finish(value);
         remember(value);
         // open-meteo 被墙/重置时退化到 wttr.in：宁可换源，也不要掉进网页搜索
         // 拿「南昌地图/百科」当天气证据（用户实见：「全是地图百科」）。
         if (active() && typeof places.wttrResult === 'function') {
-          const alt = await call('wttr', () => places.wttrResult(city, specializedOptions()));
+          const wtLeft = Math.max(0, specializedDeadline - Date.now());
+          const alt = await call('wttr', () => places.wttrResult(city, {
+            ...specializedOptions(),
+            deadline: Math.min(specializedDeadline, Date.now() + Math.floor(wtLeft * 0.8)),
+          }));
           if (alt.status === 'ok') return finish(alt);
           remember(alt);
         }

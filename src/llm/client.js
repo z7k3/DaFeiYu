@@ -895,7 +895,10 @@ class DeepSeekClient {
           throw new LlmError(FRIENDLY.empty, { code: 'empty', detail: emptyDetail, retryable: true });
         }
         const truncated = choice.finish_reason === 'length';
-        const degenerate = looksDegenerate(text);
+        // 只对聊天正文做「跑飞」检测：检索路由/摘要这类后台调用的输出是 JSON 或结构化
+        // 文本，天生没有中文标点，会被误判成「凑字」→ 白白重试一次 → 路由器 3.5 秒
+        // 预算被吃掉一半，直接 route_failed，搜索只好退回关键词（实测 2026-11-13 19:31）。
+        const degenerate = String(purpose || 'background') === 'chat' && looksDegenerate(text);
         if ((degenerate || truncated) && !safe) {
           sawDegenerate = true;
           this.logger &&
