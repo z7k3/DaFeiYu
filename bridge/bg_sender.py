@@ -953,28 +953,80 @@ _UIA_WRITE_BAD = set()
 # 我们认识自己写过的字。
 _LAST_ATTEMPT = {}
 
+# 桥接会被看门狗重启，纯内存记忆一旦重启就失效——而输入框里的残留是留在微信里的，
+# 重启后仍会挡死发送。所以把「最近发出去的正文」落盘（只存正文和秒级时间，
+# 不存会话名/wxid），重启后照样能认出自己的残留。
+_RESIDUE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "bg-recent-sends.json")
+_RESIDUE_TTL = 30 * 60      # 30 分钟内的才算「可能是我们的残留」
+_RESIDUE_MAX = 8
+_ATTEMPT_LIST = None
+
+
+def _load_attempts():
+    global _ATTEMPT_LIST
+    if _ATTEMPT_LIST is not None:
+        return _ATTEMPT_LIST
+    rows = []
+    try:
+        with open(_RESIDUE_FILE, encoding="utf-8-sig") as f:
+            data = json.load(f)
+        for row in data if isinstance(data, list) else []:
+            try:
+                rows.append((float(row[0]), str(row[1])))
+            except Exception:
+                continue
+    except Exception:
+        rows = []
+    _ATTEMPT_LIST = rows[-_RESIDUE_MAX:]
+    return _ATTEMPT_LIST
+
 
 def _remember_attempt(hwnd, text):
+    text = str(text or "")
+    if not text:
+        return
     try:
-        _LAST_ATTEMPT[int(hwnd or 0)] = str(text or "")
+        _LAST_ATTEMPT[int(hwnd or 0)] = text
+    except Exception:
+        pass
+    rows = _load_attempts()
+    now = time.time()
+    rows.append((now, text))
+    del rows[:-_RESIDUE_MAX]
+    try:
+        os.makedirs(os.path.dirname(_RESIDUE_FILE), exist_ok=True)
+        tmp = _RESIDUE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump([[round(t, 3), x] for t, x in rows], f, ensure_ascii=False)
+        os.replace(tmp, _RESIDUE_FILE)
     except Exception:
         pass
 
 
 def _looks_like_own_residue(hwnd, value):
-    """输入框里的内容是不是我们上次没发出去的正文。"""
+    """输入框里的内容是不是我们（包括重启前）没发出去的正文。"""
+    cur = str(value or "").strip()
+    if not cur:
+        return False
+    candidates = []
     try:
         prev = _LAST_ATTEMPT.get(int(hwnd or 0))
+        if prev:
+            candidates.append(str(prev))
     except Exception:
-        prev = None
-    if not prev:
-        return False
-    cur = str(value or "").strip()
-    prev = str(prev).strip()
-    if not cur or not prev:
-        return False
-    # 完全一致，或只是我们正文的一段（发送中途中断只写进去一部分）
-    return cur == prev or prev.startswith(cur) or cur.startswith(prev)
+        pass
+    now = time.time()
+    for ts, text in _load_attempts():
+        if now - float(ts) <= _RESIDUE_TTL:
+            candidates.append(str(text))
+    for prev in candidates:
+        prev = prev.strip()
+        if not prev:
+            continue
+        # 完全一致，或只是我们正文的一段（发送中断只写进去一部分）
+        if cur == prev or prev.startswith(cur) or cur.startswith(prev):
+            return True
+    return False
 
 
 def _uia_write_reliable(hwnd):
