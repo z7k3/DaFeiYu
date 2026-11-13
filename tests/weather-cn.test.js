@@ -75,8 +75,9 @@ test('天气主接口能解析实况/预报/预警，且 999 哨兵值不会被�
 });
 
 test('城市代码解析失败时返回空结果，不抛未捕获异常', async t => {
+  // 换个城市名：同一个名字会命中结果缓存（5 分钟），测不到本次失败路径
   fakeHttps(t, { 'toy1.weather.com.cn': '([{"bad":1}])' });
-  const r = await weather.cnWeatherResult('测试城', { timeoutMs: 3000 });
+  const r = await weather.cnWeatherResult('查不到的城市名', { timeoutMs: 3000 });
   assert.ok(['empty', 'failed'].includes(r.status), '解析不到城市代码时应是空/失败，不能是 ok');
   assert.equal((r.items || []).length, 0);
 });

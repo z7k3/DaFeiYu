@@ -132,6 +132,8 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
           const cnValue = await call('cnweather', () => places.cnWeatherResult(city, {
             ...specializedOptions(),
             deadline: Math.min(specializedDeadline, Date.now() + Math.floor(cnLeft * 0.6)),
+            // 配置里的常住城市：区县同名时用它挑对（西湖/东湖/新建…）
+            parent: String(config.city || '').trim(),
           }));
           if (cnValue.status === 'ok') return finish(cnValue);
           remember(cnValue);
