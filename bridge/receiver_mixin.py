@@ -685,8 +685,9 @@ class ReceiverMixin:
                     # uncertain = worker 自己也只是"可能"（声卡不可用、播放中断都走这条）。
                     # 以前这里直接把 uncertain 当成已发出并 return，结果文字被吞、语音又没
                     # 播出去 —— 用户什么都收不到（实测 11-13 15:02 那条新闻回复凭空消失）。
-                    # 现在必须拿微信数据库里的新语音消息当证据；拿不到证据就回落文字。
-                    if voice_status == 'sent_unconfirmed' or self.voice_message_landed(username, voice_started):
+                    # 现在只有 uncertain 需要拿微信数据库里的新语音消息当证据；
+                    # 其它 True（含 worker 没给状态的极端情况）沿用原契约，直接算已处理。
+                    if voice_status != 'uncertain' or self.voice_message_landed(username, voice_started):
                         G.log('[delivery] stage=voice result=handled textFallback=false stickerFallback=false '
                               'reason=voice_confirmed status=%s' % (voice_status or '-'))
                         return

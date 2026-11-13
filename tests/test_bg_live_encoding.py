@@ -228,6 +228,28 @@ class LiveEncodingTests(unittest.TestCase):
         self.assertEqual(self.state['clears'], 0)
         self.assertEqual(self.state['text'], '用户正在编辑的草稿')
 
+    def test_own_leftover_draft_is_cleared_instead_of_blocking_forever(self):
+        """我们上次没发出去的残留：必须清掉再发。
+
+        现象（真实事故）：UIA SetValue 写进去了但微信没真发出，输入框留下草稿；
+        之后每条消息都在「有草稿」这一步直接返回 input_not_empty，等 12 秒后放弃，
+        用户看到的就是「她不回我了」。
+        """
+        leftover = '上次没发出去的回复'
+        bg._remember_attempt(4242, leftover)
+        self.state['text'] = leftover
+        self.assertEqual(self.send(), (True, 'sent'))
+        self.assertGreaterEqual(self.state['clears'], 1)
+        self.assertEqual(self.state['sent'], ['鲸鲸测试'])
+
+    def test_user_draft_is_still_never_touched_when_we_have_no_attempt_record(self):
+        """没有我们自己的发送记录时，输入框里的字一律当用户草稿，一个字都不能动。"""
+        bg._LAST_ATTEMPT.pop(4242, None)
+        self.state['text'] = '用户正在编辑的草稿'
+        self.assertEqual(self.send(), (False, 'input_not_empty'))
+        self.assertEqual(self.state['clears'], 0)
+        self.assertEqual(self.state['text'], '用户正在编辑的草稿')
+
     def test_clear_failure_stops_without_appending_another_encoding(self):
         self.state['clear_ok'] = False
         self.assertEqual(self.send(), (False, 'input_dirty'))

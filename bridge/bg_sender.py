@@ -765,7 +765,13 @@ def _composer_value(hwnd):
 
 
 def _clear_composer(hwnd, edit=None):
-    """只用已定位的输入框清理本次输入；UIA 不支持时不要盲发退格。"""
+    """清空输入框：先 SetValue("")，清不掉再用 WM_CHAR 退格兜底。
+
+    以前只靠 SetValue("")：那和打字走同一个控件模型接口，微信不吃写入时它同样
+    清不掉，于是残留草稿永远卡在框里（之后每条消息都 input_not_empty）。
+    退格是真正的输入事件，微信一定认，所以这里必须有这一层兜底。
+    """
+    value = None
     try:
         ctrl = edit
         if ctrl is None:
@@ -775,6 +781,22 @@ def _clear_composer(hwnd, edit=None):
     except Exception:
         pass
     time.sleep(0.25)
+    value = _composer_value(hwnd)
+    if _is_blank(value):
+        return True
+    # 控件模型清不掉 → 用退格真删
+    try:
+        count = max(1, min(400, len(str(value or "")) + 8))
+        sender = WeChatSender(hwnd)
+        sender._post(WM_SETFOCUS, 0, 0)
+        time.sleep(TIMING["focusGap"])
+        for _ in range(count):
+            sender._post(WM_CHAR, 8, 1)          # VK_BACK
+            time.sleep(0.008)
+        sender.end_input()
+    except Exception:
+        pass
+    time.sleep(0.3)
     return _is_blank(_composer_value(hwnd))
 
 
@@ -916,6 +938,63 @@ def encode_gbk(text, strip_unencodable=True):
 
 
 _UIA_WRITE_LOGGED = set()
+# 见过「UIA SetValue 写进去了却发不出去 / 清不掉」的窗口。
+# 上游 4.1.0 为了消灭第二个气泡丢字，把后台打字改成「优先 SetValue，失败才回退
+# WM_CHAR」；但 SetValue 是直接改控件模型，部分微信版本（本机 4.2 实测）会接受
+# 写入却不真正产生输入事件——点了发送不生效，输入框残留草稿，之后每条消息都被
+# input_not_empty 挡住，形成「等 12 秒然后放弃」的死锁。
+# SetValue 的返回值只表示「没抛异常」，不能当成功证据，所以这里按窗口记住教训，
+# 之后一律走 WM_CHAR（逐字投递本来就能发）。
+_UIA_WRITE_BAD = set()
+
+# 每个窗口最近一次「我们自己想写进去的正文」。
+# 输入框里有字时只有两种可能：用户在打字（不能动），或我们上次发送失败留下的残留
+# （必须清掉，否则后面每条都发不出去）。两者在输入框里长得一样，唯一能区分的是
+# 我们认识自己写过的字。
+_LAST_ATTEMPT = {}
+
+
+def _remember_attempt(hwnd, text):
+    try:
+        _LAST_ATTEMPT[int(hwnd or 0)] = str(text or "")
+    except Exception:
+        pass
+
+
+def _looks_like_own_residue(hwnd, value):
+    """输入框里的内容是不是我们上次没发出去的正文。"""
+    try:
+        prev = _LAST_ATTEMPT.get(int(hwnd or 0))
+    except Exception:
+        prev = None
+    if not prev:
+        return False
+    cur = str(value or "").strip()
+    prev = str(prev).strip()
+    if not cur or not prev:
+        return False
+    # 完全一致，或只是我们正文的一段（发送中途中断只写进去一部分）
+    return cur == prev or prev.startswith(cur) or cur.startswith(prev)
+
+
+def _uia_write_reliable(hwnd):
+    try:
+        return int(hwnd or 0) not in _UIA_WRITE_BAD
+    except Exception:
+        return True
+
+
+def _mark_uia_write_bad(hwnd, log=None, why=""):
+    try:
+        hwnd = int(hwnd or 0)
+    except Exception:
+        hwnd = 0
+    if not hwnd or hwnd in _UIA_WRITE_BAD:
+        return
+    _UIA_WRITE_BAD.add(hwnd)
+    if log:
+        log("后台通道：UIA SetValue 在这台微信上不可靠（%s），改用 WM_CHAR 逐字投递"
+            % (why or "写入后发不出去"))
 
 
 def _uia_write(edit, text):
@@ -944,6 +1023,14 @@ def _type_text(sender, edit, text, *, mode, char_gap=0.04,
     skipped = []
     if mode != "utf16":
         _payload, skipped = encode_gbk(text, strip_unencodable)
+    try:
+        hwnd = int(getattr(sender, "hwnd", 0) or 0)
+    except Exception:
+        hwnd = 0
+    if not _uia_write_reliable(hwnd):
+        # 这个窗口的 SetValue 已经被证实发不出去：直接走 WM_CHAR，别再重蹈覆辙
+        return sender.type_text(text, char_gap=char_gap,
+                                strip_unencodable=strip_unencodable, mode=mode)
     if _uia_write(edit, expected):
         try:
             hwnd = int(getattr(sender, "hwnd", 0) or 0)
@@ -1432,7 +1519,25 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             # 空框 UIA 读出来是 '\n'，按真值判会误报 input_not_empty（M1）；
             # 读不到（None）维持原语义：当作没草稿，继续发。
             if info["value"] is not None and not _is_blank(info["value"]):
-                return False, "input_not_empty"
+                # 框里有字：先分清是自己的残留还是用户在打字。
+                # - 用户的草稿：一个字都不能动，直接让上层等（原来的行为）。
+                # - 我们上次没发出去的残留：必须清掉，否则后面每条消息都会被
+                #   input_not_empty 挡死（用户看到的现象就是「不回」）。
+                if not _looks_like_own_residue(hwnd, info["value"]):
+                    return False, "input_not_empty"
+                if _clear_composer(hwnd, info["edit"]):
+                    log("后台通道：清掉上次没发出去的残留草稿，继续发送")
+                    log("后台通道：清掉残留草稿后继续发送")
+                    info = read_ui(hwnd)
+                    if info["edit"] is None:
+                        return False, "no_input_field"
+                    if info["send_xy"] is None:
+                        return False, "no_send_button"
+                    if info["value"] is not None and not _is_blank(info["value"]):
+                        return False, "input_not_empty"
+                else:
+                    _mark_uia_write_bad(hwnd, log, "残留草稿清不掉")
+                    return False, "input_not_empty"
             if info["value"] is None:
                 # 还没输入时可以安全退回 Unicode 剪贴板通道；输入之后则不能盲目重发。
                 return False, "input_unreadable"
@@ -1472,6 +1577,9 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
                     return False, "content_mismatch" if attempt else "gbk_unsupported"
                 input_before = _input_snapshot()
                 draft_dirty = True
+                # 记下“这条是我们想发出去的正文”：若发送失败留下残留，下次靠它
+                # 认出“这是自己的字”才敢清掉（用户的草稿不能碰）。
+                _remember_attempt(hwnd, _composer_text(_expected_text(text, mode, strip_unencodable)))
                 ok, skipped = _type_text(sender, current.get("edit"), text,
                                          mode=mode, char_gap=char_gap,
                                          strip_unencodable=strip_unencodable, log=log)
@@ -1538,8 +1646,17 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
                     log("后台通道：发送后无法确认原会话输入框，按已提交处理（避免重复）")
                     return True, "sent_unverified"
                 if _is_blank(v):
+                    try:
+                        _LAST_ATTEMPT.pop(int(hwnd or 0), None)
+                    except Exception:
+                        pass
                     return True, partial
                 time.sleep(TIMING["verifyPoll"])
+            # 点了发送但框里还有字：这是 SetValue 写入「不产生真实输入事件」的
+            # 典型症状（也可能是真的没点中发送）。先记住这个窗口别再信任 SetValue，
+            # 并把残留清掉，否则下一条消息会被 input_not_empty 直接挡死。
+            _mark_uia_write_bad(hwnd, log, "点了发送但输入框没清空")
+            _clear_composer(hwnd)
             return False, "residue_left"
 
         except UipiDenied as e:

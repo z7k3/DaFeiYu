@@ -165,7 +165,8 @@ class BridgeUserFlows(unittest.TestCase):
         env, _, sent, stickers, _ = self.env(Response({'ok': True, 'action': 'reply', 'reply': '模型回复', 'bubbles': ['第一句', '第二句']}))
         captured=[]
         env['voice_reply'].choose=lambda *a, **k: True
-        env['send_voice_reply']=lambda text, *a: captured.append(text) or True
+        # send_voice_reply 现在会收到 outcome=，用来判断语音是否真的发出去了
+        env['send_voice_reply']=lambda text, *a, **k: captured.append(text) or True
         function('on_message_inner',env)(self.message(),None)
         self.assertEqual(captured,['第一句\n第二句'])
         self.assertEqual(sent,[]);self.assertEqual(stickers,[])
@@ -173,7 +174,7 @@ class BridgeUserFlows(unittest.TestCase):
     def test_voice_failure_before_recording_keeps_original_text(self):
         env, _, sent, _, _ = self.env(Response({'ok': True, 'action': 'reply', 'reply': '原始回复', 'bubbles': ['原始回复']}))
         env['voice_reply'].choose=lambda *a, **k: True
-        env['send_voice_reply']=lambda *a: False
+        env['send_voice_reply']=lambda *a, **k: False
         function('on_message_inner',env)(self.message(),None)
         self.assertEqual(sent,['原始回复'])
 
