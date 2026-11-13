@@ -264,7 +264,13 @@ class DirtyDraftPipelineTests(unittest.TestCase):
                     BG_STATS=dict(disabled=False, cooldownUntil=0, tried=0),
                     _bg_hwnd=lambda: 4242, log=Mock(), log_error=Mock(),
                     DraftDirtyError=draft_error, ChatIdentityError=type('ChatIdentityError', (RuntimeError,), {}),
-                    dead_chats=set(), fail_streak={}, account_send_allowed=lambda *a: True,
+                    # 本地 fork：dead_chats 是 {username: 拉黑时间}（10 分钟 TTL），
+                    # 并用 chat_dead()/_mark_send_ok() 收口读写。
+                    dead_chats={}, fail_streak={}, account_send_allowed=lambda *a: True,
+                    chat_dead=lambda u: False, _mark_send_ok=lambda u: None,
+                    group_is_alive=lambda u: True, is_self_chat=lambda u: False,
+                    ui_chat_name=lambda u, n: n or u, touch=lambda: None,
+                    ensure_budget=lambda b: None,
                     send_policy_allows=lambda *a: True,
                     sticker_quarantine_allows=lambda *a: True, send_lock=nullcontext(),
                     _SendStateScope=lambda n: nullcontext(), STICKER_TEST_ON=False,
@@ -277,7 +283,7 @@ class DirtyDraftPipelineTests(unittest.TestCase):
                     load_function('send_text', env)
                     self.assertFalse(env['send_text']('测试正文', '测试群'))
                 fallback.assert_not_called()
-                self.assertEqual(env['dead_chats'], set())
+                self.assertEqual(env['dead_chats'], {})
                 self.assertEqual(env['fail_streak'], {})
 
 

@@ -75,9 +75,12 @@ test('未确认、私聊、未知会话、忙碌群和跨站请求均不能清�
   assert.equal((await reset(app, { key: target })).status, 400);
   assert.equal((await reset(app, { key: privateKey, confirm: true })).status, 404);
   assert.equal((await reset(app, { key: '../../invalid', confirm: true })).status, 404);
-  app.runtime.bot._handleChains.set(target, Promise.resolve());
+  // 守卫按真实管线的会话键（platform:g|u:chatId）查 _handleChains；
+  // 直接用裸 chatId 塞进去不会命中（那正是本地 fork 修掉的旧 bug）。
+  const busyKey = app.runtime.bot.chainKeyFor(app.runtime.store.chatStore.chats.get(target));
+  app.runtime.bot._handleChains.set(busyKey, Promise.resolve());
   assert.equal((await reset(app, { key: target, confirm: true })).status, 409);
-  app.runtime.bot._handleChains.delete(target);
+  app.runtime.bot._handleChains.delete(busyKey);
   assert.equal((await reset(app, { key: target, confirm: true }, { origin: 'https://example.com' })).status, 403);
   assert.equal(app.runtime.store.messages(target).length, 1);
 });
@@ -112,9 +115,10 @@ test('所有对话列表包含群聊、私聊及其他渠道；可单独清空�
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   });
   assert.equal((await resetChat({ key: privateKey })).status, 400);
-  app.runtime.bot._handleChains.set(privateKey, Promise.resolve());
+  const busyKey = app.runtime.bot.chainKeyFor(app.runtime.store.chatStore.chats.get(privateKey));
+  app.runtime.bot._handleChains.set(busyKey, Promise.resolve());
   assert.equal((await resetChat({ key: privateKey, confirm: true })).status, 409);
-  app.runtime.bot._handleChains.delete(privateKey);
+  app.runtime.bot._handleChains.delete(busyKey);
   assert.equal((await resetChat({ key: privateKey, confirm: true })).status, 200);
   assert.equal(fs.existsSync(removed.dir), false);
   store.reloadFromDisk();

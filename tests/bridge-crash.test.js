@@ -51,7 +51,9 @@ test('碰 UIA 前先问窗口在不在（心跳 / 发送 / 热激活 三处）',
 });
 
 test('看门狗重启用 code 7，把 2 让给「找不到数据库」这类优雅报错', () => {
-  assert.match(bridge, /os\._exit\(7\)/, '看门狗重启要用 7');
+  // 本地 fork 把 os._exit(7) 收口到 G.hard_exit(7)：退出前先还原系统级副作用
+  // （SPI_SETSCREENREADER、临时置顶的微信窗口），os._exit 走不到 atexit。
+  assert.match(bridge, /(os\._exit|hard_exit)\(7\)/, '看门狗重启要用 7');
   assert.doesNotMatch(bridge, /os\._exit\(2\)/, '2 是优雅报错，不能再被看门狗占用');
   assert.match(bridge, /return 2/, '找不到数据库目录的优雅报错仍然存在');
 

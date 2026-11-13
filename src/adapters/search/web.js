@@ -74,16 +74,24 @@ async function searchResult(query, opts = {}) {
   if (valid().length < 2) await ask('so360', q);
   // 通用兜底：bing/360 都没给够时，专名类查询往往在百度百科有词条（人物/作品/地名/产品/梗）。
   // baike.search 自带清洗（去问句骨架），词条不存在返回空数组，不产生噪音。
-  if (valid().length < 2 && !site) await ask('baike', body);
+  // 只有「一条都没捞到」才补查百度百科：有 1 条已可用时不再多打一次外网请求
+  // （产品/型号类查询本来就不该走百科，避免拖慢和污染失败状态）。
+  if (!valid().length && !site) await ask('baike', body);
   const split = quality.splitFreshness(q, quality.keepRelevant(body, all), opts);
   staleItems.push(...split.staleItems);
   const items = split.items.slice(0, Math.max(1, Math.min(10, Number(opts.limit) || 5)));
+  // 百科是补充源：它的空结果不能把主搜索的 parse_error 洗成 no_results，
+  // 否则「解析结构变了」这种真故障会被当成「今天没搜到」。
+  const coreAttempts = attempts.filter((a) => a.provider !== 'baike');
   const reason = items.length ? 'available' : opts.signal?.aborted ? 'aborted' : deadlineExpired || budget() <= 0 ? 'deadline_exceeded'
-    : staleItems.length ? 'stale_only' : attempts.every(a => a.status === 'failed') ? attempts.at(-1)?.code || 'no_results' : 'no_results';
+    : staleItems.length ? 'stale_only' : coreAttempts.length && coreAttempts.every(a => a.status === 'failed') ? coreAttempts.at(-1)?.code || 'no_results' : 'no_results';
   report(opts.trace, 'result', { candidates: all.length, stale: staleItems.length, selected: items.length,
     sources: items.map(x => new URL(x.url).hostname) });
+  // status 也按主搜索判定：所有主源都失败（含 parse_error）就是 failed，
+  // 不能被百科补充源的空结果洗成 empty。
+  const coreFailed = coreAttempts.length > 0 && coreAttempts.every(a => a.status === 'failed');
   return result(items, { attempts, staleItems, reason, elapsedMs: Date.now() - started,
-    ...(!items.length && ['aborted', 'deadline_exceeded'].includes(reason) ? { status: 'failed' } : {}) });
+    ...(!items.length && (coreFailed || ['aborted', 'deadline_exceeded'].includes(reason)) ? { status: 'failed' } : {}) });
 }
 
 module.exports = { searchResult };

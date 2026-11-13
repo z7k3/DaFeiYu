@@ -158,7 +158,8 @@ test('桥接源码里必须留着「钉账号」的关键代码（别被后来�
   assert.match(bridge, /def account_send_allowed/, '要有统一的发送闸');
   assert.match(bridge, /account_send_allowed\(['"]UIA['"]\)/, 'UIA 发送要走账号闸');
   assert.match(bridge, /account_send_allowed\(['"]键盘通道['"]\)/, '键盘兜底也要走账号闸');
-  assert.match(bridge, /os\._exit\(7\)/, '账号设置变了要 exit 7，交给启动器重新拉起');
+  // 本地 fork 收口到 G.hard_exit(7)：退出前先还原系统级副作用（屏幕阅读器标志、临时置顶窗口）
+  assert.match(bridge, /(os\._exit|hard_exit)\(7\)/, '账号设置变了要 exit 7，交给启动器重新拉起');
   assert.match(bridge, /['"]account['"]: db\.account/, '心跳要上报当前账号');
 
   const compat = fs.readFileSync(path.join(__dirname, '..', 'examples', 'uia_compat.py'), 'utf8');

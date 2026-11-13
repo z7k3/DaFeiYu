@@ -656,12 +656,12 @@ class Bot {
         && addressing.herNames(this, msg).some((a) => a && clean.text.includes(String(a)));
       if (addressing.isAddressed(atMe, msg) || masterCalledHer) {
         delete targets[msg.senderId];
-      } else if (mentionedNames.length && !sessionState.engagedSetHas(state, msg.senderId, nowMs)) {
+      } else if (mentionedNames.length && !sessionState.engagedSetHas(session.state, msg.senderId, nowMs)) {
         // 说话人正在和她的对话窗口内（engaged）时，提到别人名字只算「聊到那个人」，
         // 不算「在跟那个人说话」——否则评图/转述场景会被误判成 addressed_to_other 漏答。
         targets[msg.senderId] = { names: mentionedNames, ts: nowMs };
         msg.directedElsewhere = true;
-      } else if (targets[msg.senderId] && /你|您/.test(clean.text) && !sessionState.engagedSetHas(state, msg.senderId, nowMs)) {
+      } else if (targets[msg.senderId] && /你|您/.test(clean.text) && !sessionState.engagedSetHas(session.state, msg.senderId, nowMs)) {
         msg.directedElsewhere = true;
         msg.inferredTargetNames = targets[msg.senderId].names;
       }

@@ -204,7 +204,7 @@ test('failed initial search can recover through a normalized query', async (t) =
 });
 
 test('a single official supplement is retained after later empty attempts', async (t) => {
-  fakeHttps(t, (call) => new URL(call.url).searchParams.get('q').startsWith('site:apple.com.cn')
+  fakeHttps(t, (call) => (new URL(call.url).searchParams.get('q') || '').startsWith('site:apple.com.cn')
     ? { body: bing(['iPhone 机型比较', 'https://www.apple.com.cn/iphone/compare/']) }
     : { body: '' });
   const results = await web.search('苹果最新的机器是什么', { timeoutMs: RETRY_FIXTURE_TIMEOUT_MS });
@@ -213,7 +213,7 @@ test('a single official supplement is retained after later empty attempts', asyn
 });
 
 test('failed optional official lookup cannot erase two valid first results', async (t) => {
-  fakeHttps(t, (call) => new URL(call.url).searchParams.get('q').startsWith('site:apple.com.cn')
+  fakeHttps(t, (call) => (new URL(call.url).searchParams.get('q') || '').startsWith('site:apple.com.cn')
     ? { error: 'offline' }
     : { body: bing(['iPhone 产品 A', 'https://example.test/a'], ['iPhone 产品 B', 'https://example.test/b']) });
   const results = await web.search('苹果最新的机器是什么', { timeoutMs: RETRY_FIXTURE_TIMEOUT_MS });
@@ -281,6 +281,7 @@ test('named models survive cleaning and are never replaced by generic lineup que
   await web.search('iPhone 16 Pro 最新型号多少钱', { timeoutMs: 200 });
   for (const call of calls) {
     const q = new URL(call.url).searchParams.get('q');
+    if (q == null) continue;   // 补充源（百度百科）走 bk_key，不是搜索词
     assert.match(q.toLowerCase(), /iphone\s+16\s+pro/);
     assert.doesNotMatch(q, /site:apple\.com/);
   }

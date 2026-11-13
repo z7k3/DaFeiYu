@@ -9,17 +9,8 @@ const crypto = require('node:crypto');
  *   3) 安全响应头：nosniff / 禁 referrer / 禁外部脚本
  */
 
-/** 恒定时间字符串比较：避免靠响应时间猜 token */
-function safeEqual(a, b) {
-  const ba = Buffer.from(String(a == null ? '' : a), 'utf8');
-  const bb = Buffer.from(String(b == null ? '' : b), 'utf8');
-  if (ba.length !== bb.length) return false;
-  try {
-    return crypto.timingSafeEqual(ba, bb);
-  } catch {
-    return false;
-  }
-}
+// 恒定时间比较实现在 infra（adapters 也要用，分层规则不允许 adapters → http）
+const { safeEqual } = require('../infra/safeEqual');
 
 /**
  * 给每个响应挂安全头。

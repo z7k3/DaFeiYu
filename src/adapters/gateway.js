@@ -1,7 +1,7 @@
 'use strict';
 
 const { sendDenial } = require('../core/wechatSendPolicy');
-const { safeEqual } = require('../http/security');
+const { safeEqual } = require('../infra/safeEqual');
 const { describeError } = require('../infra/errors');
 const { tagName, textMeta } = require('../infra/privacy');
 

@@ -310,7 +310,9 @@ class RecoveryTests(unittest.TestCase):
                               describe=lambda _: '所选窗口暂不可用')
         gui = Mock()
         env = dict(acct='selected-account', ACCOUNT={'verified': False}, uia_boot=uia, WeChatGUI=gui,
-                   _UIA_READY={'ts': 0}, log=Mock())
+                   _UIA_READY={'ts': 0}, log=Mock(),
+                   # 本地 fork：new_window_driver 会给新建的窗口驱动打「不自动最小化遮挡窗口」补丁
+                   install_no_minimize=lambda g: None)
         ensure = load_function('ensure_uia_ready', env)
         new_driver = load_function('new_window_driver', env)
         # 账号未确认时仍然要允许 UIA 物化，否则「等账号确认」和「等控件树」互相死锁。

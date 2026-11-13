@@ -480,7 +480,13 @@ def _referenced_names(definitions):
 
 
 class BridgeContractTest(unittest.TestCase):
-    def test_sticker_switch_forces_foreground_even_with_background_configured(self):
+    def test_sticker_switch_does_not_hijack_text_channel(self):
+        """本地 fork：开表情包不再把文字发送拖进前台。
+
+        官方 4.x 的实现是「表情包开关一开，所有文字发送先抢前台」——用户明确要求
+        文字保持零焦点（微信被遮挡也能发），表情包自己走 sticker_mixin 的切前台
+        逻辑。所以这里断言：STICKER_TEST_ON 开/关，with_window_on_top 都先走后台。
+        """
         action = Mock(return_value=True)
         foreground = Mock(return_value=False)
         restore = Mock()
@@ -489,15 +495,10 @@ class BridgeContractTest(unittest.TestCase):
             'force_send_foreground': foreground,
             'snapshot_win_state': lambda: 'snapshot', 'restore_win_state': restore,
         })
-        self.assertFalse(scope['with_window_on_top'](action))
-        action.assert_not_called()
-        foreground.assert_called_once_with(action, require_foreground=True)
-        restore.assert_called_once_with('snapshot')
-        scope['STICKER_TEST_ON'] = False
-        foreground.reset_mock()
         self.assertTrue(scope['with_window_on_top'](action))
         action.assert_called_once()
         foreground.assert_not_called()
+        restore.assert_called_once_with('snapshot')
 
     def setUp(self):
         self.cfg = {'features': {'stickers': True}, 'wechat': {}}
@@ -732,7 +733,9 @@ class BridgeContractTest(unittest.TestCase):
                    sticker_input_is_blank=transport._is_blank, log_throttled=Mock(),
                    sticker_draft_quarantine={'peer': {'hwnd': 100, 'aliases': {'Peer'},
                                                       'draft_observed': observed}},
-                   acct_dirs=['test-account'], acct='test-account', WINDOW_HWND=0, dead_chats=set(),
+                   acct_dirs=['test-account'], acct='test-account', WINDOW_HWND=0, dead_chats={},
+                   # 本地 fork：dead_chats 改 dict+TTL 后，读路径收口到 chat_dead()
+                   chat_dead=lambda u: False,
                    sticker_account_evidence_ok=transport.account_evidence_allowed,
                    group_is_alive=lambda username: True, AWAY={'on': False}, away_active=lambda: False,
                    game_running=lambda: False, foreground_is_fullscreen=lambda: False)
