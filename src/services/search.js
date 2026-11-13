@@ -124,6 +124,18 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
       if (!city && !unresolvedCity) city = String(config.city || '').trim();
       if (!city && !unresolvedCity && active()) city = await locate('ip-city', () => places.ipCity(specializedOptions())) || '';
       if (city && active()) {
+        // 中国天气网优先：国内实况/预报+预警，比国外接口更准；拿不到城市代码或失败
+        // 再退回 open-meteo，最后 wttr。三段各留余量，网页回退的预算在 specializedDeadline
+        // 之外（webReserve）不受影响。
+        if (typeof places.cnWeatherResult === 'function') {
+          const cnLeft = Math.max(0, specializedDeadline - Date.now());
+          const cnValue = await call('cnweather', () => places.cnWeatherResult(city, {
+            ...specializedOptions(),
+            deadline: Math.min(specializedDeadline, Date.now() + Math.floor(cnLeft * 0.6)),
+          }));
+          if (cnValue.status === 'ok') return finish(cnValue);
+          remember(cnValue);
+        }
         // open-meteo 只拿专用预算的 55%：它被墙/重置时还要给 wttr 兜底留时间。
         const omLeft = Math.max(0, specializedDeadline - Date.now());
         const omDeadline = Date.now() + Math.floor(omLeft * 0.55);

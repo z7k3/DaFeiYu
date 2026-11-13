@@ -22,9 +22,12 @@ function inferKind(text) {
 }
 
 function weatherSupported(text, timeRange) {
-  // 当前接口只有今明两天常规预报，不能拿它回答灾害路径、空气质量或远期/历史天气。
-  return !/(台风|雾霾|空气|aqi|紫外线|历史|去年|昨天|前天|后天|周末|下周|下个月|未来|一周|这周|本周|周[一二三四五六日天]|20\d{2}[年\-/]|\d+月\d+日|[三四五六七八九十\d]+天)/i.test(text)
-    && (!timeRange || ['today', 'tomorrow', 'current', 'any'].includes(timeRange));
+  // 中国天气网（主源）给实况 + 今天起 5 天预报 + 预警 + AQI，所以「周末/这周/后天/
+  // 空气质量」都能答；只有「历史/去年/昨天」这类回看的，以及超过 5 天的才必须走网页。
+  const backward = /(历史|去年|前年|昨天|前天|上周|上个月|往期)/;
+  const beyond5 = /(下周|下个月|未来一周|一周天气|[6-9]\s*天|十[几多]?天|20\d{2}\s*[年\-/]|\d+\s*月\s*\d+\s*日)/;
+  if (backward.test(text) || beyond5.test(text)) return false;
+  return !timeRange || ['today', 'tomorrow', 'current', 'any', 'week', 'future'].includes(timeRange);
 }
 
 function intent(text, route = {}) {
