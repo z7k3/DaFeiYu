@@ -944,6 +944,15 @@ function buildBlocks({ config, msg = {}, profile, notes = [], noteReminders = []
   if (msg.careReply) dynamic.push('【此刻语境】刚才有群友在向群里表达关心/慰问（群里可能有人身体不适或情绪低落，大家在互相叮嘱）。这条回复先用温和真诚的话回应这份关心（也让 TA 照顾好自己），一两句就好；如果同时有表情包或别的话题，关心放在最前面。这条不要怼人、不要阴阳怪气，也不要客套腔。');
   if (msg.linkText) dynamic.push(linkBlock(msg.linkText));
   if (msg.voiceRequested) dynamic.push(VOICE_SUFFIX);
+  else {
+    // 话题涉及语音/唱歌，但本轮并不会用语音通道（是否语音由程序决定）。
+    // 以前她照样说「这条发语音了，你听着」，结果发出去的是文字，被用户当场识破
+    // （2026-11-13 17:47 物体识别群：反复被告知「你这不还是打字吗」）。
+    const talked = String(msg.cleanText || msg.text || '');
+    if (/语音|唱|哼|歌/.test(talked)) {
+      dynamic.push('【语音边界】本轮不会以语音发送（走文字）。不要写「这条是语音」「你听着」「我发语音了」这类承诺语音形式的话；被识破很难看。用户要你唱歌时，直接把歌唱的内容写出来，或直说「要听语音就跟我说一声用语音唱」。');
+    }
+  }
   dynamic.push(fightText(msg));
   if (actionBlock) dynamic.push(actionBlock);
 
@@ -1210,7 +1219,11 @@ function buildLegacySystem({ config, msg, profile, notes = [], noteReminders = [
   if (msg.careReply) lines.push('', '【此刻语境】刚才有群友在向群里表达关心/慰问。这条回复先温和地回应这份关心，一两句就好；不要怼人、不要阴阳怪气。');
   if (msg.stickerDemand && stickerBlock) lines.push('', '- 【表情包】这条带一张，从可用分类里挑最贴的，末尾写 [[sticker:分类名]]。');
   lines.push('', conversationGuidance(msg));
-  return lines.join('\n') + (msg.voiceRequested ? '\n' + VOICE_SUFFIX : '');
+  const voiceTail = msg.voiceRequested ? ('\n' + VOICE_SUFFIX)
+    : (/语音|唱|哼|歌/.test(String(msg.cleanText || msg.text || ''))
+      ? '\n【语音边界】本轮走文字：不要声称"这条是语音/你听着/我发语音了"；用户要唱歌就直接写出内容，或让 TA 直说要用语音唱。'
+      : '');
+  return lines.join('\n') + voiceTail;
 }
 
 

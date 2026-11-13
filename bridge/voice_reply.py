@@ -54,12 +54,15 @@ def _send_slot(lock, check):
     finally:
         lock.release()
 
+# 唱歌类请求也算显式语音：否则「你用语音唱啊」会被当成普通文字请求，
+# 她只能把歌词打在聊天里（用户实见：一直回歌词、还嘴硬说发了语音）。
+SING = re.compile(r"(?:唱|哼)(?:一?首|一段|一句|一个|个|给我听|来听|听听)|用语音(?:唱|哼)|语音(?:唱|哼)|(?:发|来)(?:一)?条?语音(?:唱|哼)")
 REQUEST = re.compile(r"(?:发|来|说|讲|回复)(?:给我|个|一条|一句|句|段|一段|条|一下|点|一段话|个回复|次|一)?\s*语音|用语音(?:回|说|讲)|语音(?:回我|回复|说一句)")
 NEGATIVE = re.compile(r"不要|别(?:再)?|不想|不用|不能|怎么|如何|他说|她说|有人说|关闭|取消|[\"“”‘’]")
 
 def requested(text):
     text = str(text or "")
-    return len(text) <= 500 and not NEGATIVE.search(text) and bool(REQUEST.search(text))
+    return len(text) <= 500 and not NEGATIVE.search(text) and bool(REQUEST.search(text) or SING.search(text))
 
 def settings(root):
     try:
