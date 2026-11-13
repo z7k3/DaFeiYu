@@ -82,6 +82,11 @@ def configure(bg_cfg=None, state_file=None):
             TIMING[key] = max(0.0, min(3.0, float(over[key])))
         except (TypeError, ValueError):
             pass
+    # 静默发送（打字期间把窗口挪到屏幕外）：默认开，配置 bgSend.noFlash=false 可关
+    flag = (bg_cfg or {}).get("noFlash", True)
+    if isinstance(flag, str):
+        flag = flag.strip().lower() not in ('false', '0', 'off', 'no')
+    _NOFLASH['on'] = bool(flag)
     return TIMING
 
 __all__ = [
@@ -1217,6 +1222,62 @@ def fg_trace(tag, log=None, force=False):
         log('[fgtrace] %s 前台 %s → %s（%s）' % (tag, prev, now, (title or '-')[:20]))
 
 
+
+# —— 屏幕外静默发送 ——
+# 微信输入框收到任何真实输入（WM_CHAR/SetValue）都会把自己激活，这是客户端行为。
+# 但只要窗口在屏幕外，激活就没人看得见——微信自己"隐藏到托盘"用的就是 -21333 这个坐标。
+# 实测（2026-11-13）：窗口挪到屏幕外后打字+回车照样能发，前台虽然变成微信但屏幕上无变化。
+_PARKED = {}          # hwnd -> 原位置 (x, y)
+_NOFLASH = {'on': True}   # 静默发送：打字期间把窗口挪到屏幕外，屏幕上完全看不到
+_PARK_POS = -21333
+
+
+def park_window(hwnd, log=None):
+    """把窗口挪到屏幕外并记住原位置；已经挪过就直接返回。"""
+    try:
+        hwnd = int(hwnd or 0)
+        if not hwnd or hwnd in _PARKED:
+            return False
+        import win32gui
+        import win32con
+        rect = win32gui.GetWindowRect(hwnd)
+        win32gui.SetWindowPos(hwnd, 0, _PARK_POS, _PARK_POS, 0, 0,
+                              win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+        _PARKED[hwnd] = (rect[0], rect[1])
+        if log:
+            log("后台通道：已把微信窗口移到屏幕外（静默发送，屏幕上不会有任何闪烁）")
+        return True
+    except Exception as e:
+        if log:
+            log("后台通道：移动到屏幕外失败（不影响发送） %r" % (e,))
+        return False
+
+
+def unpark_window(hwnd, log=None):
+    """把窗口挪回原来的位置（退出/需要前台发送时调用）。"""
+    try:
+        hwnd = int(hwnd or 0)
+        pos = _PARKED.pop(hwnd, None)
+        if not pos:
+            return False
+        import win32gui
+        import win32con
+        win32gui.SetWindowPos(hwnd, 0, int(pos[0]), int(pos[1]), 0, 0,
+                              win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+        if log:
+            log("后台通道：微信窗口已还原到原来的位置")
+        return True
+    except Exception:
+        return False
+
+
+def is_parked(hwnd):
+    try:
+        return int(hwnd or 0) in _PARKED
+    except Exception:
+        return False
+
+
 def _type_text(sender, edit, text, *, mode, char_gap=0.04,
                strip_unencodable=True, log=None):
     """写正文：优先 UIA SetValue，失败才回退 WM_CHAR。返回 (ok, skipped)。"""
@@ -1700,6 +1761,9 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
                 return False, "tree_not_ready"
 
             fg_trace('进入后台发送', log, force=True)
+            _parked_here = False
+            if _NOFLASH['on']:
+                _parked_here = park_window(hwnd, log=log)
             # 先切会话，再看输入框：微信可能停在朋友圈 / 通讯录，
             # 这时 edit 不存在，但会话列表行还在，点一下就能回到聊天页。
             # 切会话要点会话行，微信会把自己激活到最前：记下当前前台，切完立刻还回去。
@@ -1988,8 +2052,13 @@ def probe(hwnd=0, log=print, with_send=None, unhide=True):
 
 
 def shutdown():
-    """进程退出时还原 `SPI_SETSCREENREADER`。"""
+    """进程退出时还原 `SPI_SETSCREENREADER`，并把挪到屏幕外的微信窗口放回去。"""
     _ScreenReader.restore()
+    for hwnd in list(_PARKED.keys()):
+        try:
+            unpark_window(hwnd)
+        except Exception:
+            pass
 
 
 import atexit  # noqa: E402  （放在文件尾部，避免污染上面的常量区）

@@ -73,6 +73,9 @@ def parse_bg_send(wechat_cfg):
         "strip": as_bool(raw.get("stripUnencodable", True), True),
         # 微信缩在托盘里（窗口隐藏）时，用「显示但不激活」把它拉出来 —— 不抢前台
         "unhide": as_bool(raw.get("unhideWindow", True), True),
+        # 静默发送：打字期间把微信窗口移到屏幕外（微信收到输入必然激活自己，
+        # 挪到屏幕外就看不见了）；默认开，关掉会看到窗口闪一下
+        "noFlash": as_bool(raw.get("noFlash", True), True),
         # WM_CHAR 的编码语义：auto = 按微信版本自动（4.2+ 用 UTF-16 码元）
         "charMode": str(raw.get("charMode") or "auto").lower(),
         # 后台通道的固定等待（秒）：缺省用 bg_sender.TIMING 的线上实测值，

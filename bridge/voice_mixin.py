@@ -17,6 +17,11 @@ class VoiceMixin:
         hwnd = int(self.ACCOUNT.get('hwnd') or 0)
         if not hwnd:
             return False
+        # 语音要靠窗口前台录音：如果文字发送把它挪到屏幕外了，先放回来
+        try:
+            G.bg_sender.unpark_window(hwnd, log=G.log)
+        except Exception:
+            pass
 
         def prepare():
             if not self.send_policy_allows(username, who):

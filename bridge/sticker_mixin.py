@@ -79,6 +79,13 @@ class StickerMixin:
             hwnd = int(self.ACCOUNT.get('hwnd') or 0)
             snap = None
             try:
+                # 文字发送期间窗口被挪到屏幕外（静默发送）；表情包要走前台，先放回来。
+                try:
+                    # 放回屏幕内（表情包要走前台）；发完不必手动挪回——
+                    # 下次文字发送会自动再挪到屏幕外（park_window 是幂等的）。
+                    G.bg_sender.unpark_window(hwnd, log=G.log)
+                except Exception:
+                    pass
                 desktop = G.WindowsDesktop()
                 if not desktop.foreground(hwnd):
                     snap = self.snapshot_win_state()

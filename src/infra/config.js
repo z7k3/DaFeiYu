@@ -307,6 +307,9 @@ const DEFAULT_CONFIG = {
       unhideWindow: true,
       // WM_CHAR 编码：auto = 按微信版本自动（4.2+ 用 UTF-16 码元，老版本用 GBK 字节）
       charMode: 'auto',
+      // 静默发送：打字期间把微信窗口移到屏幕外，屏幕上完全看不到（微信输入框
+      // 收到输入必然激活自己，挪到屏幕外就看不见了）。关掉则会看到窗口闪一下。
+      noFlash: true,
     },
     // 消息调度：同一会话串行、跨会话并发。workers=1 等于旧的全串行行为。
     pipelineWorkers: 4,

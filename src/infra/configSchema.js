@@ -131,6 +131,7 @@ const FIELDS = {
   'wechat.accountGuard': { type: 'bool' },
   'wechat.bgSend.enabled': { type: 'bool' },
   'wechat.bgSend.charGapMs': { type: 'int', min: 20, max: 80 },
+  'wechat.bgSend.noFlash': { type: 'bool' },
   // 后台通道的固定等待（秒，见 bridge/bg_sender.py 的 TIMING）：默认值线上实测过，
   // 放出来是为了「想快一点」不用改代码；0 也合法（=完全不等）。
   'wechat.bgSend.timing.gatePulse': { type: 'float', min: 0, max: 3 },
