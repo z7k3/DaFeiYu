@@ -84,7 +84,11 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
       routeFailed: Boolean(route.failed), budgetMs: options().timeoutMs });
     const intent = policy.intent(text, route);
     let q = intent.query;
-    const specializedDeadline = Math.min(deadline, Date.now() + Math.floor(options().timeoutMs * 0.6));
+    // 天气/热榜这类专用接口常要两次串行请求（地理编码 → 预报）：只分剩余预算的
+    // 60% 会在慢网络下必然超时，然后退化去搜网页拿到「城市百科」这种垃圾证据。
+    // 给到至少 6 秒，同时仍受总 deadline 约束。
+    const specializedDeadline = Math.min(deadline,
+      Date.now() + Math.max(6000, Math.floor(options().timeoutMs * 0.85)));
     const specializedOptions = () => ({ ...options(), deadline: specializedDeadline,
       timeoutMs: Math.max(0, specializedDeadline - Date.now()) });
     if (intent.kind === 'weather') {
@@ -106,6 +110,13 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
         const value = await call('open-meteo', () => providers.weatherResult(city, { ...specializedOptions(), ...(place ? { place } : {}) }));
         if (value.status === 'ok') return finish(value);
         remember(value);
+        // open-meteo 被墙/重置时退化到 wttr.in：宁可换源，也不要掉进网页搜索
+        // 拿「南昌地图/百科」当天气证据（用户实见：「全是地图百科」）。
+        if (active() && typeof places.wttrResult === 'function') {
+          const alt = await call('wttr', () => places.wttrResult(city, specializedOptions()));
+          if (alt.status === 'ok') return finish(alt);
+          remember(alt);
+        }
       }
       // 补地点时保留“明天/带伞”等原需求，避免天气失败后退化成泛查城市天气。
       if (city && !q.includes(city)) q = city + ' ' + q;

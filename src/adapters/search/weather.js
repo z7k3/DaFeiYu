@@ -78,4 +78,34 @@ async function weatherResult(city, opts = {}) {
   }, opts);
 }
 
-module.exports = { geocodeCity, ipCity, weatherResult, weatherSnippet, wmoText };
+/**
+ * wttr.in 兜底天气源：open-meteo 在部分网络下会被重置（ECONNRESET），
+ * 这时再走一次备用源，比退化到网页搜索拿「城市百科」强得多。
+ * 返回结构对齐 weatherResult，便于上层统一走 splitFreshness/格式化。
+ */
+async function wttrResult(city, opts = {}) {
+  const deadline = Math.min(opts.deadline ?? Infinity, Date.now() + remaining(opts));
+  return providerResult('wttr', async () => {
+    const name = String(city || '').trim();
+    if (!name) return [];
+    const url = 'https://wttr.in/' + encodeURIComponent(name) + '?format=j1&lang=zh';
+    const data = await getJson(url, { ...opts, deadline });
+    const cur = data && Array.isArray(data.current_condition) ? data.current_condition[0] : null;
+    if (!cur) throw searchError('missing_weather_data');
+    const today = data.weather && data.weather[0];
+    const place = { name, timezone: 'Asia/Shanghai', admin1: '' };
+    const lines = ['现在 ' + cur.temp_C + '°C（体感 ' + cur.FeelsLikeC + '°C，'
+      + (cur.lang_zh && cur.lang_zh[0] ? cur.lang_zh[0].value : '天气 ' + cur.weatherDesc[0].value) + '）'];
+    if (today) {
+      lines.push(today.date + '：' + today.mintempC + '~' + today.maxtempC + '°C');
+      if (today.hourly) {
+        const rain = today.hourly.map((h) => Number(h.chanceofrain)).filter(Number.isFinite);
+        if (rain.length) lines.push('降水概率最高 ' + Math.max.apply(null, rain) + '%');
+      }
+    }
+    return [{ title: name + ' 天气', url, snippet: lines.join('\n'), provider: 'wttr',
+      fetchedAt: new Date().toISOString(), publishedAt: null, weight: 1 }];
+  }, opts);
+}
+
+module.exports = { geocodeCity, ipCity, weatherResult, wttrResult, weatherSnippet, wmoText };
