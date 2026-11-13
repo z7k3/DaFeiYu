@@ -392,6 +392,39 @@ class ReceiverMixin:
             G.log_throttled('voice-fail:' + type(e).__name__, '语音识别失败：', repr(e))
             return ''
 
+    def voice_message_landed(self, username, since_ts, poll=3, interval=0.6):
+        """确认这次语音真的进了微信：会话最新消息里是否有「我发的、比开始时间新的语音」。
+
+        worker 报 uncertain 时它只表示「可能已发出」，而声卡不可用这类失败也会被
+        归到 uncertain。用数据库当证据：查不到就当没发出去，回落文字——
+        多一句文字远好过整条回复凭空消失。读不到数据库同样返回 False（保守回落）。
+        """
+        for attempt in range(poll):
+            if attempt:
+                G.time.sleep(interval)
+            try:
+                G.touch()
+            except Exception:
+                pass
+            try:
+                rows = self.db.get_messages(username, limit=5) or []
+            except Exception as exc:
+                G.log_throttled('voice-verify-read', '语音结果核对读不到数据库：', repr(exc), ttl=600)
+                return False
+            for row in rows:
+                try:
+                    if float(row.get('create_time') or 0) <= float(since_ts or 0):
+                        continue
+                except Exception:
+                    continue
+                if '语音' not in str(row.get('type') or ''):
+                    continue
+                sender = str(row.get('sender_username') or '')
+                if sender and sender != self.me:
+                    continue
+                return True
+        return False
+
     def on_message_inner(self, msg, listener):
 
         def media_failed(kind):
@@ -644,10 +677,30 @@ class ReceiverMixin:
                 G.log('[voice] stage=decision result=skip reason=separate_text_requested')
             elif G.voice_reply.choose(G.voice_reply.settings(G.ROOT), content, is_group, G.random.random, log=G.log):
                 spoken = '\n'.join((line.strip() for line in bubbles if line.strip()))
-                if self.send_voice_reply(spoken, target, username):
-                    G.log('[delivery] stage=voice result=handled textFallback=false stickerFallback=false reason=voice_may_have_sent')
-                    return
-                G.log('[voice] stage=delivery result=text_fallback reason=prepare_or_synthesis_failed')
+                voice_outcome = {}
+                voice_started = G.time.time()
+                if self.send_voice_reply(spoken, target, username, outcome=voice_outcome):
+                    voice_status = str(voice_outcome.get('Status') or '')
+                    # sent_unconfirmed = worker 已播放并确认录音，可信地"可能已发出"。
+                    # uncertain = worker 自己也只是"可能"（声卡不可用、播放中断都走这条）。
+                    # 以前这里直接把 uncertain 当成已发出并 return，结果文字被吞、语音又没
+                    # 播出去 —— 用户什么都收不到（实测 11-13 15:02 那条新闻回复凭空消失）。
+                    # 现在必须拿微信数据库里的新语音消息当证据；拿不到证据就回落文字。
+                    if voice_status == 'sent_unconfirmed' or self.voice_message_landed(username, voice_started):
+                        G.log('[delivery] stage=voice result=handled textFallback=false stickerFallback=false '
+                              'reason=voice_confirmed status=%s' % (voice_status or '-'))
+                        return
+                    G.log_throttled(
+                        'voice-not-landed',
+                        '[voice] stage=delivery result=text_fallback reason=voice_not_confirmed status=%s error=%s'
+                        % (voice_status or '-', str(voice_outcome.get('Error') or '')[:60]))
+                    # 确认没送出去 → 冷却 5 分钟，后面的回复直接走文字，别再白等 TTS
+                    try:
+                        G.voice_reply.note_failure(G.ROOT)
+                    except Exception:
+                        pass
+                else:
+                    G.log('[voice] stage=delivery result=text_fallback reason=prepare_or_synthesis_failed')
             for line in bubbles:
                 if not line:
                     continue

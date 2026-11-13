@@ -25,6 +25,19 @@ def _health_update(root, failed):
         failures = failures + 1 if failed else 0
         _health[root] = (failures, time.monotonic() + 300 if failures >= 2 else 0)
 
+def note_failure(root):
+    """一次「确认没送出去」的语音尝试 → 立刻进 5 分钟冷却。
+
+    worker 的 uncertain 里既有「真可能发出去了」，也有「声卡不可用/播放中断」这种
+    确定没出去的情况。上层用微信数据库核对后知道确实没出去，就调这里：后面的回复
+    直接走文字，不再每条都白等一次 TTS 合成（实测 10~17 秒）。
+    """
+    with _health_lock:
+        # 声卡不可用这类本地故障不会 5 分钟自愈；冷却久一点，别让 25% 的回复
+        # 每条都先白等一次 TTS 合成（实测 10~17 秒）再回落文字。
+        _health[root] = (2, time.monotonic() + 1800)
+
+
 @contextmanager
 def _send_slot(lock, check):
     if lock is None:
