@@ -312,25 +312,35 @@ class DirtyDraftPipelineTests(unittest.TestCase):
 
 
 class InputChannelTests(unittest.TestCase):
-    def test_uia_value_pattern_is_preferred_over_wm_char(self):
+    def test_wm_char_is_default_and_value_pattern_is_not_used(self):
+        """默认走 WM_CHAR：UIA ValuePattern.SetValue 会激活微信窗口（闪前台）。
+
+        2026-11-13 实测：把别的窗口放前台后调用 SetValue("")，前台立刻变成微信。
+        它还有「写进去了但发不出去」的老毛病（曾导致每条消息都卡在 input_not_empty）。
+        """
         edit = Mock()
-        sender = SimpleNamespace(hwnd=4242, type_text=Mock())
+        sender = SimpleNamespace(hwnd=4242, type_text=Mock(return_value=(True, [])))
         bg._UIA_WRITE_LOGGED.clear()
+        bg._USE_SETVALUE['on'] = False
         ok, skipped = bg._type_text(sender, edit, '鲸鲸测试', mode='utf16', log=Mock())
         self.assertTrue(ok)
         self.assertEqual(skipped, [])
-        edit.GetValuePattern.return_value.SetValue.assert_called_once_with('鲸鲸测试')
-        sender.type_text.assert_not_called()
-
-    def test_wm_char_is_used_when_value_pattern_fails(self):
-        edit = Mock()
-        edit.GetValuePattern.side_effect = RuntimeError('no ValuePattern')
-        sender = SimpleNamespace(hwnd=4242, type_text=Mock(return_value=(True, [])))
-        bg._UIA_WRITE_LOGGED.clear()
-        ok, _skipped = bg._type_text(sender, edit, '鲸鲸测试', mode='utf16',
-                                     log=Mock())
-        self.assertTrue(ok)
         sender.type_text.assert_called_once()
+        edit.GetValuePattern.return_value.SetValue.assert_not_called()
+
+    def test_value_pattern_still_available_as_fallback_switch(self):
+        """留了开关：WM_CHAR 写不进去时可以显式切回 SetValue（异常路径）。"""
+        edit = Mock()
+        sender = SimpleNamespace(hwnd=4242, type_text=Mock())
+        bg._UIA_WRITE_LOGGED.clear()
+        bg._USE_SETVALUE['on'] = True
+        try:
+            ok, _skipped = bg._type_text(sender, edit, '鲸鲸测试', mode='utf16', log=Mock())
+            self.assertTrue(ok)
+            edit.GetValuePattern.return_value.SetValue.assert_called_once_with('鲸鲸测试')
+            sender.type_text.assert_not_called()
+        finally:
+            bg._USE_SETVALUE['on'] = False
 
     def test_open_chat_refuses_fuzzy_row_and_lets_search_channel_handle_it(self):
         clicked = []

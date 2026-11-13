@@ -769,11 +769,28 @@ def _clear_composer(hwnd, edit=None):
     清不掉，于是残留草稿永远卡在框里（之后每条消息都 input_not_empty）。
     退格是真正的输入事件，微信一定认，所以这里必须有这一层兜底。
     """
-    value = None
+    # 先用退格真删（WM_CHAR，不激活窗口）；UIA SetValue("") 会抢前台，只在
+    # 真清不掉的时候兜底一次。
+    value = _composer_value(hwnd)
+    if _is_blank(value):
+        return True
     try:
-        ctrl = edit
-        if ctrl is None:
-            ctrl = read_ui(hwnd).get("edit")
+        count = max(1, min(400, len(str(value or "")) + 8))
+        sender = WeChatSender(hwnd)
+        sender._post(WM_SETFOCUS, 0, 0) if _PSEUDO_FOCUS['on'] else None
+        for _ in range(count):
+            sender._post(WM_CHAR, 8, 1)          # VK_BACK
+            time.sleep(0.008)
+        sender.end_input()
+    except Exception:
+        pass
+    time.sleep(0.3)
+    value = _composer_value(hwnd)
+    if _is_blank(value):
+        return True
+    # 最后兜底：UIA 清空（会抢前台，但这已经是异常路径）
+    try:
+        ctrl = edit if edit is not None else read_ui(hwnd).get("edit")
         if ctrl is not None:
             ctrl.GetValuePattern().SetValue("")
     except Exception:
@@ -1047,6 +1064,12 @@ def _mark_uia_write_bad(hwnd, log=None, why=""):
             % (why or "写入后发不出去"))
 
 
+# UIA ValuePattern.SetValue 会激活微信窗口（2026-11-13 实测：把别的窗口放前台后
+# 调 SetValue("")，前台立刻变成微信 → 用户看到「回个消息微信闪一下」）。
+# 它同时还有「写进去了但发不出去」的老毛病，所以默认关掉，只在 WM_CHAR 失败时兜底。
+_USE_SETVALUE = {'on': False}
+
+
 def _uia_write(edit, text):
     """用 UIA ValuePattern 直接写正文，不经过键盘。
 
@@ -1170,6 +1193,30 @@ def _restore_foreground(prev, wechat_hwnd=None, log=None):
             log("后台通道：还原前台失败（不影响发送） %r" % (e,))
         return False
 
+
+# —— 前台变化追踪（临时诊断用）：只在变化时打一行，定位是哪一步抢了前台 ——
+_FG_TRACE_LAST = {'hwnd': 0}
+
+
+def fg_trace(tag, log=None, force=False):
+    try:
+        now = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+    except Exception:
+        return
+    prev = _FG_TRACE_LAST.get('hwnd', 0)
+    _FG_TRACE_LAST['hwnd'] = now
+    if not force and prev == now:
+        return
+    if log:
+        try:
+            title = ''
+            import win32gui
+            title = win32gui.GetWindowText(now) or ''
+        except Exception:
+            title = ''
+        log('[fgtrace] %s 前台 %s → %s（%s）' % (tag, prev, now, (title or '-')[:20]))
+
+
 def _type_text(sender, edit, text, *, mode, char_gap=0.04,
                strip_unencodable=True, log=None):
     """写正文：优先 UIA SetValue，失败才回退 WM_CHAR。返回 (ok, skipped)。"""
@@ -1184,8 +1231,8 @@ def _type_text(sender, edit, text, *, mode, char_gap=0.04,
         hwnd = int(getattr(sender, "hwnd", 0) or 0)
     except Exception:
         hwnd = 0
-    if not _uia_write_reliable(hwnd):
-        # 这个窗口的 SetValue 已经被证实发不出去：直接走 WM_CHAR，别再重蹈覆辙
+    if not _uia_write_reliable(hwnd) or not _USE_SETVALUE['on']:
+        # SetValue 会抢前台，而且有「写了发不出去」的老毛病：默认走 WM_CHAR。
         return sender.type_text(text, char_gap=char_gap,
                                 strip_unencodable=strip_unencodable, mode=mode)
     if _uia_write(edit, expected):
@@ -1652,6 +1699,7 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             if len(info["nodes"]) < MIN_NODES:
                 return False, "tree_not_ready"
 
+            fg_trace('进入后台发送', log, force=True)
             # 先切会话，再看输入框：微信可能停在朋友圈 / 通讯录，
             # 这时 edit 不存在，但会话列表行还在，点一下就能回到聊天页。
             # 切会话要点会话行，微信会把自己激活到最前：记下当前前台，切完立刻还回去。
@@ -1663,6 +1711,7 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             if _fg_before and _foreground_now() != _fg_before:
                 if _restore_foreground(_fg_before, log=log):
                     log("后台通道：切会话抢了前台，已立刻还回去")
+            fg_trace('切会话/物化后', log)
             info = read_ui(hwnd)                   # 切过会话要重读（按钮位置会变）
             if info["edit"] is None:
                 # 点完会话后微信会重建一次控件树（实测 150 → 81 再回来），补一次物化
@@ -1796,7 +1845,9 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             # 「回个消息微信闪到最前面」。回车是发给输入框的键消息，实测能提交且
             # 不激活窗口（2026-11-13 实验：PostMessage WM_KEYDOWN/UP VK_RETURN 后
             # 输入框清空、消息真的发出去了）。
+            fg_trace('打字完成', log)
             sent_by_enter = _send_by_enter(hwnd, sender, log)
+            fg_trace('回车之后', log)
             if not sent_by_enter:
                 # 回车没提交（可能这台微信设成了 Ctrl+Enter 发送，回车变成了换行）。
                 # _send_by_enter 已经清过输入框，这里必须把正文重新打进去再点按钮，
@@ -1840,6 +1891,7 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             # 发出去了没有：输入框清空 = 走了。空框可能是 '\n'，按 _is_blank 判
             # （M1）；读不到（None）按「已发送」处理，免得退回前台通道再打一遍、
             # 聊天里出现两句一样的话。
+            fg_trace('进入发送确认', log)
             deadline = time.time() + 2.0
             while time.time() < deadline:
                 info = read_ui(hwnd)
