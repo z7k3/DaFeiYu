@@ -4,12 +4,19 @@ const KEYWORDS = /(查一下|查查|搜一下|搜搜|帮我查|帮我看看|最�
 const FACT = /(是什么|是谁|多少|几号|几点|怎么样|怎么|为什么|哪一?[个些张条]|有没有|是不是|能不能|会不会|可不可以|排行|排名|热搜|热榜|热门|最新|出到|第几)/;
 const CHITCHAT = /^(在吗|在不在|你好|嗨|hi|哈喽|早安|晚安|睡了|吃饭了吗|吃了吗|你在干嘛|在干啥|干啥呢|干嘛呢)/i;
 const OPINION = /(你觉得|你认为|你看|你怎么看|该不该|要不要|喜不喜欢|喜欢吗|讨厌|爱我吗|想我了吗)/;
+// 会随年份/赛季变化的「统计事实」信号：榜单、排名、冠军、比分、销量、版本……这类东西
+// 模型记忆永远不可靠（训练截止≠今天），语义路由却常把它误判成「模型自己知道」——
+// 实见：「你知道CS去年的top20名单吗」被判 need=false，她拿 2024 年的记忆冒充 2025 榜单。
+// 命中即视为必须检索的强信号：路由说「不用查」也要查（见 services/search.js 的 skip 条件）。
+const VOLATILE = /(排行|排名|榜单|名单|前十|前二十|前三|top\s*\d+|第几|冠军|亚军|季军|夺冠|卫冕|比分|战绩|胜率|连胜|销量|出货量|票房|收视率|播放量|在线人数|市场份额|市场占有率|最新版本|版本号|更新公告|补丁|赛季|段位|登顶|榜首)/i;
 const DOMAINS = { bilibili: 'bilibili.com', weibo: 'weibo.com', toutiao: 'toutiao.com' };
 
 function gate(text, mode) {
   const keyword = KEYWORDS.test(text);
   const fact = FACT.test(text) && !CHITCHAT.test(text.trim()) && !OPINION.test(text);
-  return { fallback: keyword || fact, route: mode === true || (mode !== false && (keyword || fact || /[?？]|吗|呢|什么|怎么|多少|几[个号点]|谁|哪|为什么|如何|查|搜|最新|今天|现在|价格|天气/.test(text))) };
+  // 统计事实和闲聊/观点互斥：问「你觉得谁最强」可以凭感觉答，问「谁拿了冠军」不行。
+  const volatile = VOLATILE.test(text) && !CHITCHAT.test(text.trim()) && !OPINION.test(text);
+  return { fallback: keyword || fact, volatile, route: mode === true || (mode !== false && (keyword || fact || /[?？]|吗|呢|什么|怎么|多少|几[个号点]|谁|哪|为什么|如何|查|搜|最新|今天|现在|价格|天气/.test(text))) };
 }
 
 function inferKind(text) {
@@ -26,7 +33,9 @@ function weatherSupported(text, timeRange) {
   // 空气质量」都能答；只有「历史/去年/昨天」这类回看的，以及超过 5 天的才必须走网页。
   const backward = /(历史|去年|前年|昨天|前天|上周|上个月|往期)/;
   const beyond5 = /(下周|下个月|未来一周|一周天气|[6-9]\s*天|十[几多]?天|20\d{2}\s*[年\-/]|\d+\s*月\s*\d+\s*日)/;
-  if (backward.test(text) || beyond5.test(text)) return false;
+  // 台风路径不在天气接口的数据里（实况/预报/预警/AQI 才有），硬走专用接口只会拿
+  // 「当地天气」冒充路径；必须走网页搜路径动态（与路由提示词的口径一致）。
+  if (backward.test(text) || beyond5.test(text) || /台风/.test(text)) return false;
   return !timeRange || ['today', 'tomorrow', 'current', 'any', 'week', 'future'].includes(timeRange);
 }
 

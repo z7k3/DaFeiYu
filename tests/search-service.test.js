@@ -37,8 +37,15 @@ test('路由完整意图直接驱动数据源，旧格式仍能回退规则', as
   assert.match(value.text, /open|weatherResult/);
 });
 
-test('空气质量、台风、远期和指定日期不拿今明天气冒充答案', async () => {
-  for (const text of ['北京空气质量', '北京台风路径', '北京后天天气', '北京周末天气', '北京2027年1月1日天气']) {
+test('空气质量/后天/周末走天气专用接口；台风路径、远期和指定日期走网页', async () => {
+  // 中国天气网给实况 + 未来 5 天 + 预警 + AQI（1425037 起），这三类用专用接口答得更好；
+  // 台风路径不在接口数据里，回看类和超 5 天的也拿不到——都走网页（policy.weatherSupported）。
+  for (const text of ['北京空气质量', '北京后天天气', '北京周末天气']) {
+    const f = fixture({ kind: 'weather', city: '北京' });
+    await f.run(text);
+    assert.deepEqual(f.calls.map(x => x.method), ['weatherResult'], text);
+  }
+  for (const text of ['北京台风路径', '北京2027年1月1日天气', '北京去年天气']) {
     const f = fixture({ kind: 'weather', city: '北京' });
     await f.run(text);
     assert.deepEqual(f.calls.map(x => x.method), ['searchResult'], text);
@@ -152,4 +159,24 @@ test('模型识别出的时间范围不会在改写查询后丢失', async () =>
   const f = fixture({ kind: 'web', timeRange: 'today', fresh: 'any', query: '发布会 新闻' });
   await f.run('今儿有什么发布会消息');
   assert.equal(f.calls[0].args[1].maxAgeDays, 2);
+});
+
+
+test('路由说不用查，但会变的统计事实仍强制检索（volatile_forced）', async () => {
+  // 现场：2026-11-13 问「你知道CS去年的top20名单吗」被判 need=false，她拿 2024 记忆冒充 2025 榜单。
+  // 这类榜单/排名/冠军是逐年更替的统计事实，模型记忆不可靠，路由说「不用查」也必须查。
+  const f = fixture({ need: false });
+  const value = await f.run('你知道CS去年的top20名单吗', { now: new Date(2026, 10, 13) });
+  assert.equal(f.calls[0].method, 'searchResult');
+  assert.match(f.calls[0].args[0], /2025年/, '「去年」要按注入的 now 锚成 2025');
+  assert.doesNotMatch(f.calls[0].args[0], /去年|你知道/, '口语词不进检索词');
+  assert.equal(value.status, 'ok');
+});
+
+test('路由给的检索词仍带相对时间时兜底锚定年份', async () => {
+  const f = fixture({ need: true, query: 'CS 去年 top20 名单', kind: 'web' });
+  await f.run('CS去年的top20名单', { now: new Date(2026, 10, 13) });
+  assert.equal(f.calls[0].method, 'searchResult');
+  assert.match(f.calls[0].args[0], /2025年/);
+  assert.doesNotMatch(f.calls[0].args[0], /去年/);
 });

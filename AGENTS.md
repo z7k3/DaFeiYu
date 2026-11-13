@@ -43,6 +43,7 @@ Copy-Item launcher/publish/WhaleLauncher.exe .\WhaleLauncher.exe -Force
 - CommonJS、**零 npm 运行时依赖**、Node ≥ 18；不要引入需要 `npm install` 的运行时依赖。
 - 每个行为改动配一条能复现它的测试；修 bug 要「修复前失败、修复后通过」。
 - 测试逐文件跑：`node tests/xxx.test.js`。
+- 修 bug 先归因到「一类问题」：按错误特征抽象出「什么条件下都会错」的模式，修复要覆盖这一类的不同表述，并用多条同类用例验证；只针对用户给的个例打补丁（写死特例词、特判某句话）不被接受。拿到新例子先判断「这是哪一类的又一例」，再做类级修复。
   （沙箱里 `node --test "tests/*.test.js"` 可能因 spawn EPERM 失败，这不代表测试坏了。）
 - 提交前至少跑：`node scripts/check-layers.js`、`node scripts/release-check.js`、`node scripts/privacy-scan.js .`。
 - 中文注释讲「为什么」，不要写「做了什么」式的废话；不重排无关代码。

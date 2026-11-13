@@ -1,7 +1,9 @@
 'use strict';
 
-const TIME_SENSITIVE_RE = /(最新|现在|今年|目前|当前|今天|今日|刚刚|实时|这周|本周|最近几天|这两天|出到几|第几代|什么型号|哪个版本|多少钱|什么价|行情|发布会|刚出|新出)/;
-const STOP_WORDS = /(帮我|请问|请|一下|查查|查一查|搜搜|搜索|看看|我想知道|谁是|是谁|这个|那个|什么|怎么|为什么|是不是|有没有|最新|现在|目前|当前|今天|多少钱|什么价|价格是|怎么样|如何|的|吗|呢|啊|呀|吧|了|嘛|呗)/gi;
+// 「去年/前年/最近/上个月」也是时效词：问「去年的榜单」时，几年前的旧文不该无限放行
+// （实见：CS 去年 top20 的查询完全不限新鲜度，旧年份名单文章畅通无阻地当了证据）。
+const TIME_SENSITIVE_RE = /(最新|现在|今年|去年|前年|最近|近期|上个月|上月|上周|目前|当前|今天|今日|刚刚|实时|这周|本周|最近几天|这两天|出到几|第几代|什么型号|哪个版本|多少钱|什么价|行情|发布会|刚出|新出)/;
+const STOP_WORDS = /(帮我|请问|请|一下|查查|查一查|搜搜|搜索|看看|我想知道|你知道|知道|谁是|是谁|这个|那个|什么|怎么|为什么|是不是|有没有|最新|现在|目前|当前|今天|多少钱|什么价|价格是|怎么样|如何|的|吗|呢|啊|呀|吧|了|嘛|呗)/gi;
 const GENERIC = new Set(['谁是', '是谁', '这个', '那个', '一个', '什么', '怎么', '为什', '时候', '东西',
   '事情', '问题', '方法', '我们', '你们', '他们', '自己', '可以', '不是', '就是', '还是', '如果', '但是',
   '所以', '因为', '这样', '那样', '知道', '觉得', '应该', '需要', '很多', '非常', '真的', '一直',
@@ -27,6 +29,17 @@ function queryTokens(query) {
   return [...new Set(tokens)].filter(x => !GENERIC.has(x));
 }
 
+/** 相对时间词锚定成具体年份：搜索引擎不认「去年」，锚定后才能命中用户真正指的那一年。 */
+function anchorYears(text, now = new Date()) {
+  const t = now instanceof Date && !Number.isNaN(now.getTime()) ? now : new Date();
+  const y = t.getFullYear();
+  return String(text || '')
+    .replace(/大前年/g, (y - 3) + '年')
+    .replace(/前年/g, (y - 2) + '年')
+    .replace(/去年/g, (y - 1) + '年')
+    .replace(/今年/g, y + '年');
+}
+
 function cleanQuery(query) {
   let text = String(query || '').replace(/^\s*(帮我|请|你|麻烦)?\s*(查一下|查查|查一查|查|搜一下|搜搜|搜|找一下|找|看看)/, ' ')
     .replace(STOP_WORDS, ' ').replace(/[，。！？、!?]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -46,6 +59,14 @@ function relevanceScore(query, item) {
   const models = modelNames(query);
   const found = modelNames(hay);
   if (models.length && !models.every(x => found.includes(x))) return 0;
+  // 查询里带明确年份时，通篇讲别的年份的资料等于答非所问——「2025 年的榜单」配上
+  // 2024 年的名单文章，正是「她拿旧年份当去年」这类错误的证据侧根源。正文一个年份
+  // 都没有的没法核对年份，照常打分，交给其余规则把关。
+  const wantedYears = String(query).match(/(?<!\d)20\d{2}(?!\d)/g);
+  if (wantedYears && wantedYears.length) {
+    const hayYears = hay.match(/(?<!\d)20\d{2}(?!\d)/g) || [];
+    if (hayYears.length && !hayYears.some(y => wantedYears.includes(y))) return 0;
+  }
   const tokens = queryTokens(query);
   if (!tokens.length) return 1;
   const hits = tokens.filter(t => hay.includes(t) || (ALIASES[t] || []).some(a => hay.includes(a)));
@@ -129,5 +150,5 @@ function splitFreshness(query, results, { maxAgeDays, nowMs = Date.now() } = {})
 
 function dropStaleResults(query, results, opts) { return splitFreshness(query, results, opts).items; }
 
-module.exports = { expandBrand, cleanQuery, queryTokens, modelNames, relevanceScore, keepRelevant,
+module.exports = { expandBrand, cleanQuery, anchorYears, queryTokens, modelNames, relevanceScore, keepRelevant,
   parseSnippetAgeDays, tightenFreshness, effectiveMaxAgeDays, isTimeSensitive, splitFreshness, dropStaleResults };

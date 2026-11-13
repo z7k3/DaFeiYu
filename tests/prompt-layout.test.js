@@ -214,3 +214,20 @@ test('静态模式下 buildTurnState 为空转（旧行为不再拼尾部）', (
   assert.equal(parts.tail, '');
   assert.match(parts.system, /【此刻】/, '旧行为里时间还在 system');
 });
+
+
+test('统计事实的记忆边界规则：默认与自定义人设的 system 都要有', () => {
+  const def = persona.buildSystem({ config: config(), msg: privateMsg(), now: NOW });
+  assert.match(def, /会随时间变化的统计/);
+  assert.match(def, /名单 \/ 排名 \/ 榜单/);
+  const cust = persona.buildSystem({ config: config({ persona: { customPrompt: '你是鲸鲸，保持一点俏皮。' } }),
+    msg: privateMsg({ isMaster: true, senderName: 'Master' }), now: NOW });
+  assert.match(cust, /会随时间变化的统计/, '自定义人设同样不许拿记忆名单顶数');
+});
+
+test('有联网资料时：资料里没有的名单/名次不许拿记忆顶上', () => {
+  const tail = persona.buildTurnState({ config: config(), now: NOW,
+    msg: groupMsg({ webText: '【北京 实时天气】现在 10.7°C' }) });
+  assert.match(tail, /不要拿记忆里的那份顶上/);
+  assert.match(tail, /脑子里能报出/, '实见的「脑子里能报出个大概」要被明确禁止');
+});

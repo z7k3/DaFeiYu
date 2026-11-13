@@ -79,23 +79,36 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
       attempts.push({ provider: 'router', status: route.failed ? 'failed' : 'ok', elapsedMs: Date.now() - routeStarted });
     }
     if (!active()) throw searchError(controller.signal.aborted ? 'aborted' : 'deadline_exceeded');
-    if (!route.need && !(route.failed && gate.fallback)) return skipped(route.failed ? 'local_not_needed' : 'router_not_needed');
-    say('decision', { decision: 'run', reason: route.need ? 'router_requested' : gate.route ? 'router_failed_keyword_fallback' : 'rules_requested',
+    // 路由说「不用查」通常照办；但「会变的统计事实」（榜单/排名/冠军/销量…）是例外：
+    // 路由容易把这类当成「模型自己知道」，而模型记忆停在过去（实见 CS top20 拿 2024 冒充 2025），
+    // 强信号命中时必须查。
+    if (!route.need && !(route.failed && gate.fallback) && !gate.volatile) return skipped(route.failed ? 'local_not_needed' : 'router_not_needed');
+    say('decision', { decision: 'run', reason: route.need ? 'router_requested' : route.failed ? 'router_failed_keyword_fallback' : gate.volatile ? 'volatile_forced' : 'rules_requested',
       routeFailed: Boolean(route.failed), budgetMs: options().timeoutMs });
     const intent = policy.intent(text, route);
     let q = intent.query;
-    if (route.failed) {
-      // 路由挂了 → 用关键词规则选源，但查询词必须清洗成能搜的形式。
-      // 以前直接拿原句搜：'你知道CS去年的top20名单吗' 这种问句会把 '你知道…吗' 一起搜，
-      // 命中率极差（实测第一次 10 条全被相关性过滤拒掉，得多打两次搜索）。
+    // 路由挂了（回退关键词规则选源），或被统计事实信号推翻（此时路由没给检索词）：
+    // 这两种情况下查询词都是用户原句，必须清洗成能搜的形式。
+    // 以前直接拿原句搜：'你知道CS去年的top20名单吗' 这种问句会把 '你知道…吗' 一起搜，
+    // 命中率极差（实测第一次 10 条全被相关性过滤拒掉，得多打两次搜索）。
+    if (route.failed || !route.need) {
       try {
         const cleaned = quality.cleanQuery(q);
         if (cleaned && cleaned !== q) {
-          say('query_rewrite', { reason: 'router_failed', from: q.length, to: cleaned.length });
+          say('query_rewrite', { reason: route.failed ? 'router_failed' : 'volatile_forced', from: q.length, to: cleaned.length });
           q = cleaned;
         }
       } catch { /* 清洗失败就用原句 */ }
     }
+    // 相对时间词必须锚成具体年份：搜「去年 top20」返回的是任意年份的杂页，证据年份一错
+    // 她就拿旧名单当答案。路由提示词已要求换算，这里对两种来源统一兜底（幂等）。
+    try {
+      const anchored = quality.anchorYears(q, now);
+      if (anchored && anchored !== q) {
+        say('query_rewrite', { reason: 'anchor_relative_time', from: q.length, to: anchored.length });
+        q = anchored;
+      }
+    } catch { /* 锚定失败就用原句 */ }
     // 天气/热榜这类专用接口常要两次串行请求（地理编码 → 预报）：只分剩余预算的
     // 60% 会在慢网络下必然超时，然后退化去搜网页拿到「城市百科」这种垃圾证据。
     // 给到至少 6 秒，同时仍受总 deadline 约束。

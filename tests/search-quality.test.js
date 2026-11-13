@@ -43,3 +43,29 @@ test('模型 any 标签不能放宽用户明确要求的今天和本周', () => 
   assert.equal(web.effectiveMaxAgeDays('本周赛事', 'any'), 7);
   assert.equal(web.effectiveMaxAgeDays('红楼梦作者', 'any'), null);
 });
+
+
+const quality = require('../src/core/search/quality');
+
+test('相对时间词锚定成具体年份（以查询时刻为准，幂等）', () => {
+  const now = new Date(2026, 10, 13);
+  assert.equal(quality.anchorYears('CS去年的top20名单', now), 'CS2025年的top20名单');
+  assert.equal(quality.anchorYears('今年出的新机', now), '2026年出的新机');
+  assert.equal(quality.anchorYears('前年的冠军和大前年的纪录', now), '2024年的冠军和2023年的纪录');
+  assert.equal(quality.anchorYears('南昌今天天气', now), '南昌今天天气');
+  const once = quality.anchorYears('去年冠军今年赛程', now);
+  assert.equal(quality.anchorYears(once, now), once);
+});
+
+test('查询带年份时，通篇讲别的年份的资料不能当答案', () => {
+  const items = [
+    { title: 'HLTV 2024年度top20', snippet: '2024 年度排名 donk 第一', url: 'https://e.test/2024' },
+    { title: '2025年CS年度top20名单', snippet: '2025 年度排名出炉', url: 'https://e.test/2025' },
+  ];
+  assert.deepEqual(quality.keepRelevant('CS 2025年 top20 名单', items).map(x => x.url), ['https://e.test/2025']);
+});
+
+test('「去年/最近」这类回看词也算时效敏感，过期资料不再无限放行', () => {
+  assert.equal(quality.isTimeSensitive('CS去年的top20名单'), true);
+  assert.equal(quality.isTimeSensitive('最近的比赛结果'), true);
+});

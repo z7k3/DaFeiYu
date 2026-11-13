@@ -91,3 +91,11 @@ test('路由失败时返回 failed，调用方回退关键词', async () => {
   assert.deepEqual(await route(noisy, 'B站热搜'), { need: false, query: '', site: '', city: '', fresh: 'normal', failed: true });
   assert.deepEqual(await route(null, 'B站热搜'), { need: false, query: '', site: '', city: '', fresh: 'normal', failed: true });
 });
+
+
+test('路由提示词：统计事实必须核对，相对时间要换算具体年份', () => {
+  const system = systemFor(new Date('2026-11-13T20:00:00+08:00'));
+  assert.match(system, /榜单、排名、名单/, '统计事实类要明确列进「需要联网」');
+  assert.match(system, /具体年份/, '相对时间换算规则要写明');
+  assert.match(system, /「去年」/);
+});
