@@ -476,9 +476,15 @@ class SenderMixin:
             if G.BG_SEND.get('enabled', True):
                 _bg_ran = True
                 G.touch()
+                # 打开会话时第三方库会 ensure_visible()→bring_to_front()，把微信抬到前台
+                # 并设成 TOPMOST，而且自己从不还原。后台通道以前成功后直接 return，
+                # 这些副作用就留在了桌面上（用户看到「回个消息微信跳出来」）。
+                # 所以这里也记快照，成功/失败都还原一次。
+                _bg_snap = self.snapshot_win_state()
                 try:
                     if self.bg_send(text, chat_display_name, chat_username):
                         self._mark_send_ok(chat_username)
+                        self.quiet_restore(_bg_snap)
                         G.log('发送成功（后台通道，%.1fs）→ %s' % (G.time.time() - t_start, display))
                         return True
                 except G.DraftDirtyError as e:

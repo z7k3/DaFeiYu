@@ -290,6 +290,8 @@ class DirtyDraftPipelineTests(unittest.TestCase):
                     # 并用 chat_dead()/_mark_send_ok() 收口读写。
                     dead_chats={}, fail_streak={}, account_send_allowed=lambda *a: True,
                     chat_dead=lambda u: False, _mark_send_ok=lambda u: None,
+                    # 后台发送成功也要还原窗口状态（第三方库会抢前台/置顶）
+                    snapshot_win_state=lambda: {}, quiet_restore=lambda s: None,
                     group_is_alive=lambda u: True, is_self_chat=lambda u: False,
                     ui_chat_name=lambda u, n: n or u, touch=lambda: None,
                     ensure_budget=lambda b: None,

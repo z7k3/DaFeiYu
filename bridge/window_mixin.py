@@ -281,28 +281,38 @@ class WindowMixin:
             return self.force_send_foreground(fn)
         finally:
             if restore_after:
-                self.restore_win_state(snap)
-            # guia 内部（send_file/send_image/open_chat 等）会调 ensure_visible()
-            # 自动最小化盖住微信的窗口，且从不还原（_blocked_minimized 只增不减）。
-            # 发送一结束就把它们还回去：被盖住的窗口最多消失几秒钟。
-            try:
-                gui = self.gui
-                if gui is not None and hasattr(gui, 'restore_blockers'):
-                    gui.restore_blockers()
-            except Exception:
-                pass
-            # ensure_visible → bring_to_front(keep_topmost=True) 会把微信设成 TOPMOST；
-            # 发送前不是置顶的话，发完就撤掉，微信不会一直压在所有窗口上。
-            try:
-                if snap and snap.get('hwnd') and not snap.get('topmost'):
-                    import win32con
-                    import win32gui
-                    ex = win32gui.GetWindowLong(snap['hwnd'], win32con.GWL_EXSTYLE)
-                    if ex & win32con.WS_EX_TOPMOST:
-                        win32gui.SetWindowPos(snap['hwnd'], win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
-                                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
-            except Exception:
-                pass
+                self.quiet_restore(snap)
+
+    def quiet_restore(self, snap):
+        """发送后把窗口「恢复原样」：前台还给原窗口、撤掉我们加的置顶、还原被最小化的窗口。
+
+        第三方库（guia.ensure_visible → bring_to_front、uia_driver._activate 等）在
+        打开会话时会把微信抬到前台并设成 TOPMOST，而且从不还原。以前只有
+        with_window_on_top 的 finally 会收拾；但**后台通道成功后是直接 return 的**，
+        于是这些副作用留了下来——用户看到的就是「回个消息微信跳到最前面」。
+        所以把清理抽出来，前后台两条路径都必须调用。
+        """
+        if not snap:
+            return
+        self.restore_win_state(snap)
+        # guia 内部会最小化盖住微信的窗口且从不还原（_blocked_minimized 只增不减）
+        try:
+            gui = self.gui
+            if gui is not None and hasattr(gui, 'restore_blockers'):
+                gui.restore_blockers()
+        except Exception:
+            pass
+        # ensure_visible → bring_to_front(keep_topmost=True) 会把微信设成 TOPMOST
+        try:
+            if snap.get('hwnd') and not snap.get('topmost'):
+                import win32con
+                import win32gui
+                ex = win32gui.GetWindowLong(snap['hwnd'], win32con.GWL_EXSTYLE)
+                if ex & win32con.WS_EX_TOPMOST:
+                    win32gui.SetWindowPos(snap['hwnd'], win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                                          win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
+        except Exception:
+            pass
 
     def force_foreground(self, hwnd):
         """把微信强制拉到前台，并且**确认真的到位**。
@@ -524,6 +534,36 @@ class WindowMixin:
                 return 0
 
             gui._minimize_blockers = _no_minimize
+
+            # 同一个源头还有一处：open_chat() 内部会 ensure_visible() → bring_to_front()，
+            # 后者会 SetForegroundWindow + HWND_TOPMOST，把微信抬到最前面并一直压着。
+            # 后台通道靠 UIA/PostMessage 打字，窗口被遮挡、缩在托盘、甚至在屏幕外都能发
+            # （本项目实测 18/18），所以这里不需要真的前置；真需要前台的重试路径
+            # （force_send_foreground）自己会 SetForegroundWindow，不依赖这个方法。
+            try:
+                import types
+                import win32gui
+                orig_bring = gui.bring_to_front
+
+                # orig_bring 是**绑定方法**，调用时不能再传 self（否则参数变三个）。
+                def _quiet_bring(self, keep_topmost=False, _orig=orig_bring):
+                    try:
+                        hwnd = getattr(self, 'main_hwnd', None) or 0
+                        # 只有「窗口还活着且没被最小化」时才跳过前置；
+                        # 真最小化了还是要恢复，否则 UIA 控件树拿不到。
+                        if hwnd and self.is_alive() and not win32gui.IsIconic(hwnd):
+                            self._last_visible_ok = True
+                            self._last_visible_ts = G.time.time()
+                            return True
+                    except Exception:
+                        pass
+                    return _orig(keep_topmost)
+
+                gui.bring_to_front = types.MethodType(_quiet_bring, gui)
+                gui._whale_quiet_front = True
+            except Exception as e:
+                G.log('禁用自动前置补丁没打上（行为不变）：', repr(e))
+
             gui._whale_no_minimize_patch = True
         except Exception as e:
             G.log('禁用自动最小化补丁没打上（行为不变）：', repr(e))

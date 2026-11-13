@@ -493,7 +493,9 @@ class BridgeContractTest(unittest.TestCase):
         scope = bridge_functions({'with_window_on_top'}, {
             'STICKER_TEST_ON': True, 'BACKGROUND_SEND': True,
             'force_send_foreground': foreground,
-            'snapshot_win_state': lambda: 'snapshot', 'restore_win_state': restore,
+            'snapshot_win_state': lambda: 'snapshot',
+            # 清理现在统一走 quiet_restore（内部才调 restore_win_state）
+            'quiet_restore': lambda s: restore(s), 'restore_win_state': restore,
         })
         self.assertTrue(scope['with_window_on_top'](action))
         action.assert_called_once()
@@ -736,6 +738,8 @@ class BridgeContractTest(unittest.TestCase):
                    acct_dirs=['test-account'], acct='test-account', WINDOW_HWND=0, dead_chats={},
                    # 本地 fork：dead_chats 改 dict+TTL 后，读路径收口到 chat_dead()
                    chat_dead=lambda u: False,
+                   # with_window_on_top 的清理抽成了 quiet_restore
+                   quiet_restore=lambda s: None, snapshot_win_state=lambda: {},
                    sticker_account_evidence_ok=transport.account_evidence_allowed,
                    group_is_alive=lambda username: True, AWAY={'on': False}, away_active=lambda: False,
                    game_running=lambda: False, foreground_is_fullscreen=lambda: False)
