@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Media.Effects;
 using Microsoft.Win32;
 
 namespace WhaleLauncher.Views
@@ -46,6 +47,7 @@ namespace WhaleLauncher.Views
     public partial class SettingsPage : UserControl, IRefreshable
     {
         private readonly RuntimeSupervisor _sup;
+        private readonly ConfigSaver _saver;
         private readonly Dictionary<string, Action<JsonElement>> _loaders = new Dictionary<string, Action<JsonElement>>();
         private Action<JsonElement, Dictionary<string, JsonElement>> _loadModel;
         private Action<JsonElement> _loadVision;
@@ -60,6 +62,7 @@ namespace WhaleLauncher.Views
         {
             InitializeComponent();
             _sup = sup;
+            _saver = new ConfigSaver(sup);
             BuildOnce();
             Loaded += async (_, __) =>
             {
@@ -100,15 +103,15 @@ namespace WhaleLauncher.Views
                 new FieldSpec { Path = "links.timeoutMs", Label = "链接超时(毫秒)", Kind = "num", Min = 1000, Max = 30000 },
                 new FieldSpec { Path = "links.cacheMinutes", Label = "链接缓存(分钟)", Kind = "num", Min = 0, Max = 1440 },
             }},
-            new SectionSpec { Title = "高级", Note = "改完要重启的项都在这里（对话预算例外，改完立刻生效）。", Fields =
+            new SectionSpec { Title = "高级", Note = "改完要重启的项都在这里（对话预算和时区例外，改完立刻生效）。", Fields =
             {
                 new FieldSpec { Path = "memory.dialogueBudget", Label = "对话预算(token)", Kind = "sliderInput", Min = 2000, Max = 20000, InputMin = 1000, Hint = "每轮带多少对话内容（不含人设）：默认 5,500。记忆和原文按比例分，预算越大带得越多；滑块 2,000–20,000，下面四个胶囊是一键跳档，右边输入框可以填到 1,000 以上。" },
+                new FieldSpec { Path = "env.timezone", Label = "时区", Kind = "text", Hint = "IANA 时区，如 Asia/Shanghai；留空 = 系统时区。日记时间、主动搭话时间段、提醒、朋友圈夜间判断和聊天时间戳都按它算。" },
                 new FieldSpec { Path = "server.host", Label = "监听地址", Kind = "text", Hint = "只建议 127.0.0.1；同 WiFi 访问只对桥接和接口有效，没有网页界面（改完重启）" },
                 new FieldSpec { Path = "server.port", Label = "本机端口", Kind = "selectnum", Options = new[] { "8787", "9191", "1919", "7878" }, Hint = "默认 8787；只在这四个里选，改完重启内核生效" },
                 new FieldSpec { Path = "log.level", Label = "日志级别", Kind = "select", Options = new[] { "debug", "info", "error" }, Hint = "界面 / 控制台用哪一档；日志文件始终记 debug 全量（data/whale.log、data/wechat-bridge-4x.log），改完重启生效" },
                 new FieldSpec { Path = "storage.mediaKeepDays", Label = "媒体缓存保留几天", Kind = "num", Min = 0, Max = 90 },
                 new FieldSpec { Path = "storage.mediaMaxMB", Label = "媒体缓存上限(MB)", Kind = "num", Min = 0, Max = 10000 },
-                new FieldSpec { Path = "admin.allowAll", Label = "开放其他管理命令", Kind = "bool", Hint = "魔咒、群禁言和清空记忆仍限已绑定微信 ID 的主人" },
             }},
         };
 
@@ -144,7 +147,7 @@ namespace WhaleLauncher.Views
             {
                 var spell = password.Password.Trim();
                 if (spell.Length == 0) return;
-                if (await PatchAsync("admin.spell", "\"" + Api.Esc(spell) + "\""))
+                if (await PatchAsync("admin.spell", spell))
                 {
                     password.Clear();
                     _adminSpellStatus.Text = "已设置";
@@ -152,7 +155,7 @@ namespace WhaleLauncher.Views
             };
             clear.Click += async (_, __) =>
             {
-                if (await PatchAsync("admin.spell", "\"\""))
+                if (await PatchAsync("admin.spell", ""))
                 {
                     password.Clear();
                     _adminSpellStatus.Text = "未设置";
@@ -235,7 +238,7 @@ namespace WhaleLauncher.Views
         // ── 外观：深浅色 + 背景图（只影响启动器）────────────────
         private Border BuildAppearanceSection()
         {
-            var card = Card("外观", "只影响启动器界面：深浅色和背景图。不会写进 config.json，也不影响她的人设和聊天。", out var body);
+            var card = Card("外观", "只影响启动器界面：深浅色、背景图和它的模糊 / 透明效果。文字直接浮在背景上，自带反色描边；卡片和面板的遮罩可以拉到 0。不会写进 config.json，也不影响她的人设和聊天。", out var body);
 
             var dark = new CheckBox
             {
@@ -299,16 +302,153 @@ namespace WhaleLauncher.Views
             panel.Children.Add(actions);
             panel.Children.Add(hint);
             body.Children.Add(Row("背景图片", panel,
-                "支持 JPG / PNG / BMP，会自动压一层主题蒙版并模糊。浅色模式建议配浅色图，深色模式建议配深色图，文字更清楚。", true));
+                "支持 JPG / PNG / BMP。有图时顶栏、导航和卡片都会透出背景；文字自带反色柔光，亮图暗图都能看清。", true));
+
+            var fit = new ComboBox { Width = 220, HorizontalAlignment = HorizontalAlignment.Left };
+            fit.Items.Add("等比裁剪（铺满）");
+            fit.Items.Add("拉伸铺满");
+            fit.Items.Add("等比完整（留边）");
+            fit.SelectedIndex = Appearance.BackdropFit switch { "stretch" => 1, "uniform" => 2, _ => 0 };
+            fit.SelectionChanged += (_, __) =>
+            {
+                if (fit.SelectedIndex < 0) return;
+                Appearance.SetBackdropFit(fit.SelectedIndex switch { 1 => "stretch", 2 => "uniform", _ => "fill" });
+            };
+            body.Children.Add(Row("背景填充", fit,
+                "等比裁剪会裁掉多余边缘；拉伸会让画面变形；等比完整会在空出来的地方露出主题底色。", true));
+
+            // 模糊 / 透明度滑块：值直接写进 launcher-ui.json，拖一下就能看到效果。
+            var blurValue = ValueLabel();
+            var blurSlider = new Slider
+            {
+                Style = (Style)FindResource("BudgetSlider"),
+                Minimum = 0,
+                Maximum = 60,
+                Width = 300,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            blurSlider.Value = Appearance.BackdropBlur;
+            blurValue.Text = Math.Round(Appearance.BackdropBlur) + " px";
+            blurSlider.ValueChanged += (_, e) =>
+            {
+                var v = Math.Round(e.NewValue);
+                blurValue.Text = v + " px";
+                Appearance.SetBackdropBlur(v);
+            };
+            body.Children.Add(Row("背景模糊", SliderWithValue(blurSlider, blurValue),
+                "0 = 清晰，60 = 最柔；只模糊背景图，文字和卡片保持锐利。", true));
+
+            var opacityValue = ValueLabel();
+            var opacitySlider = new Slider
+            {
+                Style = (Style)FindResource("BudgetSlider"),
+                Minimum = 0,
+                Maximum = 100,
+                Width = 300,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            opacitySlider.Value = Math.Round((1 - Appearance.BackdropOpacity) * 100);
+            opacityValue.Text = Math.Round(opacitySlider.Value) + "%";
+            opacitySlider.ValueChanged += (_, e) =>
+            {
+                var v = Math.Round(e.NewValue);
+                opacityValue.Text = v + "%";
+                Appearance.SetBackdropOpacity(1 - v / 100.0);
+            };
+            body.Children.Add(Row("背景透明度", SliderWithValue(opacitySlider, opacityValue),
+                "0% = 图片完全不透明，100% = 只看主题底色。图片越透明，底下的主题色越多。", true));
+
+            var surfaceValue = ValueLabel();
+            var surfaceSlider = new Slider
+            {
+                Style = (Style)FindResource("BudgetSlider"),
+                Minimum = 0,
+                Maximum = 100,
+                Width = 300,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            surfaceSlider.Value = Math.Round(Appearance.SurfaceOpacity * 100);
+            surfaceValue.Text = Math.Round(surfaceSlider.Value) + "%";
+            surfaceSlider.ValueChanged += (_, e) =>
+            {
+                var v = Math.Round(e.NewValue);
+                surfaceValue.Text = v + "%";
+                Appearance.SetSurfaceOpacity(v / 100.0);
+            };
+            body.Children.Add(Row("面板不透明度", SliderWithValue(surfaceSlider, surfaceValue),
+                "0% = 文字框完全透明，只留描边；100% = 更实的玻璃。文字自带描边，拉到 0 也能看清。", true));
+
+            // ── 配色：莫奈取色 + 手动覆盖（顶栏固定，不参与）──
+            var monetCheck = new CheckBox
+            {
+                Content = "从背景图自动取色（莫奈）",
+                IsChecked = Appearance.MonetEnabled,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            monetCheck.Click += (_, __) => Appearance.SetMonet(monetCheck.IsChecked == true);
+            var remonet = new Button { Content = "重新取色", Style = (Style)FindResource("Ghost"), Margin = new Thickness(10, 0, 0, 0) };
+            remonet.Click += (_, __) => Appearance.RefreshMonet();
+            var monetPanel = new WrapPanel();
+            monetPanel.Children.Add(monetCheck);
+            monetPanel.Children.Add(remonet);
+            body.Children.Add(Row("莫奈取色", monetPanel,
+                "从背景图挑主色生成主题色和低饱和遮罩色；下面手选的颜色优先。顶栏固定不参与。", true));
+
+            body.Children.Add(Row("主题色", BuildColorRow("accent", "主题色"),
+                "按钮、选中态和强调文字用的颜色。点「自动」就回到莫奈取色。", true));
+            body.Children.Add(Row("遮罩色", BuildColorRow("tint", "遮罩色"),
+                "压在背景图上的统一色调；觉得画面发灰时可以换一个颜色。", true));
+            body.Children.Add(Row("文字色", BuildColorRow("text", "文字色"),
+                "正文和说明文字的颜色；选完后注意和背景的明暗差。", true));
+
+            var haloCheck = new CheckBox
+            {
+                Content = "文字描边（觉得发光可以关掉）",
+                IsChecked = Appearance.TextHaloEnabled,
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            haloCheck.Click += (_, __) => Appearance.SetTextHalo(haloCheck.IsChecked == true);
+            body.Children.Add(Row("文字描边", haloCheck,
+                "只在有背景图时生效；关掉后靠自定义文字色保证可读。", true));
+
+            var resetPalette = new Button { Content = "恢复自动配色", Style = (Style)FindResource("Ghost") };
+            resetPalette.Click += (_, __) => Appearance.ResetPalette();
+            body.Children.Add(Row("配色重置", resetPalette,
+                "主题色、遮罩色、文字色退回莫奈 / 主题默认，描边重新打开。", true));
 
             void Refresh()
             {
                 dark.IsChecked = Appearance.IsDark;
+                monetCheck.IsChecked = Appearance.MonetEnabled;
+                haloCheck.IsChecked = Appearance.TextHaloEnabled;
+                monetCheck.IsEnabled = Appearance.HasBackdrop;
+                remonet.IsEnabled = Appearance.HasBackdrop;
                 var bmp = Appearance.LoadBackdrop();
                 img.Source = bmp;
+                img.Opacity = Appearance.BackdropOpacity;
+                if (bmp == null)
+                {
+                    img.Effect = null;
+                }
+                else
+                {
+                    // 复用同一个 BlurEffect：拖滑块时 Changed 会高频触发，别每次 new。
+                    if (img.Effect is not BlurEffect blur)
+                    {
+                        blur = new BlurEffect { KernelType = KernelType.Gaussian, RenderingBias = RenderingBias.Performance };
+                        img.Effect = blur;
+                    }
+                    blur.Radius = Appearance.BackdropBlur * 0.35;
+                }
                 img.Visibility = bmp == null ? Visibility.Collapsed : Visibility.Visible;
                 empty.Visibility = bmp == null ? Visibility.Visible : Visibility.Collapsed;
                 clear.IsEnabled = !string.IsNullOrEmpty(Appearance.Backdrop);
+                blurSlider.IsEnabled = Appearance.HasBackdrop;
+                opacitySlider.IsEnabled = Appearance.HasBackdrop;
+                surfaceSlider.IsEnabled = Appearance.HasBackdrop;
                 pathText.Text = string.IsNullOrEmpty(Appearance.Backdrop)
                     ? "当前使用纯色背景。"
                     : "当前：" + Appearance.Backdrop;
@@ -366,6 +506,80 @@ namespace WhaleLauncher.Views
             stack.Children.Add(body);
             border.Child = stack;
             return border;
+        }
+
+        private TextBlock ValueLabel() => new TextBlock
+        {
+            Style = (Style)FindResource("Small"),
+            MinWidth = 58,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(12, 0, 0, 0),
+        };
+
+        /// <summary>色块 + 当前色值 + 调色 / 自动。点「自动」清掉手选色，回到莫奈或主题默认。</summary>
+        private FrameworkElement BuildColorRow(string kind, string label)
+        {
+            var swatch = new Border
+            {
+                Width = 38,
+                Height = 22,
+                CornerRadius = new CornerRadius(6),
+                BorderThickness = new Thickness(1),
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            swatch.SetResourceReference(Border.BorderBrushProperty, "CardBorder");
+            var hex = new TextBlock
+            {
+                Style = (Style)FindResource("Small"),
+                VerticalAlignment = VerticalAlignment.Center,
+                MinWidth = 76,
+                Margin = new Thickness(8, 0, 0, 0),
+            };
+            var pick = new Button { Content = "调色…", Style = (Style)FindResource("Ghost"), Margin = new Thickness(10, 0, 0, 0) };
+            var auto = new Button { Content = "自动", Style = (Style)FindResource("Ghost"), Margin = new Thickness(8, 0, 0, 0) };
+
+            var row = new StackPanel { Orientation = Orientation.Horizontal };
+            row.Children.Add(swatch);
+            row.Children.Add(hex);
+            row.Children.Add(pick);
+            row.Children.Add(auto);
+
+            bool IsCustom() => kind switch
+            {
+                "accent" => Appearance.AccentOverride.Length > 0,
+                "tint" => Appearance.TintOverride.Length > 0,
+                _ => Appearance.TextOverride.Length > 0,
+            };
+
+            void RefreshSwatch()
+            {
+                var c = Appearance.EffectiveColor(kind);
+                swatch.Background = new SolidColorBrush(c);
+                hex.Text = Appearance.ToHex(c);
+                auto.IsEnabled = IsCustom();
+            }
+
+            pick.Click += (_, __) =>
+            {
+                var dlg = new ColorPickerWindow(label, Appearance.EffectiveColor(kind), (Style)FindResource("BudgetSlider"))
+                {
+                    Owner = Window.GetWindow(this),
+                };
+                if (dlg.ShowDialog() == true)
+                    Appearance.SetPaletteColor(kind, Appearance.ToHex(dlg.SelectedColor));
+            };
+            auto.Click += (_, __) => Appearance.ClearPaletteColor(kind);
+            Appearance.Changed += RefreshSwatch;
+            RefreshSwatch();
+            return row;
+        }
+
+        private static StackPanel SliderWithValue(Slider slider, TextBlock value)
+        {
+            var panel = new StackPanel { Orientation = Orientation.Horizontal };
+            panel.Children.Add(slider);
+            panel.Children.Add(value);
+            return panel;
         }
 
         private Grid Row(string label, FrameworkElement control, string hint, bool top = false, double labelWidth = 150)
@@ -442,7 +656,7 @@ namespace WhaleLauncher.Views
                     var status = await Api.Get(_sup.Url, "/api/memory/import/status");
                     if (!status.Ok)
                     {
-                        result.Text = "检查失败：" + (string.IsNullOrEmpty(status.Error) ? status.Raw : status.Error);
+                        result.Text = "检查失败：" + Api.Message(status);
                         return;
                     }
                     if (!status.Bool("pending"))
@@ -455,17 +669,14 @@ namespace WhaleLauncher.Views
                     var merged = NestedLong(plan, "merged");
                     var messages = NestedLong(plan, "messages");
                     var notes = NestedLong(plan, "notes");
-                    var answer = MessageBox.Show(
+                    if (!AppDialog.Confirm(
                         Window.GetWindow(this),
                         "发现旧版记忆：\n\n"
                         + "· 新增 " + imported + " 个聊天\n"
                         + "· 合并 " + merged + " 个已有聊天\n"
                         + "· 补进 " + messages + " 条消息 / " + notes + " 条偏好\n\n"
                         + "开始转换吗？原文件会保留，转换前也会自动备份当前记忆。",
-                        "转换旧版记忆",
-                        MessageBoxButton.OKCancel,
-                        MessageBoxImage.Question);
-                    if (answer != MessageBoxResult.OK)
+                        "转换旧版记忆", okText: "开始转换"))
                     {
                         result.Text = "已取消，什么都没改。";
                         return;
@@ -475,7 +686,7 @@ namespace WhaleLauncher.Views
                     var res = await Api.Post(_sup.Url, "/api/memory/import", "{}");
                     if (!res.Ok)
                     {
-                        result.Text = "转换失败：" + (string.IsNullOrEmpty(res.Error) ? res.Raw : res.Error);
+                        result.Text = "转换失败：" + Api.Message(res);
                         return;
                     }
                     if (res.Bool("idle"))
@@ -485,12 +696,10 @@ namespace WhaleLauncher.Views
                     }
                     result.Text = "完成：新增 " + res.Long("imported") + " 个聊天、合并 " + res.Long("merged")
                         + " 个，补进 " + res.Long("messages") + " 条消息 / " + res.Long("notes") + " 条偏好。";
-                    MessageBox.Show(
+                    AppDialog.Show(
                         Window.GetWindow(this),
                         "记忆已导入并转换格式。\n\n" + result.Text + "\n\n原文件保留在 data\\memory\\legacy\\。",
-                        "记忆已导入",
-                        MessageBoxButton.OK,
-                        MessageBoxImage.Information);
+                        "记忆已导入");
                     await Api.Post(_sup.Url, "/api/memory/import/ack", "{}");
                 }
                 catch (Exception ex)
@@ -528,7 +737,7 @@ namespace WhaleLauncher.Views
                     chk.Click += async (s, e) =>
                     {
                         if (_loading) return;
-                        await PatchAsync(f.Path, ((CheckBox)s).IsChecked == true ? "true" : "false");
+                        await PatchAsync(f.Path, ((CheckBox)s).IsChecked == true);
                     };
                     _loaders[f.Path] = v => { if (chk.IsKeyboardFocusWithin) return; _loading = true; chk.IsChecked = v.ValueKind == JsonValueKind.True; _loading = false; };
                     return Row(f.Label, chk, f.Hint, false, labelWidth);
@@ -539,7 +748,7 @@ namespace WhaleLauncher.Views
                     cmb.SelectionChanged += async (s, e) =>
                     {
                         if (_loading || cmb.SelectedItem == null) return;
-                        await PatchAsync(f.Path, "\"" + Api.Esc((string)cmb.SelectedItem) + "\"");
+                        await PatchAsync(f.Path, (string)cmb.SelectedItem);
                     };
                     _loaders[f.Path] = v =>
                     {
@@ -557,7 +766,8 @@ namespace WhaleLauncher.Views
                     cmb.SelectionChanged += async (s, e) =>
                     {
                         if (_loading || cmb.SelectedItem == null) return;
-                        await PatchAsync(f.Path, (string)cmb.SelectedItem);
+                        if (int.TryParse((string)cmb.SelectedItem, out var port))
+                            await PatchAsync(f.Path, port);
                     };
                     _loaders[f.Path] = v =>
                     {
@@ -576,7 +786,7 @@ namespace WhaleLauncher.Views
                     pwd.LostFocus += async (s, e) =>
                     {
                         if (_loading || pwd.Password.Length == 0) return;
-                        if (await PatchAsync(f.Path, "\"" + Api.Esc(pwd.Password.Trim()) + "\"")) pwd.Password = "";
+                        if (await PatchAsync(f.Path, pwd.Password.Trim())) pwd.Password = "";
                     };
                     return Row(f.Label, pwd, f.Hint, false, labelWidth);
                 }
@@ -587,7 +797,7 @@ namespace WhaleLauncher.Views
                     {
                         if (_loading) return;
                         var lines = (box.Text ?? "").Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0).ToArray();
-                        await PatchAsync(f.Path, "[" + string.Join(",", lines.Select(p => "\"" + Api.Esc(p) + "\"")) + "]");
+                        await PatchAsync(f.Path, lines);
                     };
                     _loaders[f.Path] = v =>
                     {
@@ -602,19 +812,49 @@ namespace WhaleLauncher.Views
                 }
                 case "num":
                 {
-                    var box = new TextBox { Width = 120, HorizontalAlignment = HorizontalAlignment.Left };
+                    TextBox box;
+                    if (f.IsInt)
+                    {
+                        var min = double.IsNaN(f.Min) ? int.MinValue : (int)Math.Ceiling(f.Min);
+                        var max = double.IsNaN(f.Max) ? int.MaxValue : (int)Math.Floor(f.Max);
+                        box = new NumberField
+                        {
+                            Width = 120,
+                            HorizontalAlignment = HorizontalAlignment.Left,
+                            Minimum = min,
+                            Maximum = max,
+                            EmptyUsesFallback = false,
+                            Label = f.Label
+                        };
+                    }
+                    else
+                    {
+                        box = new TextBox { Width = 120, HorizontalAlignment = HorizontalAlignment.Left };
+                    }
                     box.LostFocus += async (s, e) =>
                     {
                         if (_loading) return;
-                        if (!double.TryParse((box.Text ?? "").Trim(), out var n))
+                        if (box is NumberField number)
+                        {
+                            if (!number.TryRead(out var n))
+                            {
+                                StatusText.Text = number.ErrorText;
+                                return;
+                            }
+                            number.Text = n.ToString();
+                            await PatchAsync(f.Path, n);
+                            return;
+                        }
+                        var text = (box.Text ?? "").Trim();
+                        if (!double.TryParse(text, out var v) || !double.IsFinite(v))
                         {
                             StatusText.Text = f.Label + "：要填数字";
                             return;
                         }
-                        if (!double.IsNaN(f.Min)) n = Math.Max(f.Min, n);
-                        if (!double.IsNaN(f.Max)) n = Math.Min(f.Max, n);
-                        if (f.IsInt) { n = Math.Round(n); box.Text = n.ToString(); }
-                        await PatchAsync(f.Path, f.IsInt ? n.ToString() : n.ToString("0.###"));
+                        // 以前越界会静默改成边界值，用户以为自己的输入生效了；现在直接说清楚。
+                        if (!double.IsNaN(f.Min) && v < f.Min) { StatusText.Text = f.Label + " 不能小于 " + f.Min; return; }
+                        if (!double.IsNaN(f.Max) && v > f.Max) { StatusText.Text = f.Label + " 不能大于 " + f.Max; return; }
+                        await PatchAsync(f.Path, v);
                     };
                     _loaders[f.Path] = v =>
                     {
@@ -650,7 +890,7 @@ namespace WhaleLauncher.Views
                     {
                         debounce.Stop();
                         if (_loading) return;
-                        await PatchAsync(f.Path, Math.Round(slider.Value).ToString());
+                        await PatchAsync(f.Path, Math.Round(slider.Value));
                     };
                     void ShowValue() => readout.Text = Math.Round(slider.Value) + (f.Unit ?? "");
                     slider.ValueChanged += (s, e) =>
@@ -893,7 +1133,7 @@ namespace WhaleLauncher.Views
                         var v = Current();
                         if (v.Equals(saved)) return;
                         saved = v;
-                        await PatchAsync(f.Path, v.ToString("0"));
+                        await PatchAsync(f.Path, v);
                     };
 
                     hintTimer.Tick += (s, e) =>
@@ -925,7 +1165,7 @@ namespace WhaleLauncher.Views
                     box.LostFocus += async (s, e) =>
                     {
                         if (_loading) return;
-                        await PatchAsync(f.Path, "\"" + Api.Esc((box.Text ?? "").Trim()) + "\"");
+                        await PatchAsync(f.Path, (box.Text ?? "").Trim());
                     };
                     _loaders[f.Path] = v =>
                     {
@@ -952,13 +1192,12 @@ namespace WhaleLauncher.Views
             return cur.ValueKind == JsonValueKind.Number ? cur.GetDouble() : 0;
         }
 
-        private async Task<bool> PatchAsync(string path, string jsonLiteral)
+        private async Task<bool> PatchAsync(string path, object value)
         {
-            var body = "{\"patch\":{\"" + Api.Esc(path) + "\":" + jsonLiteral + "}}";
-            var res = await Api.Post(_sup.Url, "/api/config", body);
+            var res = await _saver.SaveAsync(() => new Dictionary<string, object> { [path] = value });
             StatusText.Text = res.Ok
                 ? path + " 已保存 " + DateTime.Now.ToString("HH:mm:ss")
-                : path + " 保存失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+                : path + " 保存失败：" + Api.Message(res);
             return res.Ok;
         }
 
@@ -975,16 +1214,16 @@ namespace WhaleLauncher.Views
                 .ToList();
             if (list.Count == 0) return;
 
-            var answer = MessageBox.Show(
+            if (!AppDialog.Confirm(
+                Window.GetWindow(this),
                 "把「" + title + "」改回默认值？\n\n只改这 " + list.Count + " 项；API Key 和聊天记忆不会被清掉。",
-                "恢复默认", MessageBoxButton.YesNo, MessageBoxImage.Question);
-            if (answer != MessageBoxResult.Yes) return;
+                "恢复默认", okText: "恢复默认"))
+                return;
 
-            var body = "{\"paths\":[" + string.Join(",", list.Select(p => "\"" + Api.Esc(p) + "\"")) + "]}";
-            var res = await Api.Post(_sup.Url, "/api/config/reset", body);
+            var res = await _sup.SaveConfigurationAsync("/api/config/reset", new { paths = list });
             if (!res.Ok)
             {
-                StatusText.Text = "恢复默认失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+                StatusText.Text = "恢复默认失败：" + Api.Message(res);
                 return;
             }
 
@@ -1253,7 +1492,7 @@ namespace WhaleLauncher.Views
                 if (_providers != null)
                     foreach (var kv in _providers)
                         if (ProviderHasVision(kv.Key))
-                            list.Add(new ProviderItem { Key = kv.Key, Label = GetStr(kv.Value, "label") + "（" + kv.Key + "）" });
+                            list.Add(new ProviderItem { Key = kv.Key, Label = JsonRead.Str(kv.Value, "label") + "（" + kv.Key + "）" });
                 // 自定义永远在最后：不依赖任何预设，地址和模型都由用户填
                 list.Add(new ProviderItem { Key = "custom", Label = "自定义（自己填接口地址和模型）" });
                 visionProviders = list;
@@ -1284,9 +1523,9 @@ namespace WhaleLauncher.Views
                     suppressAuto = true;
                     try
                     {
-                        baseUrl.Text = GetStr(pv, "baseUrl");
+                        baseUrl.Text = JsonRead.Str(pv, "baseUrl");
                         FillChatOptions(pv);
-                        model.Text = GetStr(pv, "model");
+                        model.Text = JsonRead.Str(pv, "model");
                         RebuildVisionProviders();   // 新服务商的聊天模型能不能识图，决定「自动跟随」还在不在
                         if (!wasAuto || !VisionIsAuto()) EnsureVisionSelection();
                         ApplyVisionMode();
@@ -1416,34 +1655,36 @@ namespace WhaleLauncher.Views
                 return string.IsNullOrWhiteSpace(picked) ? (visionModel.Text ?? "").Trim() : picked;
             }
 
-            string ModelRequest()
+            object ModelRequest()
             {
                 var prov = (cmb.SelectedItem as ProviderItem)?.Key ?? "";
-                return "{"
-                    + "\"provider\":\"" + Api.Esc(prov) + "\","
-                    + "\"baseUrl\":\"" + Api.Esc(baseUrl.Text.Trim()) + "\","
-                    + "\"model\":\"" + Api.Esc(model.Text.Trim()) + "\","
-                    + "\"visionProvider\":\"" + Api.Esc(VisionProviderValue()) + "\","
-                    + "\"visionModel\":\"" + Api.Esc(VisionValue()) + "\","
-                    + (VisionIsCustom() ? "\"visionBaseUrl\":\"" + Api.Esc(visionUrl.Text.Trim()) + "\"," : "")
-                    + "\"mock\":false"
-                    + ",\"thinking\":" + (thinking.IsChecked == true ? "true" : "false")
-                    + (key.Password.Length > 0 ? ",\"apiKey\":\"" + Api.Esc(key.Password.Trim()) + "\"" : "")
-                    + "}";
+                var req = new Dictionary<string, object>
+                {
+                    ["provider"] = prov,
+                    ["baseUrl"] = baseUrl.Text.Trim(),
+                    ["model"] = model.Text.Trim(),
+                    ["visionProvider"] = VisionProviderValue(),
+                    ["visionModel"] = VisionValue(),
+                    ["mock"] = false,
+                    ["thinking"] = thinking.IsChecked == true
+                };
+                if (VisionIsCustom()) req["visionBaseUrl"] = visionUrl.Text.Trim();
+                if (key.Password.Length > 0) req["apiKey"] = key.Password.Trim();
+                return req;
             }
 
             // 自动保存：聊天/看图这些输入改完（失焦、换了选项、勾了开关）立刻写回，
             // 不用再记得点「保存」。手动按钮保留，老习惯照样能用。
             async Task AutoSaveChatAsync()
             {
-                if (suppressAuto || autoSaving || _loading || _loadingConfig || !_configLoaded || !_sup.NodeRunning) return;
+                if (suppressAuto || autoSaving || _loading || _loadingConfig || !_configLoaded) return;
                 autoSaving = true;
                 try
                 {
-                    var res = await Api.Post(_sup.Url, "/api/settings", ModelRequest());
+                    var res = await _sup.SaveConfigurationAsync("/api/settings", ModelRequest());
                     if (!res.Ok)
                     {
-                        chatResult.Text = "自动保存失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+                        chatResult.Text = "自动保存失败：" + Api.Message(res);
                         return;
                     }
                     key.Password = "";
@@ -1454,14 +1695,14 @@ namespace WhaleLauncher.Views
 
             async Task AutoSaveVisionAsync()
             {
-                if (suppressAuto || _loading || _loadingConfig || !_configLoaded || !_sup.NodeRunning) return;
+                if (suppressAuto || _loading || _loadingConfig || !_configLoaded) return;
                 await SaveVisionAsync("");
             }
 
             save.Click += async (s, e) =>
             {
-                var res = await Api.Post(_sup.Url, "/api/settings", ModelRequest());
-                if (!res.Ok) { chatResult.Text = "保存失败：" + (res.Error.Length > 0 ? res.Error : res.Raw); return; }
+                var res = await _sup.SaveConfigurationAsync("/api/settings", ModelRequest());
+                if (!res.Ok) { chatResult.Text = "保存失败：" + Api.Message(res); return; }
                 key.Password = "";
                 chatResult.Text = "已保存。";
                 // 服务端可能顺手改了看图模型（跟随/解除跟随），必须重新拉一次，
@@ -1472,8 +1713,8 @@ namespace WhaleLauncher.Views
             test.Click += async (s, e) =>
             {
                 chatResult.Text = "正在测…";
-                var res = await Api.Post(_sup.Url, "/api/settings/test", ModelRequest());
-                chatResult.Text = res.Ok ? "连通正常。" : "测试没通过：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+                    var res = await Api.PostJson(_sup.Url, "/api/settings/test", ModelRequest());
+                chatResult.Text = res.Ok ? "连通正常。" : "测试没通过：" + Api.Message(res);
             };
 
             // ── 看图面板 ────────────────────────────────────────
@@ -1529,10 +1770,10 @@ namespace WhaleLauncher.Views
                     + (VisionIsCustom() ? ",\"visionBaseUrl\":\"" + Api.Esc(visionUrl.Text.Trim()) + "\"" : "")
                     + (visionKey.Password.Length > 0 ? ",\"visionApiKey\":\"" + Api.Esc(visionKey.Password.Trim()) + "\"" : "")
                     + "}";
-                var res = await Api.Post(_sup.Url, "/api/settings", payload);
+                var res = await _sup.SaveConfigurationAsync("/api/settings", System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(payload));
                 if (!res.Ok)
                 {
-                    visionResult.Text = "保存失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+                    visionResult.Text = "保存失败：" + Api.Message(res);
                     return false;
                 }
                 if (visionKey.Password.Length > 0) visionKey.Password = "";
@@ -1548,10 +1789,10 @@ namespace WhaleLauncher.Views
             vcopy.Click += async (s, e) =>
             {
                 visionResult.Text = "正在从聊天复制…";
-                var res = await Api.Post(_sup.Url, "/api/settings", "{\"visionCopyFromChat\":true}");
+                var res = await _sup.SaveConfigurationAsync("/api/settings", new { visionCopyFromChat = true });
                 if (!res.Ok)
                 {
-                    visionResult.Text = "复制失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+                    visionResult.Text = "复制失败：" + Api.Message(res);
                     return;
                 }
                 _lastLoad = DateTime.MinValue;
@@ -1564,7 +1805,7 @@ namespace WhaleLauncher.Views
                 visionResult.Text = "正在测…";
                 if (!await SaveVisionAsync("")) return;      // 先落盘，测的就是刚才填的模型/Key
                 var res = await Api.Post(_sup.Url, "/api/vision/test", "{}");
-                visionResult.Text = res.Ok ? "看图通了，它说：" + res.Str("sample") : "没通：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+                visionResult.Text = res.Ok ? "看图通了，它说：" + res.Str("sample") : "没通：" + Api.Message(res);
             };
 
             // ── 语音面板（原来单独一页，并到模型卡里）──────────
@@ -1593,10 +1834,10 @@ namespace WhaleLauncher.Views
                 // SelectedItem 指向新对象就匹配不上 → 显示成空白（换模型服务后就这样）。
                 var list = new List<ProviderItem>();
                 foreach (var kv in provs)
-                    list.Add(new ProviderItem { Key = kv.Key, Label = GetStr(kv.Value, "label") + "（" + kv.Key + "）" });
+                    list.Add(new ProviderItem { Key = kv.Key, Label = JsonRead.Str(kv.Value, "label") + "（" + kv.Key + "）" });
                 var keepKey = (cmb.SelectedItem as ProviderItem)?.Key;
                 cmb.ItemsSource = list;
-                var cur = GetStr(set, "provider");
+                var cur = JsonRead.Str(set, "provider");
                 // 以服务端值为准；万一认不出（服务刚重启、列表还没刷新）就退回上一次选中的，
                 // 再不行取第一项。以前焦点在下拉里时干脆不恢复，列表一重建就空白。
                 var picked = list.FirstOrDefault(x => x.Key == cur)
@@ -1604,13 +1845,13 @@ namespace WhaleLauncher.Views
                     ?? list.FirstOrDefault();
                 cmb.SelectedItem = picked;
                 FillChatOptions(picked != null && provs.TryGetValue(picked.Key, out var pv) ? pv : default);
-                if (!baseUrl.IsKeyboardFocusWithin) baseUrl.Text = GetStr(set, "baseUrl");
-                if (!model.IsKeyboardFocusWithin) model.Text = GetStr(set, "model");
+                if (!baseUrl.IsKeyboardFocusWithin) baseUrl.Text = JsonRead.Str(set, "baseUrl");
+                if (!model.IsKeyboardFocusWithin) model.Text = JsonRead.Str(set, "model");
                 RebuildVisionProviders();   // 自动项是否出现取决于聊天模型能不能识图
                 var vis = set.ValueKind == JsonValueKind.Object && set.TryGetProperty("vision", out var vv) ? vv : default;
-                var vmodel = GetStr(vis, "model");
+                var vmodel = JsonRead.Str(vis, "model");
                 var manual = vis.ValueKind == JsonValueKind.Object && vis.TryGetProperty("manual", out var mf) && mf.ValueKind == JsonValueKind.True;
-                var vprov = GetStr(vis, "provider");
+                var vprov = JsonRead.Str(vis, "provider");
                 if (!visionProvider.IsKeyboardFocusWithin && !visionModel.IsKeyboardFocusWithin)
                 {
                     if (manual && vmodel.Length > 0)
@@ -1622,7 +1863,7 @@ namespace WhaleLauncher.Views
                         var hit = visionProviders.FirstOrDefault(x => x.Key == vprov);
                         if (hit == null) hit = visionProviders.FirstOrDefault(x => x.Key == cur);   // 认不出就用聊天服务商，别把手动模型弄丢
                         visionProvider.SelectedItem = hit ?? visionProviders.FirstOrDefault();
-                        if (!visionUrl.IsKeyboardFocusWithin) visionUrl.Text = GetStr(vis, "baseUrl");
+                        if (!visionUrl.IsKeyboardFocusWithin) visionUrl.Text = JsonRead.Str(vis, "baseUrl");
                         if (hit != null && hit.Key == "custom")
                         {
                             // 自定义：模型名可能不在任何预设里，直接放进可编辑下拉的文本框
@@ -1658,7 +1899,7 @@ namespace WhaleLauncher.Views
             _loadVision = (set) =>
             {
                 var v = set.ValueKind == JsonValueKind.Object && set.TryGetProperty("vision", out var vv) ? vv : default;
-                var curModel = GetStr(v, "model");
+                var curModel = JsonRead.Str(v, "model");
                 var manual = v.ValueKind == JsonValueKind.Object && v.TryGetProperty("manual", out var mf) && mf.ValueKind == JsonValueKind.True;
                 if (v.ValueKind == JsonValueKind.Object)
                 {
@@ -1667,7 +1908,7 @@ namespace WhaleLauncher.Views
                     var follow = manual ? "" : "（自动）";
                     visionHint.Text = (configured ? "已配置：" + masked : "没配置。选「自动跟随」就用聊天那把 Key；本机/内网看图服务可以留空。")
                         + (curModel.Length > 0 ? " 当前看图模型：" + curModel + follow : "");
-                    var ep = GetStr(v, "baseUrl");
+                    var ep = JsonRead.Str(v, "baseUrl");
                     var custom = v.ValueKind == JsonValueKind.Object && v.TryGetProperty("custom", out var cst) && cst.ValueKind == JsonValueKind.True;
                     visionEndpoint.Text = ep.Length > 0
                         ? "接口地址：" + ep + (custom ? "（自定义）" : manual ? "（手动指定）" : "（自动跟随聊天模型）")
@@ -1693,7 +1934,7 @@ namespace WhaleLauncher.Views
             }
             KernelHint.Text = _sup.NodeRunning
                 ? "改完立即写回 config.json（密钥留空表示不改）"
-                : "已读取本地配置，启动内核后可修改；外观设置仍可直接调整。";
+                : "可保存到本地，启动后生效。";
             if (!_configLoaded) await LoadConfigAsync();      // 还没回填过，补一次
         }
 
@@ -1733,9 +1974,6 @@ namespace WhaleLauncher.Views
                 }
                 _configLoaded = true;
                 _loadedOnline = _sup.NodeRunning;
-                // 外观是本地设置，内核停止时仍然可以编辑。
-                for (var i = 0; i < SectionsHost.Children.Count - 1; i++)
-                    ConfigurationControls.SetReadOnly(SectionsHost.Children[i], !_loadedOnline);
             }
             finally
             {
@@ -1753,10 +1991,6 @@ namespace WhaleLauncher.Views
             }
             return cur;
         }
-
-        private static string GetStr(JsonElement e, string name)
-            => e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String
-                ? (v.GetString() ?? "") : "";
     }
 }
 

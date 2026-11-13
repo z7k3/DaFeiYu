@@ -18,6 +18,8 @@
  */
 
 const persona = require('../../persona');
+const sessionState = require('../../core/sessionState');
+const addressing = require('../../core/addressing');
 
 /** 授权条目的到期时间：兼容旧版「纯数字」存法和新版 { expires, name } 对象 */
 function consentExpires(entry) {
@@ -44,10 +46,27 @@ function pruneConsent(consent, nowMs) {
  * @returns {object|null} decision
  */
 function dismissReply(bot, { msg, text, isGroup, isMaster, atMe, state, nowMs, key }) {
-  const ask = String(text || '').trim();
+  const askRaw = String(text || '').trim();
+  // 桥接已经确认「这条 @ 的是她」时，文本里那个 @ 名字是什么都不影响判断。
+  // 以前直接拿原文本做 ^闭嘴$ 匹配：桥接刚换了昵称、配置还没刷新时，
+  // `@新昵称 闭嘴` 会残留 @ 前缀，被当成普通搭话，怎么喊都不闭嘴。
+  const ask = (atMe || (msg && msg.replyToBot))
+    ? askRaw.replace(/^(?:[@＠][^\s\u2005]+[\s\u2005]*)+/, '').trim()
+    : askRaw;
+  // 叫她什么名字只认项目里的统一入口：人设名 / 别名 / 桥接上报的账号昵称、备注。
+  // 不在这里另起一套名字来源，否则退场、@ 判定、提示词三处会各认各的。
+  const selfNames = addressing.herNames(bot, msg)
+    .map((name) => String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+  const nameAlt = selfNames.join('|') || '鲸鲸|小鲸|肥鱼';
 
   // 「没你事儿了，走吧」→ 回一句就退场，之后不再接
   const dismissClean = ask.replace(/^[\s，,。.!！~～、]+|[\s，,。.!！~～、…]+$/g, '');
+  // 「不要叫机器人闭嘴」「别让她走」是在制止别人，不是在赶她走。
+  if (/(不要|别|不用|不许).{0,10}(让|叫|把|喊|请)?[^。！？\n]{0,10}(机器人|她|它|鲸鲸|小鲸|肥鱼)[^。！？\n]{0,10}(滚|闭嘴|安静|走开|消失|退下)/.test(dismissClean)) {
+    return null;
+  }
   const dismissHit =
     /(没你事儿|没你事了|没你事|这里没你事了|不关你事|不用你了|没问你|别接话)/.test(dismissClean) ||
     /(退下吧|一边去|忙你的去吧|去忙你的吧|你先去忙)/.test(dismissClean) ||
@@ -57,12 +76,11 @@ function dismissReply(bot, { msg, text, isGroup, isMaster, atMe, state, nowMs, k
     // 第三人称：群里说「让她滚」「叫它闭嘴」「把机器人赶走」——也是在赶她走。
     // 以前只认「你滚/滚」这种直接命令，「让她滚」完全识别不到，于是不静默、还接着说话。
     // 只用「她 / 它 / 鲸鲸」这类明确指向她的词，别把「让他滚」（指别的男生）也当成赶她。
-    /(让|叫|把|喊|请)(?:她|它|这货|这家伙|这玩意|这玩意儿|机器人|鲸鲸|小鲸|肥鱼|鲸)(?:赶紧|快点|马上)?(?:滚|滚蛋|滚开|滚出去|爬|走开|消失|退下|下去|闭嘴|安静|别说话|少说话|别接话|别插嘴|别吵|歇着)/.test(dismissClean);
+    new RegExp(`(让|叫|把|喊|请)(?:她|它|这货|这家伙|这玩意|这玩意儿|机器人|${nameAlt}|鲸)(?:赶紧|快点|马上)?(?:滚|滚蛋|滚开|滚出去|爬|走开|消失|退下|下去|闭嘴|安静|别说话|少说话|别接话|别插嘴|别吵|歇着)`).test(dismissClean);
   // 群友也能让她闭嘴（不用 @）：只要是在赶她走，就认。
-  const dismissByGroup = isGroup && /(让她|叫她|让它|叫它|机器人|鲸鲸|小鲸|肥鱼)/.test(dismissClean);
+  const dismissByGroup = isGroup && new RegExp(`(让她|叫她|让它|叫它|机器人|${nameAlt})`).test(dismissClean);
   if (dismissHit && (isMaster || atMe || msg.replyToBot || !isGroup || dismissByGroup)) {
-    state.engagedUntil = 0;
-    state.engagedBy = '';
+    sessionState.clearEngagement(state);
     state.dismissedAt = nowMs;
     state.silentUntil = nowMs + Math.max(1, Number(bot.config.group.silentMinutes) || 10) * 60000;
     return {

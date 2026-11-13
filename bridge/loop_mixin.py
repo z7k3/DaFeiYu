@@ -25,10 +25,12 @@ class LoopMixin:
         def save_state(st):
             try:
                 G.os.makedirs(G.os.path.dirname(state_file), exist_ok=True)
-                with open(state_file, 'w', encoding='utf-8') as f:
+                tmp = state_file + '.tmp'
+                with open(tmp, 'w', encoding='utf-8') as f:
                     G.json.dump(st, f, ensure_ascii=False)
-            except Exception:
-                pass
+                G.os.replace(tmp, state_file)
+            except Exception as e:
+                G.log_warn('主动搭话状态保存失败：', repr(e))
         while True:
             G.time.sleep(60)
             if not G.CARE_ENABLED:
@@ -49,7 +51,9 @@ class LoopMixin:
             try:
                 r = G.LOCAL_HTTP.get(base + '/api/care/due', params={'last': int(last_ts * 1000), 'sentToday': sent, 'active': ','.join(active)}, timeout=15)
                 due = r.json() or {}
-            except Exception:
+            except Exception as e:
+                G.log_throttled('care-due-fail', '主动搭话检查失败：type=%s detail=%s'
+                                % (type(e).__name__, repr(e)[:160]))
                 continue
             if not due.get('due'):
                 reason = str(due.get('reason') or 'unknown')
@@ -58,8 +62,16 @@ class LoopMixin:
                 continue
             target = due.get('target') or {}
             u = str(target.get('wxid') or '').strip()
-            name = str(target.get('name') or u).strip()
+            name = str(target.get('name') or '').strip()
             if not u:
+                continue
+            if self.is_self_chat(u):
+                G.log_throttled('care-self-target', '主动搭话没发：目标是机器人自己的微信账号，请绑定接收消息的主人账号', ttl=3600)
+                continue
+            name = self.ui_chat_name(u, name)
+            if not name:
+                # 读不到昵称就别去搜 —— 用 wxid 搜会话是纯粹的十几秒空转。
+                G.log_throttled('care-no-name-' + u[:18], '主动搭话没发：%s 在本地数据库里没有昵称/备注，微信搜不到这个会话（先给 TA 加个备注再试）' % G.safe_id(u), ttl=3600)
                 continue
             try:
                 r2 = G.LOCAL_HTTP.get(base + '/api/care', params={'chat': u}, timeout=40)
@@ -69,7 +81,7 @@ class LoopMixin:
                 continue
             if not text:
                 continue
-            G.log('主动搭话 →', name, text[:30])
+            G.log('主动搭话 →', G.safe_name(name), G.safe_text(text))
             try:
                 ok = self.send_text(text, name, u)
                 save_state({'lastTs': G.time.time(), 'day': today, 'count': sent + (0 if ok is False else 1)})
@@ -101,23 +113,27 @@ class LoopMixin:
                 except Exception as e:
                     G.log('发晚安失败：', repr(e))
 
-    def ensure_uia_ready(self, force=False):
+    def ensure_uia_ready(self, force=False, wake=True):
         """挑「PID 里真有 Weixin.dll」的窗口并按真判据物化 UIA。
 
         修的是这三件事：过期 hwnd 被当成微信主窗（日志里那个不存在的 PID）、
         第三方库只看根窗口类名就判成功、以及版本表没有 4.2.0.9 时候选 RVA 试错。
         结果缓存 30 秒，避免每次发送都扫一遍。
+
+        注意：指定了账号但窗口还没确认时**不能直接返回**。以前这里返回
+        「等待确认」，而确认窗口又依赖 UIA 会话树，最后两边互相等，控件树
+        永远是空壳。现在先让 UIA 物化，窗口归属仍由 pick_account_window 决定，
+        没确认前绝不把挑中的窗口写进 ACCOUNT。`wake=False` 供心跳安静待命。
         """
         if G.uia_boot is None:
             return self._UIA_READY
         prefer = int(self.ACCOUNT.get('hwnd') or 0) if self.ACCOUNT.get('verified') else 0
-        if getattr(self, 'acct', '') and not prefer:
-            return {'ok': False, 'msg': '等待确认已选微信账号的窗口'}
         now = G.time.time()
         if not force and now - self._UIA_READY['ts'] < 30:
             return self._UIA_READY
         try:
-            res = G.uia_boot.ensure(prefer_hwnd=prefer, log=G.log, strict=bool(prefer))
+            res = G.uia_boot.ensure(prefer_hwnd=prefer, log=G.log,
+                                    strict=bool(prefer), wake=wake)
         except Exception as e:
             res = {'ok': False, 'reason': 'exception: %r' % (e,)}
         try:
@@ -209,7 +225,7 @@ class LoopMixin:
                     wname = win.Name if win is not None else None
                 except Exception:
                     wcls, wname = (None, None)
-                G.log('发送通道预热完成（UIA 可用，主窗类名=%r 名称=%r）' % (wcls, wname))
+                G.log('发送通道预热完成（UIA 可用，主窗类名=%r 名称=%s）' % (wcls, G.safe_name(wname)))
                 try:
                     if self.pick_account_window(quiet=True):
                         if self.ACCOUNT.get('hwnd'):
@@ -279,7 +295,7 @@ class LoopMixin:
         """每 20 秒告诉服务端「桥接还活着、UIA/ffmpeg 状态如何」。
 
         没有心跳时，服务端只知道「它收到了消息」，不知道回复到底有没有能力发出去；
-        网页上也就没法提示「桥接离线」或「UIA 不可用」。
+        启动器上也就没法提示「桥接离线」或「UIA 不可用」。
         """
         base = self.bot_url.rsplit('/webhook', 1)[0]
         misses = 0
@@ -307,7 +323,8 @@ class LoopMixin:
                             with self.gui_lock:
                                 _u = self.gui._get_uia() if self.gui is not None else None
                             if _u is None:
-                                _ready = self.ensure_uia_ready(force=True)
+                                # 心跳只检查能力，不替用户把微信窗口弹出来。
+                                _ready = self.ensure_uia_ready(force=True, wake=False)
                                 if _ready.get('ok'):
                                     with self.gui_lock:
                                         self.gui = self.new_window_driver()
@@ -342,14 +359,26 @@ class LoopMixin:
                     hb_misses = 0
             except Exception as e:
                 hb_misses += 1
+                status = getattr(e, 'response', None)
+                status = getattr(status, 'status_code', None)
+                if status in (401, 403):
+                    hint = '桥接 token 与内核不一致，请核对 gateway.wechat.inboundToken'
+                elif '10061' in repr(e) or 'refused' in repr(e).lower():
+                    hint = '连不上内核（127.0.0.1 没有程序监听），请先在启动器点「启动」'
+                else:
+                    hint = '内核可能未启动、超时或返回异常'
                 if hb_misses in (1, 3, 10) or hb_misses % 60 == 0:
-                    G.log_warn('心跳上报失败（连续 %d 次）：%r' % (hb_misses, e))
+                    G.log_warn(
+                        '心跳上报失败（连续 %d 次，HTTP %s）：%s | type=%s detail=%s'
+                        % (hb_misses, status if status is not None else '-', hint,
+                           type(e).__name__, repr(e)[:160])
+                    )
             G.time.sleep(20)
 
     def config_watch(self):
-        """盯 config.json 的修改时间：调试台一保存就热更新，不用重启桥接。
+        """盯 config.json 的修改时间：启动器一保存就热更新，不用重启桥接。
 
-        以前这些开关只在启动时读一次，用户在 /debug 里关掉「主动搭话」、
+        以前这些开关只在启动时读一次，用户在启动器里关掉「主动搭话」、
         改「忽略名单」、「群聊开关」都没反应，只能重启桥接 —— 也就是
         「调了没用，还是默认」。
         """
@@ -368,14 +397,20 @@ class LoopMixin:
                 G.log('桥接连接设置变了，重新连接微信与内核…')
                 G.os._exit(7)
             if G.reload_config():
-                G.log('配置已热更新（调试台改完即时生效，不用重启桥接）')
+                # 人设名/别名也可能刚被改过；同步给群聊 @ 判定，并清掉 60 秒缓存，
+                # 否则用户改完称呼还要等下一轮刷新才生效。
+                self.cfg = current
+                persona = (current.get('persona') or {})
+                self.aliases = list(persona.get('aliases') or []) + [persona.get('name') or '鲸鲸']
+                self._mention_cache = None
+                G.log('配置已热更新（启动器改完即时生效，不用重启桥接）')
 
     def contacts_sync_once(self):
         """把「联系人 + 群」清单推给服务端一次（H1 接线；后台线程跑完即退）。
 
         bridge/contacts_sync.py 只负责从 DB 整理数据；推送（POST
         /api/wechat/contacts/sync）在这里做。失败只记日志：清单丢一轮只影响
-        网页选择器的候选，绝不影响收发消息。
+        启动器选择器的候选，绝不影响收发消息。
         """
         try:
             try:
@@ -389,7 +424,7 @@ class LoopMixin:
             base = self.bot_url.rsplit('/webhook', 1)[0]
             r = G.LOCAL_HTTP.post(base + '/api/wechat/contacts/sync', json=data, headers=headers, timeout=15)
             code = getattr(r, 'status_code', 0)
-            G.log('联系人同步：%s（%d 条%s）' % ('成功' if code == 200 else '失败 HTTP %s' % code, len(data.get('items') or []), '，账号 ' + str(data.get('account') or '') if data.get('account') else ''))
+            G.log('联系人同步：%s（%d 条%s）' % ('成功' if code == 200 else '失败 HTTP %s' % code, len(data.get('items') or []), '，账号 ' + G.safe_id(data.get('account')) if data.get('account') else ''))
         except Exception as e:
             G.log('联系人同步失败（不影响收发消息）：', repr(e))
 

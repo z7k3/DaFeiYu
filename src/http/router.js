@@ -2,6 +2,8 @@
 
 const { json } = require('./util');
 const { checkRequest, applySecurityHeaders } = require('./security');
+const { describeError } = require('../infra/errors');
+const { redactSecrets } = require('../infra/redact');
 
 /**
  * 极简声明式路由：精确路径 + 正则模式，无依赖。
@@ -75,10 +77,13 @@ class Router {
       const status = err.statusCode || 500;
       // 关掉的表情包接口 / 被拒绝的测试是预期行为，不该刷 ERROR
       if (!(pathname.startsWith('/api/stickers') && status < 500)) {
-        runtime.logger.error(`${method} ${pathname} 出错：` + (err && err.stack ? err.stack : err));
+        runtime.logger.error(`${method} ${pathname} 出错：` + describeError(err)
+          + '\n' + (err && err.stack ? err.stack : ''));
       }
       if (status === 500) return json(res, 500, { ok: false, error: '服务器打了个结，请看控制台日志' });
-      return json(res, status, { ok: false, error: err.message });
+      // 截断前先脱敏，避免密钥截成片段后无法被识别；仅返回首行，不回显堆栈。
+      const message = redactSecrets((err && err.message) || '请求失败').split(/[\r\n]/)[0].slice(0, 200) || '请求失败';
+      return json(res, status, { ok: false, error: message });
     }
   }
 }

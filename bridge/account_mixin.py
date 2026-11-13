@@ -1,6 +1,31 @@
 # -*- coding: utf-8 -*-
 """Bridge runtime mixin: AccountMixin."""
+import re
+
 import engine as G
+
+# 微信内部 id / 群 id：会话列表和搜索框都不认这种写法（搜索框只认昵称、备注、微信号），
+# 拿它当关键词只会白跑十几秒再失败 —— 2026-11-08 21:35 的卡死就是这么来的。
+_RAW_CHAT_ID_RE = re.compile(r'^(?:wxid_[A-Za-z0-9_-]+|[A-Za-z0-9_-]+@chatroom)$', re.I)
+# 账号目录名比真 wxid 多一段 4 位哈希（wxid_xxx_c248），两者指同一个账号。
+_ACCOUNT_HASH_RE = re.compile(r'_[0-9a-f]{4}$', re.I)
+
+
+def is_raw_chat_id(text):
+    """这串是不是微信内部 id（wxid_xxx / xxx@chatroom），而不是能搜索的昵称。"""
+    return bool(_RAW_CHAT_ID_RE.match(str(text or '').strip()))
+
+
+def same_account(a, b):
+    """两种写法是不是同一个账号：账号目录名带哈希，真 wxid 不带。"""
+    sa, sb = str(a or '').strip(), str(b or '').strip()
+    if not sa or not sb:
+        return False
+    if sa.lower() == sb.lower():
+        return True
+    # 只剥账号目录那段 4 位十六进制哈希；wechat_db.account_wxid 用的是 \w{4}，
+    # 会把以 _test / _abcd 结尾的真 wxid 也截掉，这里不能照抄。
+    return _ACCOUNT_HASH_RE.sub('', sa).lower() == _ACCOUNT_HASH_RE.sub('', sb).lower()
 
 
 class AccountMixin:
@@ -35,6 +60,36 @@ class AccountMixin:
                 G.write_accounts_cache(self.db.db_dir or self.db_dir, self.db.account, self._self_nick)
         except Exception as e:
             G.log('账号缓存检查失败（不影响收发）：', repr(e))
+
+    def is_self_chat(self, username):
+        """这个会话是不是「机器人自己」。微信里没有「和自己聊天」这一项，
+        搜自己的 wxid 永远搜不到，所以只能落到文件传输助手。"""
+        me = str(getattr(self, 'me', '') or getattr(self, 'self_wxid', '') or '').strip()
+        return bool(me) and same_account(username, me)
+
+    def ui_chat_name(self, username, shown=''):
+        """给 UI 用的会话名：昵称 / 备注优先，绝不把 wxid / 群 id 丢给会话列表和搜索框。
+
+        `display_name` 读不到昵称时会退回 username（也就是 wxid），那条路只适合
+        数据库查询，不能拿去 open_chat —— 微信不认，搜一次十几秒，连试几次
+        整个发送锁就被占住，表现就是「桥接卡死」。这里读不到就返回空，
+        让调用方放弃这次发送。
+        """
+        uname = str(username or '').strip()
+        shown = str(shown or '').strip()
+        if uname.lower() == 'filehelper' or shown.lower() == 'filehelper':
+            return '文件传输助手'
+        if shown and not is_raw_chat_id(shown):
+            return shown
+        if not uname:
+            return ''
+        try:
+            nm = str(self.display_name(uname) or '').strip()
+        except Exception:
+            nm = ''
+        if nm and nm != uname and not is_raw_chat_id(nm):
+            return nm
+        return ''
 
     def display_name(self, username):
         if username in self.name_cache:
@@ -93,17 +148,26 @@ class AccountMixin:
                 partial = True
         if not out:
             out.append(shown or username)
-        out = [x for x in dict.fromkeys(out) if x]
+        # wxid / 群 id 在微信里搜不到；装进候选里只会让 open_chat 白搜一轮。
+        out = [x for x in dict.fromkeys(out) if x and not is_raw_chat_id(x)]
         if not partial:
             self.alias_cache[key] = out
         return out
 
-    def _account_locked(self, fn):
-        """把账号窗口绑定函数整体罩进 account_lock（见上面注释）。"""
+    @staticmethod
+    def _account_locked(fn):
+        """把账号窗口绑定函数整体罩进 account_lock（见上面注释）。
 
-        def _wrap(*args, **kwargs):
-            with self.account_lock:
-                return fn(*args, **kwargs)
+        包装器必须从**调用现场**取实例（inst），不能闭包捕获 self：
+        这里是在类体里调用的，那时根本没有实例；以前写成
+        `_account_locked(None, ...)` + 闭包 self，结果每次调用都在
+        `with self.account_lock` 抛 AttributeError('NoneType' object has no attribute 'account_lock')，
+        择窗永远失败、桥接一直卡在「等待微信主窗可用」。
+        """
+
+        def _wrap(inst, *args, **kwargs):
+            with inst.account_lock:
+                return fn(inst, *args, **kwargs)
         _wrap.__name__ = fn.__name__
         return _wrap
 
@@ -213,8 +277,8 @@ class AccountMixin:
             return ('已选账号 %s 没登录；当前微信登录的是 %s。请登录这个号，'
                     '或在「微信桥接 → 账号」里改用当前登录的号' % (
                         self._account_label(selected), '、'.join(others)))
-        return '已选账号 %s 没登录，也没扫到其它已登录的微信账号（请先在微信里登录）' % (
-            self._account_label(selected))
+        return '未能确认已选账号 %s 的登录窗口。请确认该账号已登录并打开主窗口（%s）' % (
+            self._account_label(selected), fallback)
 
 
     def _probe_wechat_windows(self):
@@ -231,6 +295,14 @@ class AccountMixin:
             hwnds = list(probe._wechat_hwnds() or ())
         except Exception:
             hwnds = []
+        # 朋友圈页面可能把主窗藏起来（或只剩 mmui::SNSWindow），
+        # _wechat_hwnds 只看可见主窗时会一个都扫不到。只有在一个候选都没有时
+        # 才补隐藏主窗，避免把另一个号的隐藏窗混进来造成“多候选无法确认”。
+        if not hwnds:
+            fallback = self.find_weixin_hwnd()
+            if fallback:
+                hwnds.append(fallback)
+                G.log('账号窗口：补入后台/隐藏主窗 hwnd=%s（朋友圈页面常见）' % fallback)
         pinned = int(self.ACCOUNT.get('hwnd') or 0) if self.ACCOUNT.get('verified') else 0
         if pinned:
             try:
@@ -245,13 +317,10 @@ class AccountMixin:
         unknown = []
         matched = []
         ownership = {}
-        for h in dict.fromkeys(map(int, hwnds)):
+        for h, _cpid in G.uia_boot.account_window_candidates(win32gui, win32process, hwnds):
             if pinned and h != pinned:
                 continue
-            if not G.uia_boot.is_wechat_account_window(win32gui, h):
-                continue
             try:
-                _cpid = int(win32process.GetWindowThreadProcessId(h)[1] or 0)
                 if not _cpid or not probe._weixin_dll_module(_cpid):
                     continue
             except Exception:
@@ -267,11 +336,12 @@ class AccountMixin:
         if matched:
             return probe, [], matched
         for h in unknown:
-            if not selected or h == pinned:
-                try:
-                    probe._hot_activate_accessibility(h)
-                except Exception:
-                    pass
+            # 文件句柄证据缺失时，先物化这个候选的控件树，再核对会话。
+            # 等账号先确认才物化会让两条识别路径互相等待；已知错号已在上面排除。
+            try:
+                probe._hot_activate_accessibility(h)
+            except Exception as exc:
+                G.log('账号窗口：候选 UIA 物化失败 type=%s hwnd=%s' % (type(exc).__name__, h))
             c = None
             rows = []
             for _try in range(2):
@@ -364,7 +434,7 @@ class AccountMixin:
         return True
 
     def pick_account_window(self, force=False, quiet=False):
-        """确认哪个微信窗口是 config/网页指定的账号，并钉死它。"""
+        """确认哪个微信窗口是 config/启动器指定的账号，并钉死它。"""
         if self.ACCOUNT['verified'] and (not force):
             return True
         if G.WINDOW_HWND:
@@ -373,7 +443,9 @@ class AccountMixin:
                 import win32process
                 if win32gui.IsWindow(G.WINDOW_HWND):
                     pid = win32process.GetWindowThreadProcessId(G.WINDOW_HWND)[1]
-                    if not getattr(self, 'acct', '') or self._window_account_matches(pid) is True:
+                    # 自动选号时也要证明窗口确实持有当前账号的数据库；
+                    # 否则库是 A 号、windowHwnd 指向 B 号会把发送串到 B。
+                    if self._window_account_matches(pid) is True:
                         self.ACCOUNT.update(hwnd=G.WINDOW_HWND, pid=pid, verified=True, label='hwnd=%s（配置）' % G.WINDOW_HWND, why='config.wechat.windowHwnd')
                         self.rebind_uia(G.WINDOW_HWND)
                         if not quiet:
@@ -383,21 +455,26 @@ class AccountMixin:
                 pass
         probe, cands, matched = self._probe_wechat_windows()
         if matched:
-            chosen = matched[0]
+            # 微信 4.2 会在同一个进程里再挂一个明显更小的隐藏 Qt 窗；先按面积
+            # 去掉辅助窗，避免把「一大一小」误判成两个账号候选。跨进程不合并。
+            try:
+                prefer = getattr(G.uia_boot, 'prefer_main_windows', None)
+                if callable(prefer):
+                    narrowed = prefer(matched)
+                    if narrowed and narrowed != matched:
+                        G.log('账号窗口：同进程辅助窗已过滤 %d → %d' % (len(matched), len(narrowed)))
+                        matched = narrowed
+            except Exception as e:
+                G.log('账号窗口：辅助窗过滤失败：', repr(e))
+            h, pid = matched[0]
             if len(matched) > 1:
-                chosen, evidence = G.uia_boot.resolve_account_windows(matched)
-                confirmed = chosen is not None and self._window_account_matches(chosen[1]) is True
-                code = 'main_window_verified' if confirmed else (
-                    'ownership_changed' if chosen is not None else 'main_window_ambiguous')
-                status = 'confirmed' if confirmed else 'blocked'
-                detail = {'candidates': len(matched), 'chosen': chosen, 'windows': evidence}
-                G.log_throttled('account-window-' + code,
-                                '账号窗口 type=window_binding code=%s status=%s detail=%r' % (code, status, detail),
-                                ttl=60, emit=G.log if confirmed else G.log_warn)
-                if not confirmed:
-                    self.ACCOUNT.update(verified=False, hwnd=0, pid=0, why='所选账号有多个候选窗口，未能确认聊天主窗')
+                resolved, evidence = G.uia_boot.resolve_account_windows(matched)
+                G.log('账号窗口：同账号候选 %d，择窗=%r，证据=%r' % (len(matched), resolved, evidence))
+                if resolved is not None:
+                    h, pid = resolved
+                else:
+                    self.ACCOUNT.update(verified=False, hwnd=0, why='所选账号有多个候选窗口，未能确认聊天主窗')
                     return False
-            h, pid = chosen
             self.ACCOUNT.update(hwnd=h, pid=pid, verified=True, label='hwnd=%s' % h, why='微信进程持有该账号数据库')
             self.rebind_uia(h)
             G.log('账号窗口：按数据库归属锁定 hwnd=%s' % h)
@@ -419,9 +496,9 @@ class AccountMixin:
                 G.log('账号窗口：只有一个微信主窗（hwnd=%s），直接用它' % h)
             return True
         want = self._account_recent_names()
-        G.log('账号窗口：本机有 %d 个微信主窗，按账号 %s 的最近会话认窗口：%s' % (len(cands), self.db.account, ' / '.join(want[:6]) or '（空）'))
+        G.log('账号窗口：本机有 %d 个微信主窗，按账号 %s 的最近会话认窗口：%s' % (len(cands), G.safe_id(self.db.account), ' / '.join(G.safe_name(x) for x in want[:6]) or '（空）'))
         for h, _c, rows in cands:
-            G.log('   hwnd=%s 可见 %d 行：%s' % (h, len(rows), ' | '.join(rows[:6]) or '（读不到会话列表）'))
+            G.log('   hwnd=%s 可见 %d 行：%s' % (h, len(rows), ' | '.join(G.safe_name(x) for x in rows[:6]) or '（读不到会话列表）'))
         score_fn = getattr(probe, '_row_score', None)
         scored = []
         for h, c, rows in cands:
@@ -456,7 +533,7 @@ class AccountMixin:
             best_hits = scored[0][1]
             tied = [x for x in scored if x[1] == best_hits]
             if best_hits < 2 or len(tied) > 1:
-                self.ACCOUNT.update(verified=False, hwnd=0, why=self._explain_unverified('没有一个窗口对得上账号 %s 的最近会话' % self.db.account))
+                self.ACCOUNT.update(verified=False, hwnd=0, why=self._explain_unverified('没有一个窗口对得上账号 %s 的最近会话' % G.safe_id(self.db.account)))
                 return False
         self.ACCOUNT.update(hwnd=h, verified=True, label='hwnd=%s' % h, why='命中最近会话 %d 条' % nhit)
         m = self._compat_mod()
@@ -467,6 +544,9 @@ class AccountMixin:
                 G.log('账号窗口：pin_window 失败：', repr(e))
         G.log('账号窗口：锁定 hwnd=%s（%d 个窗口里对上 %d 条最近会话%s）' % (h, len(scored), nhit, '，最新一条也在' if newest_ok else ''))
         return True
+
+    # 生产环境给择窗/rebind 全程加 account_lock；测试单函数抽取仍用原函数。
+    pick_account_window = _account_locked(pick_account_window)
 
     def ensure_account_window(self, engine=None):
         """发送前确认「锁定的微信窗口」还活着；微信重启/换号后自动重认。
@@ -525,7 +605,9 @@ class AccountMixin:
         if not wanted:
             return ''
         current = str(getattr(self.db, 'account', '') or '')
-        if wanted == current or G.account_wxid(wanted) == G.account_wxid(current) or (current and current.lower().startswith(wanted.lower())):
+        # 只认完全相同或「目录名去掉 4 位哈希 = 真 wxid」；不能用前缀，
+        # 否则 wxid_ab 会把 wxid_abc 当成同一个号放行。
+        if wanted == current or (wanted and current and G.account_wxid(wanted) == G.account_wxid(current)):
             return current
         if not c['dir']:
             try:
@@ -540,13 +622,13 @@ class AccountMixin:
         current = str(getattr(self.db, 'account', '') or '')
         if pinned and pinned != current:
             self.ACCOUNT['blockedAt'] = G.time.time()
-            G.log_throttled('account-pin-mismatch', '⚠️ 不发送（%s）：config 里选的账号是 %s，但桥接现在连的是 %s。切号后桥接没重启成功，先从别的号发就露馅了 —— 重启桥接后再发。' % (where, pinned, current), ttl=60)
+            G.log_throttled('account-pin-mismatch', '⚠️ 不发送（%s）：config 里选的账号是 %s，但桥接现在连的是 %s。切号后桥接没重启成功，先从别的号发就露馅了 —— 重启桥接后再发。' % (where, G.safe_id(pinned), G.safe_id(current)), ttl=60)
             return False
         if self.ensure_account_window(engine):
             return True
         if G.ACCOUNT_GUARD or getattr(self, 'acct', ''):
             self.ACCOUNT['blockedAt'] = G.time.time()
-            G.log('⚠️ 不发送（%s）：没能确认哪个微信窗口是账号 %s（%s）；现在可能同时登着别的号，乱发会从别人的号发出去。' % (where, self.db.account, self.ACCOUNT['why'] or '未知'))
+            G.log('⚠️ 不发送（%s）：没能确认哪个微信窗口是账号 %s（%s）；现在可能同时登着别的号，乱发会从别人的号发出去。' % (where, G.safe_id(self.db.account), self.ACCOUNT['why'] or '未知'))
             return False
         return True
 
@@ -571,12 +653,13 @@ class AccountMixin:
         """
         try:
             import win32gui
+            import win32process
             from wechatauto.uia_driver import WeChatUIA
             probe = WeChatUIA()
             hwnds = list(probe._wechat_hwnds() or ())
         except Exception:
             return None
-        return sum(G.uia_boot.is_wechat_account_window(win32gui, h) for h in set(map(int, hwnds)))
+        return len(G.uia_boot.account_window_candidates(win32gui, win32process, hwnds))
 
     def sticker_account_evidence_allowed(self):
         explicit_pin = bool(G.WINDOW_HWND and int(G.WINDOW_HWND) == int(self.ACCOUNT.get('hwnd') or 0))
@@ -584,3 +667,4 @@ class AccountMixin:
         if not allowed:
             G.log_throttled('sticker-account-ambiguous', '表情包跳过：当前微信窗口和账号信息不一致，或多个窗口无法区分。只登录一个号且数据库匹配时无需手选；多开时请在设置中选账号。', ttl=300)
         return allowed
+

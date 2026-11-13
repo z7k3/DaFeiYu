@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Text.Json;
@@ -11,7 +12,7 @@ Directory.CreateDirectory(Path.Combine(root, "runtime", "python"));
 Directory.CreateDirectory(Path.Combine(root, "data"));
 File.Copy(args[1],Path.Combine(root,"runtime","node.exe"));
 foreach(var file in Directory.GetFiles(Path.Combine(workspace,"artifacts","launcher-tests","fake"))) File.Copy(file,Path.Combine(root,"runtime","python",Path.GetFileName(file)));
-File.WriteAllText(Path.Combine(root,"server.js"), "const fs=require('fs'),http=require('http');const s=http.createServer((q,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify(q.url==='/healthz'?{ok:true,up:true,service:'whale-girl',pid:fs.existsSync('wrong-pid')?process.pid+1:process.pid}:{ok:true,gateways:[{platform:'douyin',bridge:{account_nick:'wrong'}},{platform:'wechat',bridge:{online:true,accountNick:'right'}}]}));});s.listen(0,'127.0.0.1',()=>fs.writeFileSync('data/server-port.txt',String(s.address().port)));process.stdin.on('data',b=>{if(String(b).includes('shutdown'))s.close(()=>process.exit(0));});");
+File.WriteAllText(Path.Combine(root,"server.js"), "const fs=require('fs'),http=require('http');const s=http.createServer((q,r)=>{r.setHeader('content-type','application/json');r.end(JSON.stringify(q.url==='/healthz'?{ok:true,up:true,service:'whale-girl',pid:fs.existsSync('wrong-pid')?process.pid+1:process.pid}:{ok:true,gateways:[{platform:'qq',bridge:{account_nick:'wrong'}},{platform:'wechat',bridge:{online:true,accountNick:'right'}}]}));});s.listen(0,'127.0.0.1',()=>fs.writeFileSync('data/server-port.txt',String(s.address().port)));process.stdin.on('data',b=>{if(String(b).includes('shutdown'))s.close(()=>process.exit(0));});");
 void Check(bool ok,string message) { if(!ok) throw new Exception(message); Console.WriteLine("PASS: "+message); }
 try {
  Check(Api.Detail(null)=="", "联系人摘要兼容空响应");
@@ -52,6 +53,15 @@ try {
  File.WriteAllText(Path.Combine(root,"bridge-test-count"),"0");File.WriteAllText(Path.Combine(root,"bridge-test-code"),"7");File.WriteAllText(Path.Combine(root,"bridge-test-always"),"1");
  sup.StartNode();Check(await sup.WaitForNodeAsync(),"连续故障场景内核就绪");sup.StartBridge();await Task.Delay(14000);
  Check(File.ReadAllText(Path.Combine(root,"bridge-test-count"))=="4" && !sup.BridgeRunning,"连续异常最多自动恢复三次，避免重启风暴");
+ // 启动器被强杀时窗口 Closed 不会执行，只能靠 Job 句柄关闭兜底。
+ using(var job = new ProcessJob())
+ using(var orphan = Process.Start(new ProcessStartInfo(Path.Combine(root,"runtime","node.exe"), "-e \"setInterval(()=>{},1000)\""){UseShellExecute=false,CreateNoWindow=true}))
+ {
+  Check(job.IsAvailable,"能创建带 KILL_ON_JOB_CLOSE 的进程 Job");
+  Check(job.Assign(orphan),"内核进程能加入启动器 Job");
+  job.Dispose();
+  Check(orphan.WaitForExit(5000),"Job 句柄关闭后内核进程被系统结束");
+ }
 } finally {
  var allowed=Path.GetFullPath(Path.Combine(workspace,".tools","temp"))+Path.DirectorySeparatorChar;
  if(!Path.GetFullPath(root).StartsWith(allowed,StringComparison.OrdinalIgnoreCase))throw new Exception("invalid cleanup target");

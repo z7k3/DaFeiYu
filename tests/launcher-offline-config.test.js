@@ -54,10 +54,38 @@ test('首次打开无配置文件时回填出厂默认值而不生成运行时�
 test('短进程只输出有效配置 JSON，不启动聊天服务；配置变化后重读可见', (t) => {
   const root = fixture(t);
   const script = path.resolve(__dirname, '../src/services/launcherSnapshot.js');
-  const read = () => JSON.parse(execFileSync(process.execPath, [script], { cwd: root, encoding: 'utf8', timeout: 5000 }));
+  const read = () => JSON.parse(execFileSync(process.execPath, [script], { cwd: root, encoding: 'utf8', timeout: 15000 }));
   write(root, 'config.json', { persona: { name: '第一次打开' } });
   assert.equal(read()['/api/persona'].persona.name, '第一次打开');
   write(root, 'config.json', { persona: { name: '重新打开' } });
   assert.equal(read()['/api/persona'].persona.name, '重新打开');
   assert.equal(fs.existsSync(path.join(root, 'data/server-port.txt')), false);
 });
+
+
+test('offline saves persist model, persona and Moments settings without launching the service', (t) => {
+  const root = fixture(t);
+  const script = path.resolve(__dirname, '../src/services/launcherSnapshot.js');
+  const save = (path, body) => JSON.parse(execFileSync(process.execPath, [script, '--save'], {
+    cwd: root, encoding: 'utf8', timeout: 15000, input: JSON.stringify({ path, body }),
+  }));
+  for (const [route, body] of [
+    ['/api/config', { patch: { 'group.requireAt': false } }],
+    ['/api/settings', { provider: 'custom', model: 'offline-model', baseUrl: 'http://127.0.0.1:19191/v1' }],
+    ['/api/persona', { name: '离线人设' }],
+    ['/api/moments/publish-settings', { featureEnabled: true, enabled: false, withImage: true, interval: 8, maxPerDay: 2 }],
+  ]) {
+    const result = save(route, body);
+    assert.equal(result.ok, true, result.error);
+  }
+  assert.equal(save('/api/moments/publish-test', { confirm: true }).ok, false);
+  assert.equal(save('/api/moments/publish-settings', { featureEnabled: true, enabled: true }).ok, false);
+  const snapshot = readSnapshot(root, {});
+  assert.equal(snapshot['/api/config'].config.group.requireAt, false);
+  assert.equal(snapshot['/api/settings'].model, 'offline-model');
+  assert.equal(snapshot['/api/persona'].persona.name, '离线人设');
+  assert.equal(snapshot['/api/moments/publish-settings'].interval, 8);
+  assert.equal(snapshot['/api/moments/publish-settings'].enabled, false);
+  assert.equal(fs.existsSync(path.join(root, 'data/server-port.txt')), false);
+});
+

@@ -183,15 +183,28 @@ const DEFAULT_CONFIG = {
   // **不要填街道门牌**——拼装时会按区截断，但一开始就别填。
   // autoDetect：自动探测本机所在地。优先 Windows 定位服务（不吃公网 IP，挂 VPN 也是本机位置），
   // 只到市（区县容易错，要区就手填）；拿不到才退回出口 IP（会写明「按出口 IP」）。
-  // 不想联网/不想起子进程就设 false。timezone 留空 = 用系统自己的时区。
+  // 不想联网/不想起子进程就设 false。
+  // timezone 是全局唯一时区来源：留空 = 系统时区；日记、主动搭话、提醒、朋友圈、
+  // 聊天时间戳和提示词 <env> 都按它算，不再各用各的。
   env: { location: '', timezone: '', autoDetect: true },
   // 提醒：规则和 care 同语义（每天上限 / 刚聊过先跳过），配置独立、界面独立。
   // 提醒不设时间段：它是用户指定的准点事件，卡时间窗只会让提醒发不出去。
   reminder: { enabled: true, maxPerDay: 0, quietAfterMinutes: 0 },
+  // 日记只写主人私聊；sendToOwner 打开后，写完把 Markdown 全文交给桥接发给主人。
+  diary: { enabled: false, time: '23:00', sendToOwner: false },
+  // 朋友圈：读取结果只存最近一次快照（data/moments/latest.json），不写聊天记忆。
+  // 自动点赞默认开，但只对正文足够长、非自己、非丧事/求助/负面、且模型置信度高的
+  // 动态执行；每次读取后延迟执行，先让启动器拿结果。autoReadEveryHours=0 表示
+  // 不主动定时读取，只在主人问起或启动器手动读取时读。
+  moments: {
+    autoLike: true, autoLikeMaxPerDay: 3, autoReadEveryHours: 0,
+    publishFeatureEnabled: false, publishEnabled: false, publishIntervalHours: 6, publishMaxPerDay: 1,
+    publishAccount: '', publishWithImage: false,
+  },
   // 别人发链接时，读一下标题/摘要/文章正文（视频只读得到文案）
-  links: { enabled: true, timeoutMs: 6000, cacheMinutes: 60 },
-  // 魔咒：主人在微信私聊输入口令后，临时解锁当前会话的群禁言命令。
-  admin: { spell: '', minutes: 30, allowAll: false },
+  links: { enabled: true, timeoutMs: 6000, cacheMinutes: 60, allowPrivate: false },
+  // 魔咒：主人在微信私聊输入口令后，临时解锁当前会话的管理命令。
+  admin: { spell: '', minutes: 30 },
   // 表情包（实验性）：总闸在 features.stickers，这里只管「怎么挑、发多勤」。
   // 关闭时整个功能不生效：不挑图、不回包带字段、桥接不轮询、测试接口 404。
   sticker: {
@@ -203,7 +216,7 @@ const DEFAULT_CONFIG = {
     // ensureSend=true 时，命中提醒的轮次即使模型没写标记也由程序补一张（按回复语气选分类），
     // 这样 1.0 才约等于“每轮都发”；难过/求助的严肃窗口仍然不发。
     // 自定义分类存在 data/sticker-categories.json（不进 config，避免被表单转成字符串）。
-    testChat: '文件传输助手', // 控制台「发送测试表情包」默认发到哪
+    testChat: '文件传输助手', // 启动器「发送测试表情包」默认发到哪
     demandChance: 0.7,
     ensureSend: false,
   },
@@ -267,7 +280,8 @@ const DEFAULT_CONFIG = {
   },
   // 记忆参数以 src/memory/constants.js 为准（写死的那些不改）；
   // 唯一可调的是「对话预算」：config.json 的 memory.dialogueBudget，默认 5,500。
-  // 启动器「高级模式 → 高级」里能改；旧的 memory.maxSessions / maxMessages 等仍然被忽略。
+  // 启动器「高级模式 → 高级」里能改；memory.maxMessages 会作为原文保留条数上限，
+  // memory.maxSessions 等旧字段仍然被忽略。
   memory: {
     // 对话预算（不含 system prompt）= memory 900 + summary 900 + recent 3,200 + reserve 500
     dialogueBudget: 5500,
@@ -303,7 +317,6 @@ const DEFAULT_CONFIG = {
     // 默认开：本地桥接就是走这个 webhook，关掉等于微信收发全停。
     // 启动器设置页已不再暴露这一组，改只能改 config.json。
     wechat: { enabled: true, inboundToken: 'change-me-wechat', outboundUrl: '', outboundHeaders: {} },
-    douyin: { enabled: false, inboundToken: 'change-me-douyin', outboundUrl: '', outboundHeaders: {} },
   },
   // 日志：level 管控制台，fileLevel 管文件（默认 debug 全量）。
   // trace 记「为什么回/为什么不回」的判定链（不含正文）；traceRaw 在本地留 24 小时的原文副本，
@@ -406,6 +419,8 @@ function migrateSampling(cfg, log) {
 }
 
 function loadConfig({ root = projectRoot(), env = process.env, readOnly = false } = {}) {
+  const { registerSecrets } = require('./redact');
+  registerSecrets(env);
   const configPath = path.join(root, 'config.json');
   const configExists = fs.existsSync(configPath);
   // 解析失败不能悄悄当成「空配置」：那会让所有默认值顶上来，用户看到的是
@@ -425,11 +440,12 @@ function loadConfig({ root = projectRoot(), env = process.env, readOnly = false 
       }
       fromFile = parsed;
     } catch (err) {
-      configError = String((err && err.message) || err);
+      configError = require('./redact').redactSecrets((err && err.message) || err);
       fromFile = {};
     }
   }
   const cfg = deepMerge(DEFAULT_CONFIG, fromFile);
+  registerSecrets(cfg);
   // 表情包不再按概率发送（分类由模型标记决定），旧的 chances / genericChance
   // 即使还留在 config.json 里也不参与运行，这里不再做任何兼容搬移。
   // 老配置迁移（在 env 覆盖之前做，避免把用户的 env 设置改掉）
@@ -484,13 +500,15 @@ function loadConfig({ root = projectRoot(), env = process.env, readOnly = false 
 function ensureConfigFile(root = projectRoot()) {
   const target = path.join(root, 'config.json');
   if (fs.existsSync(target)) return target;
-  const example = path.join(root, 'config.example.json');
+  const example = path.join(root, 'config', 'config.example.json');
   if (fs.existsSync(example)) fs.copyFileSync(example, target);
   return target;
 }
 
 function loadSettings(cfg) {
-  return readJson(cfg.paths.settingsFile, {}) || {};
+  const settings = readJson(cfg.paths.settingsFile, {}) || {};
+  require('./redact').registerSecrets(settings);
+  return settings;
 }
 
 function saveSettings(cfg, patch) {
@@ -518,8 +536,14 @@ function saveSettings(cfg, patch) {
     next.apiKey = keys[providerName] || '';
   }
   next.keys = keys;
+  require('./redact').registerSecrets(next);
   fs.mkdirSync(cfg.paths.dataDir, { recursive: true });
-  fs.writeFileSync(cfg.paths.settingsFile, JSON.stringify(next, null, 2), 'utf8');
+  // settings.json 存所有服务商 Key；直接 writeFileSync 中途崩溃会留下半截
+  // JSON，loadSettings 静默回落 {}，表现为所有 Key 突然消失。
+  const file = cfg.paths.settingsFile;
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
   return next;
 }
 

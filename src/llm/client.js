@@ -13,6 +13,7 @@ const path = require('node:path');
 const { URL } = require('node:url');
 const { resolveRuntime, maskKey } = require('../infra/config');
 const { describeError } = require('../infra/errors');
+const { textMeta } = require('../infra/privacy');
 
 const FRIENDLY = {
   nokey: '呜…人家还没拿到深海的钥匙（API Key），去右上角「设置」里填一下吧 (｡•́︿•̀｡)',
@@ -29,12 +30,12 @@ const FRIENDLY = {
 
 class LlmError extends Error {
   constructor(userMessage, { code = 'unknown', status = 0, retryable = false, detail = '' } = {}) {
-    super(detail || userMessage);
+    super(require('../infra/redact').redactSecrets(detail || userMessage));
     this.name = 'LlmError';
-    this.userMessage = userMessage || FRIENDLY.default;
+    this.userMessage = require('../infra/redact').redactSecrets(userMessage || FRIENDLY.default);
     // detail 是给日志/诊断用的结构证据（HTTP 状态、finish、usage…），不发给用户。
     // 以前只放进 message，err.detail 一直是 undefined，extractor / probe 都读不到。
-    this.detail = detail || '';
+    this.detail = require('../infra/redact').redactSecrets(detail);
     this.code = code;
     this.status = status;
     this.retryable = retryable;
@@ -285,6 +286,7 @@ class DeepSeekClient {
     this.provider = rt.provider;
     this.providerLabel = rt.providerLabel;
     this.apiKey = rt.apiKey;
+    require('../infra/redact').registerSecrets({ apiKey: this.apiKey });
     this.model = rt.model;
     this.baseUrl = rt.baseUrl;
     this.temperature = rt.temperature;
@@ -437,7 +439,7 @@ class DeepSeekClient {
   }
 
   /** 记下 API 返回的 usage（不打印内容，只记数字） */
-  _recordUsage(json) {
+  _recordUsage(json, purpose = 'background') {
     const u = json && json.usage;
     if (!u) return;
     const promptTokens = Number(u.prompt_tokens) || 0;
@@ -465,7 +467,7 @@ class DeepSeekClient {
       at: Date.now(),
     };
     this.usageSeq += 1;
-    this.usageEvents.push({ seq: this.usageSeq, ...this.lastUsage });
+    this.usageEvents.push({ seq: this.usageSeq, purpose, ...this.lastUsage });
     // 只留最近 64 次：够一轮里的重试，也不会把内存越攒越大
     if (this.usageEvents.length > 64) this.usageEvents.splice(0, this.usageEvents.length - 64);
   }
@@ -724,7 +726,7 @@ class DeepSeekClient {
     return new LlmError(friendlyForStatus(res.statusCode, detail), {
       code: 'http_' + res.statusCode,
       status: res.statusCode,
-      detail: `HTTP ${res.statusCode}: ${String(detail).slice(0, 300)}`,
+      detail: `HTTP ${res.statusCode}: ${require('../infra/redact').redactSecrets(detail).slice(0, 300)}`,
       retryable: res.statusCode === 429 || res.statusCode >= 500,
     });
   }
@@ -740,7 +742,7 @@ class DeepSeekClient {
    *   5) 仍空 → 抛 LlmError(empty, detail)，detail 带 finish/usage/reasoning_tokens。
    * 参数被 400/422 拒时（不同服务商字段名不一样），按候选表换下一档再试。
    */
-  async complete({ system, turns, maxTokens, signal, thinking, allowOverflow = false } = {}) {
+  async complete({ system, turns, maxTokens, signal, thinking, allowOverflow = false, purpose = 'background' } = {}) {
     this.lastUsage = null;
     let lastErr = null;
     let sawDegenerate = false;
@@ -782,9 +784,9 @@ class DeepSeekClient {
         try {
           json = JSON.parse(raw);
         } catch {
-          throw new LlmError(FRIENDLY.empty, { code: 'bad_json', detail: 'invalid json: ' + raw.slice(0, 200) });
+          throw new LlmError(FRIENDLY.empty, { code: 'bad_json', detail: 'invalid json: ' + textMeta(raw) });
         }
-        this._recordUsage(json);
+        this._recordUsage(json, purpose);
         // HTTP 200 也可能带错误体（网关 / 反向代理 / 部分兼容服务会这么干）。
         // 以前这里直接当「模型没说话」吞成空响应，日志里只剩一句「空泡泡」，
         // 真正的限流原因全丢了。
@@ -971,7 +973,7 @@ class DeepSeekClient {
   /**
    * 流式，异步生成器，每次 yield 一段新增文本。
    */
-  async *stream({ system, turns, signal }) {
+  async *stream({ system, turns, signal, purpose = 'background' }) {
     this.lastUsage = null;
     const payload = this.buildPayload({ system, turns, stream: true });
     const { req, res } = await this._open(payload, { signal, stream: true });
@@ -1007,7 +1009,7 @@ class DeepSeekClient {
           if (json?.error) {
             throw new LlmError(FRIENDLY.default, { code: 'stream_error', detail: String(json.error.message || '') });
           }
-          if (json && json.usage) this._recordUsage(json);
+          if (json && json.usage) this._recordUsage(json, purpose);
           const finish = json?.choices?.[0]?.finish_reason;
           if (finish) lastFinish = finish;
           const delta = json?.choices?.[0]?.delta;

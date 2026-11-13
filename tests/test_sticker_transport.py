@@ -115,7 +115,7 @@ class TransportTest(unittest.TestCase):
                                    copy_files_to_clipboard=Mock(return_value=True))
 
     def test_sole_window_accepted_when_configured_account_matches_database(self):
-        # 现场故障：机器上有 3 个历史账号目录，现在只登一个号，网页里已经选好了小号，
+        # 现场故障：机器上有 3 个历史账号目录，现在只登一个号，启动器里已经选好了小号，
         # 文字能发，表情包却一直 "target account window could not be verified"。
         allowed = transport.account_evidence_allowed(
             configured_account='wxid_test_account_0001',
@@ -127,7 +127,7 @@ class TransportTest(unittest.TestCase):
         self.assertTrue(allowed, '明确指定了账号且数据库就是这个号，应当放行')
 
     def test_sole_logged_in_account_is_enough_without_picking_one(self):
-        # 现场故障：默认配置（网页里没选账号、机器上有 3 个历史账号目录），
+        # 现场故障：默认配置（启动器里没选账号、机器上有 3 个历史账号目录），
         # 明明只登着一个号，表情包却一条也发不出去，还提示「去选一个账号」。
         allowed = transport.account_evidence_allowed(
             configured_account='', db_account='wxid_a', reason='本机只登了一个号',
@@ -453,13 +453,15 @@ class TransportTest(unittest.TestCase):
             transport.resolve_target(self.db, 'Peer')
 
 
-from bridge_ast import init, load_function
+from bridge_ast import init, load_chat_name_helpers, load_function
 
 BRIDGE = ROOT / 'bridge' / 'engine.py'
 
 
 def bridge_functions(names, environment):
     init(environment)
+    if 'send_text' in names or 'send_at' in names:
+        load_chat_name_helpers(environment)
     for name in names:
         load_function(name, environment)
     return environment
@@ -790,7 +792,7 @@ class BridgeContractTest(unittest.TestCase):
         self.assertIn('peer', env['sticker_draft_quarantine'])
 
     def test_sole_visible_window_needs_the_configured_account(self):
-        # 现场回归 1：只登着一个号时，不需要在网页里选账号，表情包也应该能发。
+        # 现场回归 1：只登着一个号时，不需要在启动器里选账号，表情包也应该能发。
         env, _, _ = self.quarantine_environment()
         env['ACCOUNT']['why'] = '本机只登了一个号'
         env['acct_dirs'] = ['test-account', 'another-account']
@@ -821,10 +823,12 @@ class BridgeContractTest(unittest.TestCase):
         fake_gui = SimpleNamespace(GetClassName=lambda h: windows[int(h)][0],
                                    GetWindowText=lambda h: windows[int(h)][1],
                                    IsIconic=lambda h: False,
+                                   IsWindowVisible=lambda h: True,
                                    GetWindowRect=lambda h: (0, 0, 900, 531))
+        fake_process = SimpleNamespace(GetWindowThreadProcessId=lambda h: (1, h + 100))
         fake_driver = SimpleNamespace(WeChatUIA=lambda: SimpleNamespace(_wechat_hwnds=lambda: list(windows)))
         env = bridge_functions({'wechat_main_window_count'}, {})
-        with patch.dict(sys.modules, {'win32gui': fake_gui,
+        with patch.dict(sys.modules, {'win32gui': fake_gui, 'win32process': fake_process,
                                       'wechatauto.uia_driver': fake_driver}):
             self.assertEqual(env['wechat_main_window_count'](), 1, '只有一个标题为「微信」的主窗')
             windows[104] = ('mmui::MainWindow', 'WeChat')

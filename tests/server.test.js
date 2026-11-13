@@ -43,16 +43,20 @@ async function collectSse(url, payload) {
   return events;
 }
 
-test('状态接口：默认是演示模式，两个网关都在', async () => {
+test('状态接口：默认是演示模式，只保留微信网关', async () => {
   const app = await boot();
-  const res = await fetch(app.url + '/api/status');
-  const data = await res.json();
-  assert.equal(data.ok, true);
-  assert.equal(data.mock, true);
-  assert.equal(data.name, '鲸鲸');
-  assert.ok(Array.isArray(data.gateways) && data.gateways.length === 2);
-  assert.ok(data.webhookPaths.includes('/webhook/wechat'));
-  await app.close();
+  try {
+    const res = await fetch(app.url + '/api/status');
+    const data = await res.json();
+    assert.equal(data.ok, true);
+    assert.equal(data.mock, true);
+    assert.equal(data.name, '鲸鲸');
+    assert.ok(Array.isArray(data.gateways) && data.gateways.length === 1);
+    assert.equal(data.gateways[0].platform, 'wechat');
+    assert.ok(data.webhookPaths.includes('/webhook/wechat'));
+  } finally {
+    await app.close();
+  }
 });
 
 test('网页聊天入口已关闭：不带桥接 token 一律 404', async () => {
@@ -69,7 +73,7 @@ test('网页聊天入口已关闭：不带桥接 token 一律 404', async () => 
   await app.close();
 });
 
-test('网页私聊：SSE 流式返回完整回复', async () => {
+test('API 私聊：SSE 流式返回完整回复', async () => {
   const app = await boot();
   const events = await collectSse(app.url + '/api/chat', {
     text: '你好呀',
@@ -88,7 +92,7 @@ test('网页私聊：SSE 流式返回完整回复', async () => {
   await app.close();
 });
 
-test('网页群聊：没被 @ 返回 ignore，被 @ 才回复', async () => {
+test('API 群聊：没被 @ 返回 ignore，被 @ 才回复', async () => {
   const app = await boot();
   const res = await fetch(app.url + '/api/chat', {
     method: 'POST',
@@ -141,7 +145,6 @@ test('微信网关：token 校验 + 收到消息 + 回复发回中转服务', as
   const app = await boot({
     gateway: {
       wechat: { enabled: true, inboundToken: 'secret-token', outboundUrl: sinkUrl, outboundHeaders: {} },
-      douyin: { enabled: false, inboundToken: 'dy-token', outboundUrl: '', outboundHeaders: {} },
     },
   });
 
@@ -191,29 +194,21 @@ test('微信网关：token 校验 + 收到消息 + 回复发回中转服务', as
   await new Promise((r) => sink.close(r));
 });
 
-test('抖音网关：token 可以用 query 传，群消息按群聊规则处理', async () => {
-  const app = await boot({
-    gateway: {
-      wechat: { enabled: false, inboundToken: 'w', outboundUrl: '', outboundHeaders: {} },
-      douyin: { enabled: true, inboundToken: 'dy-token', outboundUrl: '', outboundHeaders: {} },
-    },
-  });
+test('已下线的抖音网关不再暴露 webhook：返回 404', async () => {
+  const app = await boot();
   const res = await fetch(app.url + '/webhook/douyin?token=dy-token', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ room_id: 'live_1', chat_type: 'group', nickname: '小丑鱼', content: '鲸娘你在吗', msg_id: 'd1' }),
   });
-  const data = await res.json();
-  assert.equal(data.ok, true);
-  assert.equal(data.action, 'reply');
+  assert.equal(res.status, 404);
   await app.close();
 });
 
-test('回调地址校验：GET 带 challenge 原样返回（抖音/微信都有这种校验）', async () => {
+test('回调地址校验：GET 带 challenge 原样返回', async () => {
   const app = await boot({
     gateway: {
       wechat: { enabled: true, inboundToken: 'sec', outboundUrl: '', outboundHeaders: {} },
-      douyin: { enabled: false, inboundToken: 'd', outboundUrl: '', outboundHeaders: {} },
     },
   });
   const res = await fetch(app.url + '/webhook/wechat?token=sec&challenge=12345');
@@ -304,7 +299,7 @@ test('健康检查与 404', async () => {
   await app.close();
 });
 
-test('调试台：状态接口能看到主人和模型信息', async () => {
+test('诊断接口：状态接口能看到主人和模型信息', async () => {
   const app = await boot();
   try {
   const s = await (await fetch(app.url + '/api/debug/state')).json();
@@ -318,7 +313,7 @@ test('调试台：状态接口能看到主人和模型信息', async () => {
   } finally { await app.close(); }
 });
 
-test('调试台：提示词预览能区分主人 / 普通人 / 群聊', async () => {
+test('诊断接口：提示词预览能区分主人 / 普通人 / 群聊', async () => {
   const app = await boot();
   try {
   const post = (body) => fetch(app.url + '/api/debug/prompt', {
@@ -330,7 +325,7 @@ test('调试台：提示词预览能区分主人 / 普通人 / 群聊', async ()
   assert.match(master.system, /父母|养大/);
 
   // 只把昵称改成主人的名字、id 对不上：配了真 wxid 就不认（和微信里真正跑消息时一致），
-  // 以前调试台这里会显示「识别为主人」，害人以为改好了
+  // 以前这里会显示「识别为主人」，害人以为改好了
   const impostor = await (await post({ senderName: 'Master', senderId: 'wxid_fake', chatType: 'private', text: '在吗' })).json();
   assert.equal(impostor.isMaster, false);
   assert.equal(impostor.master.reason, 'name_blocked');
@@ -342,12 +337,12 @@ test('调试台：提示词预览能区分主人 / 普通人 / 群聊', async ()
 
   const byWxid = await (await post({ senderName: '随便改的昵称', senderId: 'wxid_test_master', chatType: 'group', chatTitle: '深海鱼塘', text: '在吗' })).json();
   assert.equal(byWxid.isMaster, true);
-  // 群名在尾部（每轮会变），调试台返回拼装后的 prompt
+  // 群名在尾部（每轮会变），诊断接口返回拼装后的 prompt
   assert.match(byWxid.prompt, /微信群「深海鱼塘」/);
   } finally { await app.close(); }
 });
 
-test('调试台：会话列表只给计数，不暴露记忆正文', async () => {
+test('诊断接口：会话列表只给计数，不暴露记忆正文', async () => {
   const app = await boot();
   try {
   await collectSse(app.url + '/api/chat', { text: '在吗', mode: 'private', sessionId: 'dbg', senderName: '小海' });
@@ -361,7 +356,7 @@ test('调试台：会话列表只给计数，不暴露记忆正文', async () =>
   } finally { await app.close(); }
 });
 
-test('调试台：网页同名昵称不能借魔咒取得管理员权限', async () => {
+test('诊断接口：未绑定 ID 的同名昵称不能借魔咒取得管理员权限', async () => {
   const app = await boot();
   try {
     const s = await (await fetch(app.url + '/api/debug/state')).json();
@@ -376,7 +371,7 @@ test('调试台：网页同名昵称不能借魔咒取得管理员权限', async
     const d = await (await fetch(app.url + '/api/debug/sessions')).json();
     const sess = d.sessions.find((x) => x.key.includes('adm'));
     assert.ok(sess, '应能找到这个会话');
-    assert.equal(Number(sess.adminUntil)||0, 0, '未绑定 ID 的网页同名用户不得激活管理员权限');
+    assert.equal(Number(sess.adminUntil)||0, 0, '未绑定 ID 的同名用户不得激活管理员权限');
   } finally {
     await app.close();
   }
@@ -429,8 +424,8 @@ test('人设调教接口：读、改、恢复默认', async () => {
     const reset = await (await post({ reset: true })).json();
     assert.equal(reset.ok, true);
     assert.equal(reset.persona.name, '鲸鲸');
-    assert.equal(reset.persona.historyTurns, 200);
-    assert.equal(reset.persona.groupHistoryTurns, 150);
+    assert.equal(reset.persona.historyTurns, 120);
+    assert.equal(reset.persona.groupHistoryTurns, 100);
   } finally {
     await app.close();
   }
@@ -439,7 +434,6 @@ test('本地桥接请求不会被误报「回复只打印在控制台」', async
   const app = await boot({
     gateway: {
       wechat: { enabled: true, inboundToken: 'secret-token', outboundUrl: '', outboundHeaders: {} },
-      douyin: { enabled: false, inboundToken: 'dy-token', outboundUrl: '', outboundHeaders: {} },
     },
   });
   try {
@@ -510,11 +504,10 @@ test('微信本地桥接：短回复换行和明确分条请求都返回多气�
   }
 });
 
-test('桥接心跳：网页能看出桥接在不在、UIA 通不通', async () => {
+test('桥接心跳：启动器能看出桥接在不在、UIA 通不通', async () => {
   const app = await boot({
     gateway: {
       wechat: { enabled: true, inboundToken: 'secret-token', outboundUrl: '', outboundHeaders: {} },
-      douyin: { enabled: false, inboundToken: 'dy-token', outboundUrl: '', outboundHeaders: {} },
     },
   });
   try {
@@ -546,7 +539,7 @@ test('桥接心跳：网页能看出桥接在不在、UIA 通不通', async () =
     info = st.gateways.find((x) => x.platform === 'wechat');
     assert.equal(info.bridge.online, true);
     assert.equal(info.bridge.uia, true);
-    assert.equal(info.bridge.ffmpeg, false, 'ffmpeg 状态要透传给网页');
+    assert.equal(info.bridge.ffmpeg, false, 'ffmpeg 状态要透传给启动器');
 
     // 超过 45 秒没心跳 → 又变离线
     g.bridge.lastSeen = Date.now() - 60 * 1000;
@@ -562,7 +555,6 @@ test('演示模式下 webhook 响应带 mock:true，桥接才能提醒用户', a
   const app = await boot({
     gateway: {
       wechat: { enabled: true, inboundToken: 'secret-token', outboundUrl: '', outboundHeaders: {} },
-      douyin: { enabled: false, inboundToken: 'dy-token', outboundUrl: '', outboundHeaders: {} },
     },
   });
   try {

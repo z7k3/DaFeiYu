@@ -1,9 +1,11 @@
 'use strict';
 
 const { sendDenial } = require('../core/wechatSendPolicy');
+const { describeError } = require('../infra/errors');
+const { tagName, textMeta } = require('../infra/privacy');
 
 /**
- * 通用 HTTP 网关适配器：把微信/抖音中转服务发来的 JSON 变成统一消息，
+ * 通用 HTTP 网关适配器：把微信中转服务发来的 JSON 变成统一消息，
  * 再把鲸鲸的回复 POST 回中转服务。
  *
  * 收消息：POST /webhook/{platform}  （协议见 docs/GATEWAY.md）
@@ -14,7 +16,8 @@ const http = require('node:http');
 const https = require('node:https');
 const { URL } = require('node:url');
 
-const PLATFORMS = ['wechat', 'douyin'];
+// 只保留微信：抖音桥接早已不适配，代码删掉后不再留一个永远连不上的平台名。
+const PLATFORMS = ['wechat'];
 
 function firstDefined(obj, keys) {
   for (const k of keys) {
@@ -43,6 +46,7 @@ function normalizeInbound(payload, platform) {
   const replyToName = firstDefined(body, ['reply_to_name', 'replyToName', 'quote_sender_name', 'quoted_sender_name']);
   const replyToUserId = firstDefined(body, ['reply_to_user_id', 'replyToUserId', 'quote_sender_id', 'quoted_sender_id']);
   const mentions = firstDefined(body, ['mentioned_names', 'mentionedNames', 'mention_names', 'mentions']);
+  const selfNames = firstDefined(body, ['self_names', 'selfNames', 'bot_names', 'botNames']);
   const noReply = toBool(firstDefined(body, ['no_reply', 'noReply']));
 
   return {
@@ -57,6 +61,7 @@ function normalizeInbound(payload, platform) {
     replyToName: String(replyToName || ''),
     replyToUserId: String(replyToUserId || ''),
     mentionedNames: Array.isArray(mentions) ? mentions : [],
+    selfNames: Array.isArray(selfNames) ? selfNames.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 20) : [],
     msgId: String(firstDefined(body, ['msg_id', 'msgId', 'message_id', 'messageId', 'id']) ?? ''),
     chatTitle: String(firstDefined(body, ['chat_title', 'chatTitle', 'room_name', 'roomName', 'group_name', 'groupName', 'title']) ?? ''),
     noReply,
@@ -121,7 +126,7 @@ class Gateway {
     this.bridge = {
       lastSeen: 0, uia: null, rest: false, listener: null, ffmpeg: null,
       // 多账号：桥接当前用的是哪个号、窗口认没认出来
-      account: '', accountNick: '', accountOk: null, accountWhy: '', accountGuard: true,
+      account: '', accountWxid: '', accountNick: '', accountOk: null, accountWhy: '', accountGuard: true,
       // 微信主窗现场（可见 / 最小化 / 托盘 / 句柄失效）：诊断包和自检都要它
       window: '',
     };
@@ -137,6 +142,7 @@ class Gateway {
       listener: typeof info.listener === 'boolean' ? info.listener : this.bridge.listener,
       ffmpeg: typeof info.ffmpeg === 'boolean' ? info.ffmpeg : this.bridge.ffmpeg,
       account: String(info.account || this.bridge.account || ''),
+      accountWxid: String(info.account_wxid || this.bridge.accountWxid || ''),
       accountNick: String(info.account_nick || this.bridge.accountNick || ''),
       accountOk: typeof info.account_ok === 'boolean' ? info.account_ok : this.bridge.accountOk,
       accountWhy: String(info.account_why || this.bridge.accountWhy || ''),
@@ -164,7 +170,7 @@ class Gateway {
   verifyToken(req, body) {
     const expected = String(this.options.inboundToken || '');
     if (!expected.trim()) return false; // 空凭据不能变成免鉴权入口。
-    if (/^change-me-(wechat|douyin)$/.test(expected)) {
+    if (/^change-me-wechat$/.test(expected)) {
       const ip = String(req.socket && req.socket.remoteAddress || '');
       if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(ip)) return false;
     }
@@ -190,10 +196,11 @@ class Gateway {
     if (msg.noReply) return { ok: true, skipped: 'no_reply_flag' };
     this.logger &&
       this.logger.info(
-        `[${this.platform}] 收到 ${msg.chatType === 'group' ? '群' : '私聊'}消息 ${msg.senderName}（${String(msg.text).length} 字）`
+        `[${this.platform}] 收到 ${msg.chatType === 'group' ? '群' : '私聊'}消息 sender=${tagName(msg.senderName)} ${textMeta(msg.text)}`
       );
     const localWechat = local && this.platform === 'wechat';
     const result = await this.bot.handle(msg, { localWechat });
+    this.logger?.debug?.(`[${this.platform}] event=gateway.result action=${result.action || '-'} reason=${result.reason || '-'} bubbles=${(result.bubbles || []).length}`);
     if (result.action !== 'reply' || !result.reply) {
       return { ok: true, action: 'ignore', reason: result.reason || 'ignored' };
     }
@@ -211,6 +218,11 @@ class Gateway {
       senderName: msg.senderName,
       local,
     });
+    if (this.bot.messagePlugins && result.reason !== 'command') {
+      await this.bot.messagePlugins.run('chat.dispatched', this.bot.pluginContext({ key: this.bot.sessionKey(msg), msg }, {
+        delivery: { ok: out?.ok !== false, local: Boolean(out?.local), dryRun: Boolean(out?.dryRun) }
+      }));
+    }
     // 文字回执：发成功的她自己能从聊天记录里看见，不用记账；
     // 只有「根本没到微信」和「发失败」记下来，否则下一轮她会以为消息已经发出去了。
     try {
@@ -239,7 +251,7 @@ class Gateway {
         }, result.reply);
       }
     } catch (err) {
-      this.logger && this.logger.warn && this.logger.warn('挑表情包失败：' + (err && err.message ? err.message : err));
+      this.logger && this.logger.warn && this.logger.warn('挑表情包失败：' + describeError(err));
     }
     return {
       ok: true,
@@ -281,19 +293,24 @@ class Gateway {
         this.logger &&
           this.logger.warn(
             `[${this.platform}] 这条回复不会到微信：既没有 gateway.outboundUrl，也不是本地桥接请求。` +
-            `本地用法请在启动器里点「启动」拉起桥接；自建中转才需要 outboundUrl。内容：${String(text).slice(0, 40)}`
+            `本地用法请在启动器里点「启动」拉起桥接；自建中转才需要 outboundUrl。回复${textMeta(text)}`
           );
       }
       return { ok: true, dryRun: true, local };
     }
     const results = [];
     for (let i = 0; i < lines.length; i++) {
+      // sendBubbles=true 时每条请求只带当前气泡；第一条也带完整 bubbles 会让
+      // 接收端把全部气泡发一遍，随后循环再逐条发，消息重复。
+      const body = lines.length > 1
+        ? { ...payload, text: lines[i], bubbles: [lines[i]] }
+        : payload;
       let lastErr = null;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           const r = await postJson(
             this.options.outboundUrl,
-            i === 0 ? payload : { ...payload, text: lines[i], bubbles: [lines[i]] },
+            body,
             this.options.outboundHeaders || {}
           );
           results.push(r);
@@ -312,11 +329,19 @@ class Gateway {
       if (lastErr) {
         this.stats.failed += 1;
         this.stats.lastError = lastErr.message;
-        this.logger && this.logger.error(`[${this.platform}] 发送失败：${lastErr.message}`);
+        this.logger && this.logger.error(`[${this.platform}] 发送失败：${describeError(lastErr)}`);
       }
       if (lines.length > 1 && i < lines.length - 1) await sleep(400);
     }
-    return { ok: results.some((r) => r.ok), results };
+    // 部分成功不能算整体成功：否则上层不会补发缺的气泡，模型也以为已经送达。
+    const ok = results.length === lines.length && results.every((r) => r && r.ok);
+    return {
+      ok,
+      partial: !ok && results.some((r) => r && r.ok),
+      sent: results.filter((r) => r && r.ok).length,
+      failed: lines.length - results.filter((r) => r && r.ok).length,
+      results,
+    };
   }
 
   status() {
@@ -337,10 +362,12 @@ class Gateway {
         listener: online ? this.bridge.listener : null,
         ffmpeg: online ? this.bridge.ffmpeg : null,
         account: this.bridge.account,
+        accountWxid: this.bridge.accountWxid,
         accountNick: this.bridge.accountNick,
         accountOk: this.bridge.accountOk,
         accountWhy: this.bridge.accountWhy,
         accountGuard: this.bridge.accountGuard,
+        accountStale: !online,
         window: online ? this.bridge.window : '',
       },
       ...this.stats,

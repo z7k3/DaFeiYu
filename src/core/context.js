@@ -3,10 +3,16 @@
 const { createHash } = require('node:crypto');
 const { sanitizeForModel, formatStamp } = require('./text');
 const { stripMasterDispute } = require('./identity');
+const time = require('../infra/time');
+const history = require('./history');
+const { estimateBudgetTokens } = require('../infra/textBudget');
 
 // Qwen 需要足够的上下文才能分清群里是谁在说话；按字符限额而不是只给几条消息。
 const MAX_TURN_CHARS = 1800;
-const MAX_PROMPT_CHARS = 60000;
+// 和 memory/constants.hardTotalTokens 一致；按 token 裁剪，不再拿字符数冒充预算。
+const MAX_PROMPT_TOKENS = 64000;
+// 兼容旧调用方/测试的导出；实际裁剪已改成 token 口径。
+const MAX_PROMPT_CHARS = 100000;
 
 // 时间戳只在「首条 / 与上一条隔了 5 分钟以上 / 跨天」时标，别每条都写，省 token 也更像聊天记录。
 const STAMP_GAP_MS = 5 * 60 * 1000;
@@ -15,7 +21,7 @@ const STAMP_GAP_MS = 5 * 60 * 1000;
  * 时间戳节流器：同一条消息不管当「当前」还是当「历史」，formatStamp 出来的字符串一样；
  * 这里只决定「要不要打标记」。返回空串表示省略。
  */
-function makeStamper() {
+function makeStamper(timeZone = '') {
   let prevTs = 0;
   let seen = false;
   return (ts) => {
@@ -24,10 +30,10 @@ function makeStamper() {
     let need = false;
     if (!seen) need = true;
     else if (t - prevTs >= STAMP_GAP_MS) need = true;
-    else if (new Date(t).toDateString() !== new Date(prevTs).toDateString()) need = true;
+    else if (time.dayKey(t, timeZone) !== time.dayKey(prevTs, timeZone)) need = true;
     prevTs = t;
     seen = true;
-    return need ? `[${formatStamp(t)}] ` : '';
+    return need ? `[${formatStamp(t, timeZone)}] ` : '';
   };
 }
 
@@ -39,7 +45,7 @@ function makeStamper() {
  * 都放在**最后一条 user 消息**里，不塞 system：system 保持会话内稳定，前缀缓存才不会被每轮变化的
  * 记忆和状态打断。顺序固定：正文 → 记忆块 → 本轮状态。
  */
-function buildTurns(msg, history, memoryBlock = '', tailBlock = '') {
+function buildTurns(msg, history, memoryBlock = '', tailBlock = '', timeZone = '') {
   const memory = String(memoryBlock || '').trim();
   const tail = String(tailBlock || '').trim();
   const turns = [];
@@ -57,7 +63,7 @@ function buildTurns(msg, history, memoryBlock = '', tailBlock = '') {
     };
     const entries = [];
     let previousTs = 0;
-    const stampOf = makeStamper();
+    const stampOf = makeStamper(timeZone);
     for (const event of past) {
       if (!event.text || event.error) continue;
       const ts = Number(event.ts || 0);
@@ -76,36 +82,48 @@ function buildTurns(msg, history, memoryBlock = '', tailBlock = '') {
       entries.push(gap + stamp + JSON.stringify(record));
     }
     // 当前这条永远带时间戳：它就是「现在」。
-    const currentStamp = `[${formatStamp(Number(msg.ts) || Date.now())}] `;
+    const currentStamp = `[${formatStamp(Number(msg.ts) || Date.now(), timeZone)}] `;
     const current = currentStamp + JSON.stringify({
       发言人: speaker(msg),
       // 挨骂的时候要让它看见原话，否则不知道对面骂了什么，回怼就没劲
-      内容: msg.fight ? String(msg.cleanText || msg.text) : sanitizeForModel(msg.cleanText || msg.text),
+      内容: String(msg.fight ? String(msg.cleanText || msg.text) : sanitizeForModel(msg.cleanText || msg.text))
+        .slice(0, MAX_TURN_CHARS),
       叫到鲸鲸: Boolean(msg.addressedToBot || msg.atMe || msg.replyToBot),
       其他提及对象: msg.mentionedNames || [],
       ...(msg.replyToName ? { 引用对象: msg.replyToName } : {}),
     });
-    let size = entries.reduce((n, s) => n + s.length + 1, current.length + 200) + memory.length + tail.length;
+    const lineTokens = (s) => estimateBudgetTokens(s) + 2;
+    let size = entries.reduce((n, s) => n + lineTokens(s), 0)
+      + estimateBudgetTokens(current) + 200 + estimateBudgetTokens(memory) + estimateBudgetTokens(tail);
     const dropped = [];
-    while (size > MAX_PROMPT_CHARS && entries.length > 1) {
+    while (size > MAX_PROMPT_TOKENS && entries.length > 1) {
       const old = entries.shift();
-      size -= old.length + 1;
+      size -= lineTokens(old);
       dropped.push(old);
     }
     // 被挤掉的旧消息压成一句摘要，别让更早的话题凭空消失
     let summary = '';
     if (dropped.length) {
-      const texts = dropped
-        .map((line) => {
-          try {
-            const obj = JSON.parse(line.replace(/^\[[^\]]*\]\s*/, '').replace(/^\[间隔[^\]]*\]\n/, ''));
+      const buildSummary = () => {
+        const texts = dropped
+          .map((line) => {
+            const obj = history.parseHistoryLine(line);
+            if (!obj) return '';
             return `${obj.发言人 ? String(obj.发言人).replace(/（参与者[0-9a-f]+）/, '') : ''}：${String(obj.内容 || '').slice(0, 24)}`;
-          } catch {
-            return '';
-          }
-        })
-        .filter(Boolean);
-      if (texts.length) summary = '【更早的对话（已压缩）】' + texts.slice(-12).join('；') + '\n';
+          })
+          .filter(Boolean);
+        return texts.length ? '【更早的对话（已压缩）】' + texts.slice(-12).join('；') + '\n' : '';
+      };
+      // 摘要也占预算。每多丢一条都要重新生成摘要，不能只把消息从 entries 删掉，
+      // 否则这批历史既不在原文里，也不在摘要里。
+      for (;;) {
+        summary = buildSummary();
+        const summaryTokens = estimateBudgetTokens(summary);
+        if (size + summaryTokens <= MAX_PROMPT_TOKENS || entries.length <= 1) break;
+        const old = entries.shift();
+        size -= lineTokens(old);
+        dropped.push(old);
+      }
     }
     return [{
       role: 'user',
@@ -116,20 +134,14 @@ function buildTurns(msg, history, memoryBlock = '', tailBlock = '') {
         + (tail ? '\n\n' + tail : ''),
     }];
   }
-  const push = (role, content, merge = !isGroup) => {
+  const push = (role, content) => {
     const limit = isGroup ? 900 : MAX_TURN_CHARS;
     const trimmed = String(content || '').slice(0, limit);
     if (!trimmed) return;
-    const last = turns[turns.length - 1];
-    // 群聊不能把多个群友合并成一条 user 消息，否则会丢掉说话人边界和代词指向。
-    if (merge && last && last.role === role) {
-      last.content += '\n' + trimmed;
-    } else {
-      turns.push({ role, content: trimmed });
-    }
+    turns.push({ role, content: trimmed });
   };
   let previousTs = 0;
-  const stampOf = makeStamper();
+  const stampOf = makeStamper(timeZone);
   for (const m of past) {
     if (m.error || !m.text) continue;
     const ts = Number(m.ts || 0);
@@ -151,7 +163,7 @@ function buildTurns(msg, history, memoryBlock = '', tailBlock = '') {
   const current = msg.cleanText || msg.text;
   const currentBody = msg.fight ? String(current) : sanitizeForModel(current);
   // 当前这条永远带时间戳（它就是「现在」），同一 ts 的渲染和历史里完全一致。
-  const currentStamp = `[${formatStamp(Number(msg.ts) || Date.now())}] `;
+  const currentStamp = `[${formatStamp(Number(msg.ts) || Date.now(), timeZone)}] `;
   const currentText = isGroup
     ? `${currentStamp}[${msg.senderName || '群友'}] ${currentBody}`
     : `${currentStamp}${currentBody}`;
@@ -168,13 +180,13 @@ function buildTurns(msg, history, memoryBlock = '', tailBlock = '') {
     else turns.push({ role: 'user', content: tail });
   }
   // 总长度控制：从最旧事件开始删，保留当前事件和最近的完整边界。
-  let total = turns.reduce((n, t) => n + t.content.length, 0);
-  while (total > MAX_PROMPT_CHARS && turns.length > 1) {
-    total -= turns[0].content.length;
+  let total = turns.reduce((n, t) => n + estimateBudgetTokens(t.content), 0);
+  while (total > MAX_PROMPT_TOKENS && turns.length > 1) {
+    total -= estimateBudgetTokens(turns[0].content);
     turns.shift();
   }
   while (turns.length && turns[0].role !== 'user') turns.shift();
   return turns;
 }
 
-module.exports = { MAX_TURN_CHARS, MAX_PROMPT_CHARS, STAMP_GAP_MS, buildTurns, makeStamper };
+module.exports = { MAX_TURN_CHARS, MAX_PROMPT_CHARS, MAX_PROMPT_TOKENS, STAMP_GAP_MS, buildTurns, makeStamper };

@@ -8,7 +8,7 @@
 
 前置：
   1. WeChat 4.x 已登录（建议用小号）
-  2. 已装依赖：pip install wechatauto-replica requests
+  2. 依赖按 bridge/requirements.txt 安装；wechatauto 用仓库 vendor/wechatauto（启动器运行时已内置）
   3. 鲸鲸服务已启动（启动器状态页显示「运行中」）
   4. config.json 里 gateway.wechat.enabled = true（脚本会读 token）
 
@@ -48,6 +48,8 @@ import voice_reply
 import voice_send_test
 from sticker_transport import guarded_send as guarded_sticker_send, read_enabled_config, resolve_target as resolve_sticker_target, result as sticker_result, WindowsDesktop, quarantined_input_value, account_evidence_allowed as sticker_account_evidence_ok, alias_match as sticker_alias_match, _is_blank as sticker_input_is_blank
 from config_values import as_bool as _as_bool, as_int as _as_int, as_float as _as_float, parse_bg_send as _parse_bg_send
+import mention
+import mention_meta
 from wechat_db import DB_ROOT_NAMES, looks_like_db_root as _looks_like_db_root, iter_drive_roots, resolve_db_dir as _resolve_db_dir, find_account_dirs as _find_account_dirs, account_wxid, resolve_account_dir as _resolve_account_dir
 try:
     from bridge import uia_boot
@@ -65,7 +67,8 @@ except OSError:
 LOG_FILE = os.path.join(ROOT, 'data', 'wechat-bridge-4x.log')
 LOG_LEVEL = 'info'
 import bridge_log
-from bridge_log import log, log_debug, log_warn, log_error, boot, log_window_problem
+from bridge_log import (log, log_debug, log_warn, log_error, boot, log_window_problem,
+                        safe_id, safe_name, safe_text, safe_path, safe_url)
 from guards import is_system_notice, duplicate_guard, rate_guard, set_system_senders
 import config as bridge_config
 from config import read_config, build_bot_url, wait_for_server as _wait_for_server, ensure_ffmpeg_env as _ensure_ffmpeg_env
@@ -104,7 +107,7 @@ LOW_BATTERY_PCT = 5.0
 GOODNIGHT_TEXT = '晚安，电量快没了，我先睡啦，明天见～'
 _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config.json')
 if not os.path.exists(_cfg_path):
-    _example = os.path.join(os.path.dirname(_cfg_path), 'config.example.json')
+    _example = os.path.join(os.path.dirname(_cfg_path), 'config', 'config.example.json')
     if os.path.exists(_example):
         try:
             import shutil
@@ -214,8 +217,8 @@ def log_throttled(key, *args, ttl=600, emit=None):
 def reload_config(path=None):
     """把 config.json 重新读一遍，覆盖上面这些「启动时定型」的开关。
 
-    为什么需要：调试台（/debug）改的是 config.json，但桥接以前只在启动时读一次，
-    用户在页面上关掉「主动搭话」、改「忽略名单」、调「群聊开关」……全都没反应，
+    为什么需要：启动器改的是 config.json，但桥接以前只在启动时读一次，
+    用户在启动器里关掉「主动搭话」、改「忽略名单」、调「群聊开关」……全都没反应，
     只能在启动器里手动重启桥接，表现出来就是「调了没用，还是默认」。
     现在 config.json 一变，5 秒内自动生效。
 
@@ -267,7 +270,7 @@ def reload_config(path=None):
         WINDOW_HWND = 0
     wanted_now = str(w.get('account') or '').strip()
     if wanted_now != ACCOUNT_WANTED:
-        log('账号设置变了（%r → %r），3 秒后自动重启桥接…' % (ACCOUNT_WANTED, wanted_now))
+        log('账号设置变了（%s → %s），3 秒后自动重启桥接…' % (safe_id(ACCOUNT_WANTED), safe_id(wanted_now)))
         time.sleep(3)
         _restart_deadline = time.time() + 15
         while SEND_STATE.get('active') and time.time() < _restart_deadline:
@@ -334,7 +337,7 @@ def resolve_account_dir(db_dir, wanted):
     return _resolve_account_dir(db_dir, wanted)
 
 def list_accounts_cli():
-    """--list-accounts：扫描本机所有微信账号，写 data/accounts.json 给网页下拉用。
+    """--list-accounts：扫描本机所有微信账号，写 data/accounts.json 给启动器下拉用。
 
     昵称要开库读 contact.db（必须微信在登录、能取到密钥），所以是「尽力而为」：
     单个账号失败就留空，整件事最多花 20 秒，绝不因为读不到昵称就报错。
@@ -376,9 +379,9 @@ def list_accounts_cli():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-        log('列账号完成：%d 个（%s）' % (len(rows), '、'.join((r['account'] for r in rows)) or '无'))
+        log('列账号完成：%d 个（%s）' % (len(rows), '、'.join((safe_id(r['account']) for r in rows)) or '无'))
     except Exception as e:
-        log('列账号：写 %s 失败：%r' % (path, e))
+        log('列账号：写 %s 失败：%r' % (safe_path(path), e))
     print(json.dumps(payload, ensure_ascii=False))
     return 0
 
@@ -433,7 +436,7 @@ def write_accounts_cache(db_dir, account='', nick='', probe_others=True, deadlin
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-        log('账号缓存已补写：%d 个号（%s）' % (len(rows), '、'.join((r['nick'] or r['account'] for r in rows))))
+        log('账号缓存已补写：%d 个号（%s）' % (len(rows), '、'.join((safe_name(r['nick']) if r['nick'] else safe_id(r['account']) for r in rows))))
         return True
     except Exception as e:
         log('账号缓存补写失败（不影响收发）：', repr(e))

@@ -29,6 +29,7 @@ namespace WhaleLauncher
     public partial class MainWindow : Window
     {
         private readonly RuntimeSupervisor _sup;
+        private readonly PluginMarket _pluginMarket;
         private readonly DispatcherTimer _timer;
         private readonly Dictionary<string, UserControl> _pages = new Dictionary<string, UserControl>();
         private bool _busy;
@@ -40,9 +41,11 @@ namespace WhaleLauncher
             new NavEntry { Key = "状态", Label = "状态", Icon = Geometry.Parse("M4 4h7v7H4z M13 4h7v4h-7z M13 10h7v10h-7z M4 13h7v7H4z") },
             new NavEntry { Key = "人设", Label = "人设", Icon = Geometry.Parse("M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7") },
             new NavEntry { Key = "表情包", Label = "表情包", Icon = Geometry.Parse("M4 4h16v16H4z M8.5 9a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z M20 16l-4.6-4.6L7 20") },
+            new NavEntry { Key = "朋友圈", Label = "朋友圈", Icon = Geometry.Parse("M4 8h3l2-3h6l2 3h3v12H4z M12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z") },
             new NavEntry { Key = "主动与提醒", Label = "主动与提醒", Icon = Geometry.Parse("M18 8a6 6 0 0 0-12 0c0 7-3 8-3 8h18s-3-1-3-8 M10.5 20a2 2 0 0 0 3 0") },
             new NavEntry { Key = "微信桥接", Label = "微信桥接", Icon = Geometry.Parse("M21 11.5a8.4 8.4 0 0 1-9 8.4 9.9 9.9 0 0 1-4-.9L3 21l1.9-3.5a8.4 8.4 0 1 1 16.1-6Z M8 10h8 M8 13h5") },
             new NavEntry { Key = "诊断", Label = "诊断", Icon = Geometry.Parse("M3 12h4l2-5 4 10 2-5h6") },
+            new NavEntry { Key = "插件市场", Label = "插件市场", Icon = Geometry.Parse("M4 9h16v11H4z M3 5h18v4H3z M10 13h4") },
             new NavEntry { Key = "设置", Label = "设置", Icon = Geometry.Parse("M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.56 1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.9a1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.12.4.5.86 1.56 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z") },
         };
 
@@ -52,6 +55,7 @@ namespace WhaleLauncher
 
             var dir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
             _sup = new RuntimeSupervisor(dir);
+            _pluginMarket = new PluginMarket(dir);
 
             // 正式版不该显示成 v4.0-alpha：那会让用户以为自己装的是测试版，
             // 而且强制更新拿这个版本号做比较，后缀只会添乱。
@@ -59,7 +63,7 @@ namespace WhaleLauncher
             VersionText.Text = ver.Length > 0 ? "v" + ver : "v?";
 
             foreach (var k in NavKeys) Nav.Items.Add(k);
-            Nav.Items.Insert(3, new NavEntry { Key = "语音发送", Label = "语音发送", Icon = Geometry.Parse("M9 3h6v12H9z M5 10v3a7 7 0 0 0 14 0v-3 M12 20v3 M8 23h8") });
+            Nav.Items.Insert(4, new NavEntry { Key = "语音发送", Label = "语音发送", Icon = Geometry.Parse("M9 3h6v12H9z M5 10v3a7 7 0 0 0 14 0v-3 M12 20v3 M8 23h8") });
             Nav.SelectedIndex = 0;
 
             _sup.Say("启动器就绪 · " + dir);
@@ -160,7 +164,7 @@ namespace WhaleLauncher
                 text += "\n原文件保留在 data\\memory\\legacy\\，不会删除。\n"
                       + "以后可以在「设置 → 高级 → 旧版记忆」里手动再识别。";
 
-                MessageBox.Show(this, text, "记忆已导入", MessageBoxButton.OK, MessageBoxImage.Information);
+                AppDialog.Show(this, text, "记忆已导入");
                 await Api.Post(_sup.Url, "/api/memory/import/ack", "{}");
             }
             catch
@@ -202,7 +206,7 @@ namespace WhaleLauncher
 
         /// <summary>
         /// 拿清单结果决定界面形态。这里只做「提示 / 强制 / 禁止启动」的判定，
-        /// 不下载；真下载交给 UpdateService（安装版下安装包，源码版跑 update.ps1）。
+        /// 不下载；真下载交给 UpdateService 下载官方安装包。
         /// </summary>
         private async Task SilentUpdateCheckAsync()
         {
@@ -294,33 +298,27 @@ namespace WhaleLauncher
                     ? chk.Manifest.Message
                     : "这个版本存在已知的严重问题，请下载最新版。")
                 + "\n\n请到 GitHub Releases 下载最新安装包。";
-            MessageBox.Show(msg, "版本已停用", MessageBoxButton.OK, MessageBoxImage.Stop);
+            AppDialog.Show(this, msg, "版本已停用", danger: true);
             Application.Current.Shutdown();
         }
 
         /// <summary>
-        /// 真正下载并换版：源码版跑 update.ps1（备份 / 覆盖 / 失败回滚），安装版下载官方安装包、
-        /// 校验 SHA256 后静默覆盖安装。askFirst=false 用于强制态：不再问「现在更新吗」。
+        /// 真正下载并换版：下载官方安装包、校验 SHA256 后静默覆盖安装。
+        /// askFirst=false 用于强制态：不再问「现在更新吗」。
         /// </summary>
         private async Task RunUpdateAsync(ManifestCheck chk, bool askFirst)
         {
             if (_updating || chk == null || chk.Manifest == null) return;
             var latest = chk.Manifest.Latest;
-            // 有脚本 = 源码版 / 老 zip 装法；安装版包里没有 scripts\，走安装包
-            var byScript = File.Exists(Path.Combine(_sup.BaseDir, "scripts", "update.ps1"));
 
             if (askFirst)
             {
-                var how = byScript
-                    ? "更新会先备份，再覆盖代码；data\\ 和 config.json 不会被改动。\n"
-                    : "更新会下载官方安装包，校验 SHA256 后覆盖安装；data\\ 和 config.json 不会被改动。\n";
-                var answer = MessageBox.Show(
+                if (!AppDialog.Confirm(this,
                     "发现新版本 v" + latest + "（当前 v" + chk.Current + "）。\n\n"
                     + (chk.Manifest.Message.Length > 0 ? chk.Manifest.Message + "\n\n" : "")
-                    + how
+                    + "更新会下载官方安装包，校验 SHA256 后覆盖安装；data\\ 和 config.json 不会被改动。\n"
                     + "更新期间启动器会退出，结束后自动重新打开。\n\n现在更新吗？",
-                    "检查更新", MessageBoxButton.YesNo, MessageBoxImage.Question);
-                if (answer != MessageBoxResult.Yes) return;
+                    "检查更新", okText: "现在更新", cancelText: "稍后")) return;
             }
 
             _updating = true;
@@ -338,45 +336,23 @@ namespace WhaleLauncher
                     // 强制态不能「失败也照常用」：提示完退出，下次启动还会再拦
                     if (!askFirst)
                     {
-                        MessageBox.Show(
+                        AppDialog.Show(this,
                             "必须更新到 v" + latest + " 才能继续使用，但自动更新失败了：\n\n" + outcome.Error,
-                            "必须更新", MessageBoxButton.OK, MessageBoxImage.Stop);
+                            "必须更新", danger: true);
                         Application.Current.Shutdown();
                         return;
                     }
-                    MessageBox.Show("更新失败：" + outcome.Error + "\n\n再点一次「检查更新」可以重试。",
-                        "检查更新", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    AppDialog.Show(this, "更新失败：" + outcome.Error + "\n\n再点一次「检查更新」可以重试。",
+                        "检查更新", danger: true);
                     return;
                 }
 
-                // 安装版：apply.ps1 已经接手——等本进程退出后装包，装完自己拉起新版。
-                // 这里不能再 RestartSelf，否则会跟安装器抢同一个 exe。
-                if (outcome.HandedToInstaller)
-                {
-                    StatusLine.Text = "正在安装 v" + latest + "，启动器会退出并在安装完成后自动重新打开…";
-                    await Task.Delay(800);
-                    Application.Current.Shutdown();
-                    return;
-                }
-
-                // 源码版：跑着的还是旧镜像，旧 exe 也只有等本进程退出才删得掉。
-                StatusLine.Text = "已更新到 v" + latest + "，正在重启…";
+                // apply.ps1 已经接手——等本进程退出后装包，装完自己拉起新版。
+                // 这里不能再重启自己，否则会跟安装器抢同一个 exe。
+                StatusLine.Text = "正在安装 v" + latest + "，启动器会退出并在安装完成后自动重新打开…";
                 await Task.Delay(800);
-
-                // 脚本收尾时会自己把启动器拉起来（带 --replace 本进程 PID）：
-                // 它已经在了就只关自己；没在（老脚本）才自己起一个。
-                if (AnotherInstanceRunning())
-                {
-                    Application.Current.Shutdown();
-                }
-                else if (!RestartSelf(out var restartErr))
-                {
-                    HideUpdateProgress();
-                    StatusLine.Text = "已更新到 v" + latest + "，请手动重新打开";
-                    MessageBox.Show(
-                        "更新完成，但自动重启失败：" + restartErr + "\n\n请手动关掉再打开启动器（新版要重启才生效）。",
-                        "检查更新", MessageBoxButton.OK, MessageBoxImage.Information);
-                }
+                Application.Current.Shutdown();
+                return;
             }
             finally
             {
@@ -410,57 +386,14 @@ namespace WhaleLauncher
             UpdatePct.Visibility = Visibility.Collapsed;
         }
 
-        /// <summary>是不是已经有新实例被脚本拉起来了（含自己）。</summary>
-        private static bool AnotherInstanceRunning()
-        {
-            try
-            {
-                var name = Path.GetFileNameWithoutExtension(Environment.ProcessPath ?? "");
-                if (string.IsNullOrEmpty(name)) return false;
-                return Process.GetProcessesByName(name).Length > 1;
-            }
-            catch { return false; }
-        }
-
         /// <summary>更新中关窗口：说清楚关掉也不会中断，让用户自己决定。</summary>
         private void OnClosingDuringUpdate(object sender, System.ComponentModel.CancelEventArgs e)
         {
             if (!_updating) return;
-            var ans = MessageBox.Show(
+            if (!AppDialog.Confirm(this,
                 "更新还在进行。\n\n" +
                 "关掉窗口不会中断更新：下载和安装会在后台继续，装完会自动把启动器重新打开。\n\n现在关吗？",
-                "更新进行中", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-            if (ans != MessageBoxResult.Yes) e.Cancel = true;
-        }
-
-        /// <summary>
-        /// 重启自己：起一个新实例（带 --replace 本进程 PID），然后关掉本进程。
-        /// 返回 false 表示起不来，调用方负责提示。
-        /// </summary>
-        private bool RestartSelf(out string error)
-        {
-            error = "";
-            try
-            {
-                // 不写死文件名：更新可能刚把 exe 换掉（甚至以后会改名），
-                // ProcessPath 永远是"我是从哪个路径启动的"，正好就是要重启的那个。
-                var exe = Environment.ProcessPath;
-                if (string.IsNullOrEmpty(exe)) exe = Path.Combine(AppContext.BaseDirectory, "WhaleLauncher.exe");
-                Process.Start(new ProcessStartInfo(exe)
-                {
-                    UseShellExecute = true,
-                    WorkingDirectory = AppContext.BaseDirectory,
-                    // 让新进程等本进程退出再抢单实例锁，否则会弹「已经在运行」
-                    Arguments = "--replace " + Environment.ProcessId,
-                });
-            }
-            catch (Exception ex)
-            {
-                error = ex.Message;
-                return false;
-            }
-            Application.Current.Shutdown();
-            return true;
+                "更新进行中", danger: true, okText: "现在关闭", cancelText: "继续等待")) e.Cancel = true;
         }
 
         // ── 外观：主题 / 背景图 / 标题栏 ────────────────────────
@@ -477,10 +410,47 @@ namespace WhaleLauncher
             if (BackdropImage != null)
             {
                 BackdropImage.Source = bmp;
+                BackdropImage.Stretch = Appearance.BackdropStretch;
+                BackdropImage.Opacity = Appearance.BackdropOpacity;
+                if (BackdropScale != null)
+                {
+                    // 只有「等比裁剪」需要放大一点藏住模糊软边；拉伸 / 完整显示要保留原图边界。
+                    var zoom = Appearance.BackdropFit == "fill" ? 1.06 : 1.0;
+                    BackdropScale.ScaleX = zoom;
+                    BackdropScale.ScaleY = zoom;
+                }
+                if (BackdropBlurEffect != null) BackdropBlurEffect.Radius = Appearance.BackdropBlur;
                 BackdropLayer.Visibility = bmp == null ? Visibility.Collapsed : Visibility.Visible;
             }
 
-            ApplyTitleBar();
+            ApplyTopBarDefaults();
+            if (_appliedTitleTheme != Appearance.Theme)
+            {
+                ApplyTitleBar();
+                _appliedTitleTheme = Appearance.Theme;
+            }
+        }
+
+        // 顶栏和系统标题栏只跟深浅主题走，拖滑块 / 改颜色时不用重复刷。
+        private static readonly string[] TopBarKeys =
+        {
+            "BgTop", "Line", "Text", "Text2", "Muted", "Dim", "Accent",
+            "ChipBg", "CardBorder", "Surface3", "Idle", "TopBtnHover",
+            "GhostBg", "GhostHover", "PrimaryBg", "PrimaryFg", "PrimaryHover",
+        };
+
+        private string _appliedTopBarKey;
+        private string _appliedTitleTheme;
+
+        private void ApplyTopBarDefaults()
+        {
+            if (TopBar == null) return;
+            // 背景图有无会改变顶栏的玻璃厚度，缓存键里带上它，换图 / 清除时才会重刷。
+            var key = Appearance.Theme + "|" + (Appearance.HasBackdrop ? "1" : "0");
+            if (_appliedTopBarKey == key) return;
+            foreach (var k in TopBarKeys)
+                TopBar.Resources[k] = new SolidColorBrush(Appearance.TopBarColor(k));
+            _appliedTopBarKey = key;
         }
 
         private void OnAppearanceChanged() => ApplyAppearance();
@@ -523,6 +493,7 @@ namespace WhaleLauncher
             ChangeWindowMessageFilterEx(hwnd, 0x004A /* WM_COPYDATA */, MSGFLT_ALLOW, IntPtr.Zero);
 
             ApplyTitleBar();
+            _appliedTitleTheme = Appearance.Theme;
         }
 
         [DllImport("dwmapi.dll", PreserveSig = true)]
@@ -562,9 +533,11 @@ namespace WhaleLauncher
                 case "人设": return new PersonaPage(_sup);
                 case "表情包": return new StickerPage(_sup);
                 case "语音发送": return new VoiceSendPage(_sup);
+                case "朋友圈": return new MomentsPage(_sup);
                 case "主动与提醒": return new ReminderPage(_sup);
                 case "微信桥接": return new BridgePage(_sup);
                 case "诊断": return new DiagPage(_sup);
+                case "插件市场": return new PluginMarketPage(_pluginMarket, UpdateManifestService.LocalVersion(_sup.BaseDir), _sup);
                 case "设置": return new SettingsPage(_sup);
                 default:
                     return new PlaceholderPage(key, "这一页还没做。");

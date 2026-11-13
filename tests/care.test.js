@@ -171,7 +171,7 @@ test('接口 /api/care/due 会说清为什么不该发', async () => {
 
 test('端到端闸门：时间窗全开时，到点该发、刚发过不该发', async () => {
   const app = await boot({
-    care: { enabled: true, windows: ['00:00-24:00'], everyMinutes: 30, jitterMinutes: 0, maxPerDay: 5 },
+    care: { enabled: true, onlyMaster: false, windows: ['00:00-24:00'], everyMinutes: 30, jitterMinutes: 0, maxPerDay: 5 },
   });
   try {
     // 从没发过 → 该发
@@ -197,19 +197,19 @@ test('端到端闸门：时间窗全开时，到点该发、刚发过不该发',
   }
 });
 
-test('调试台保存 care 设置后，闸门立刻按新设置算', async () => {
+test('设置接口保存 care 设置后，闸门立刻按新设置算', async () => {
   const app = await boot();
   try {
     // 一开始用默认配置（当前这个点大概不在窗内，先不假设）
     const before = await (await fetch(app.url + '/api/care/due?last=0&sentToday=0')).json();
     assert.ok(before.reason);
 
-    // 模拟调试台提交：全开时间窗 + 1 分钟一次
+    // 模拟设置接口提交：全开时间窗 + 1 分钟一次
     const save = await fetch(app.url + '/api/config', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       // 主动搭话现在默认关，这里显式打开再测「改了设置立刻生效」
-      body: JSON.stringify({ patch: { 'care.enabled': true, 'care.windows': ['00:00-24:00'], 'care.everyMinutes': 1, 'care.maxPerDay': 5 } }),
+      body: JSON.stringify({ patch: { 'care.enabled': true, 'care.onlyMaster': false, 'care.windows': ['00:00-24:00'], 'care.everyMinutes': 1, 'care.maxPerDay': 5 } }),
     });
     const saved = await save.json();
     assert.equal(saved.ok, true, '保存失败：' + JSON.stringify(saved));
@@ -254,4 +254,9 @@ test('桥接里接了定时器，且判断交给服务端', () => {
   assert.match(py, /\/api\/care['"]/, '内容要问服务端生成');
   assert.match(py, /CARE_QUIET_MIN/, '要有「刚聊过就别打扰」的静默期');
   assert.match(py, /care-state\.json/, '要记上次发的时间');
+  // 2026-11-08 21:35 现场：白名单里是 wxid，桥接拿它去搜会话，搜一轮十几秒，
+  // 连试几轮就像卡死。现在名字必须先换成昵称/备注，换不出来就不发。
+  assert.match(py, /ui_chat_name\(/, '会话名要经 ui_chat_name 换成人能搜到的昵称');
+  assert.match(py, /is_self_chat\(/, '白名单填了自己要改发文件传输助手');
+  assert.match(py, /文件传输助手/, '自己的 wxid 落到文件传输助手');
 });

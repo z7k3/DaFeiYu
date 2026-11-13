@@ -29,6 +29,87 @@ class ReceiverMixin:
             self._media_box['downloader'] = dl
             return dl
 
+    def self_identity_ids(self):
+        """所有能代表「自己」的内部 id：真 wxid、账号目录名、目录推出来的 wxid。"""
+        ids = set()
+        values = [getattr(self, 'me', ''), getattr(self, 'self_wxid', ''),
+                  getattr(getattr(self, 'db', None), 'wxid', ''),
+                  getattr(getattr(self, 'db', None), 'account', '')]
+        try:
+            values.append(G.account_wxid(getattr(self.db, 'account', '')))
+        except Exception:
+            pass
+        for value in values:
+            value = str(value or '').strip()
+            if value:
+                ids.add(value)
+        return ids
+
+    def self_mention_names(self, chat=''):
+        """当前「她」在群里可能被 @ 到的名字。
+
+        人设名 + 别名 + 账号昵称 + 账号备注 + 自己 wxid/账号目录，
+        再加群成员表里自己的昵称/备注。缓存 60 秒，避免每条消息都开库；
+        配置热重载会主动清缓存。改名后最多 60 秒自动跟上。
+        """
+        now = G.time.time()
+        cache = getattr(self, '_mention_cache', None)
+        if cache and cache.get('chat') == chat and now - float(cache.get('ts') or 0) < 60:
+            return cache['names']
+
+        info = {}
+        try:
+            info = self.db.get_self_info() or {}
+        except Exception:
+            info = {}
+        nick = str(info.get('nick_name') or '').strip()
+        remark = str(info.get('remark') or '').strip()
+        if nick and nick != getattr(self, '_self_nick', ''):
+            G.log('当前登录账号昵称已更新：', G.safe_name(nick))
+        if nick:
+            self._self_nick = nick
+        else:
+            nick = str(getattr(self, '_self_nick', '') or '').strip()
+
+        persona = (getattr(self, 'cfg', {}) or {}).get('persona') or {}
+        aliases = getattr(self, 'aliases', None) or []
+        group_names = []
+        if str(chat or '').endswith('@chatroom'):
+            ids = self.self_identity_ids()
+            try:
+                for member in self.db.get_group_members(chat) or []:
+                    if str(member.get('username') or '') in ids:
+                        group_names += [member.get('nick_name'), member.get('remark')]
+            except Exception:
+                pass
+
+        names = G.mention.build_names(
+            persona.get('name'), aliases, nick, remark, group_names,
+            sorted(self.self_identity_ids()),
+        )
+        self._mention_cache = {'chat': chat, 'ts': now, 'names': names}
+        if names and names != getattr(self, '_mention_logged', None):
+            self._mention_logged = list(names)
+            G.log('群聊称呼：%s' % (' / '.join(G.safe_name(x) for x in names[:10])))
+        return names
+
+    def is_latest_message(self, username, msg):
+        """这条是不是当前会话的最后一条。
+
+        只有是当前最后一条时，才让 WeChatAuto 走 ``quote_msg(target_text=None)`` 的「引用最近
+        一条」新路径（UIA 行控件 + 像素重心，图片/表情也能定位）。如果生成回复
+        期间又来了新消息，宁可不引用，也不要引用错人。
+        """
+        try:
+            latest = self.db.get_messages(username, limit=1)
+        except Exception:
+            return False
+        if not latest:
+            return False
+        cur = latest[0]
+        return (str(cur.get('local_id')) == str(msg.get('local_id'))
+                and str(cur.get('shard') or '') == str(msg.get('shard') or ''))
+
     def describe_image(self, msg):
         try:
             import base64
@@ -130,7 +211,7 @@ class ReceiverMixin:
             text = '\n'.join(texts).strip()
             if len(text) > 1200:
                 text = text[:1200] + '…'
-            G.log('图片识别：', text[:80])
+            G.log('图片识别：', G.safe_text(text))
             return text
         except Exception as e:
             if isinstance(msg, dict):
@@ -171,7 +252,7 @@ class ReceiverMixin:
                 G.log('表情包识图接口失败：', str(data.get('error') or '未知错误')[:160])
                 return ''
             text = str(data.get('text') or '').strip()[:1200]
-            G.log('表情包识别（%d帧）：' % frames, text[:80])
+            G.log('表情包识别（%d帧）：%s' % (frames, G.safe_text(text)))
             return text
         except Exception as exc:
             if isinstance(msg, dict):
@@ -230,7 +311,7 @@ class ReceiverMixin:
                 except Exception:
                     pass
             text = G.clean_transcript(text)
-            G.log('语音识别（%.1fs）：%s' % (seconds, text[:60] or '（空）'))
+            G.log('语音识别（%.1fs）：%s' % (seconds, G.safe_text(text) if text else '（空）'))
             return text
         except Exception as e:
             if isinstance(msg, dict):
@@ -260,7 +341,7 @@ class ReceiverMixin:
             if not who:
                 who = '群友' if username.endswith('@chatroom') else '微信好友'
             reason = msg.pop('_media_fail', None) or '空描述（识别结果为空）'
-            G.log_throttled('media-fail:%s:%s' % (msg_id, kind), '识别失败（这条不回话）：会话=%s 发送者=%s 类型=%s 消息id=%s 原因=%s' % (chat, who, kind, msg_id, reason), emit=G.log_error)
+            G.log_throttled('media-fail:%s:%s' % (msg_id, kind), '识别失败（这条不回话）：会话=%s 发送者=%s 类型=%s 消息id=%s 原因=%s' % (G.safe_id(chat), G.safe_name(who), kind, msg_id, reason), emit=G.log_error)
         try:
             username = msg.get('username') or ''
             if not username:
@@ -293,7 +374,7 @@ class ReceiverMixin:
             if mtype not in ('文本', '语音', '图片', '表情', '动画表情'):
                 if '移出群聊' in content or '移出' in content:
                     self.dead_chats.add(username)
-                    G.log('被移出群聊，停掉这个会话：', self.display_name(username))
+                    G.log('被移出群聊，停掉这个会话：', G.safe_name(self.display_name(username)))
                     return
                 _low = content.lower()
                 if 'finderfeed' in _low or '<type>51</type>' in _low or ('视频号' in content and '<url>' in _low):
@@ -330,22 +411,27 @@ class ReceiverMixin:
             if G.is_system_notice(username, nickname, content):
                 if G.ONLY_CHATS:
                     return
-                G.log('跳过系统通知：', nickname, '：', content[:24])
+                G.log('跳过系统通知：', G.safe_name(nickname), '：', G.safe_text(content))
                 return
             if G.duplicate_guard(username, sender, content):
-                G.log('跳过重复消息：', nickname, '：', content[:20])
+                G.log('跳过重复消息：', G.safe_name(nickname), '：', G.safe_text(content))
                 return
             if '拍了拍' in content and '<url>' not in content:
-                G.log('跳过拍一拍提示：', content[:24])
+                G.log('跳过拍一拍提示：', G.safe_text(content))
                 return
-            import re as _mention_re
-            _at_text = content.replace('\u2005', ' ')
-            addressed = any((a and _mention_re.search('@\\s*' + _mention_re.escape(str(a)) + '(?=$|[\\s，,：:！!~～…?？。\\-—])', _at_text) for a in self.aliases))
-            _at_remainder = _mention_re.sub('^[A-Za-z0-9_\\-]{4,}:\\s*', '', _at_text).strip()
-            for _alias in self.aliases:
-                if _alias:
-                    _at_remainder = _mention_re.sub('@\\s*' + _mention_re.escape(str(_alias)), ' ', _at_remainder)
-            _bare_mention = not _at_remainder.strip(' \t\r\n，,。.!！?？…~～')
+            _names = self.self_mention_names(username) if is_group else []
+            _mention = G.mention.analyze(
+                content, _names, self.display_name(username) if is_group else '')
+            addressed = bool(_mention['addressed'])
+            _structured = None
+            if is_group and '@' in content:
+                # 优先用 source 里的 atuserlist（wxid），昵称改名也不会漏；
+                # 读不到再退回显示名匹配。
+                _structured = G.mention_meta.self_mentioned(
+                    self.db, username, msg, self.self_identity_ids())
+                if _structured is not None:
+                    addressed = bool(_structured)
+            _bare_mention = _mention['bare_any'] if _structured else _mention['bare_self']
             if username.endswith('@chatroom') and addressed and _bare_mention:
                 try:
                     for m in self.db.get_messages(username, limit=12):
@@ -355,20 +441,34 @@ class ReceiverMixin:
                             continue
                         prev = G.fix_garbled((m.get('content') or '').strip())
                         prev = __import__('re').sub('^[A-Za-z0-9_\\-]{4,}:\\s*', '', prev).strip()
-                        if prev and (not any((a in prev for a in self.aliases))):
+                        # 上一条如果已经叫过她，就不是「裸 @ 补问题」的素材。
+                        # 这里必须用和 @ 解析同一套名字/归一化，不能用短别名的子串匹配。
+                        if prev and not G.mention.contains_name(prev, _names):
                             content = prev
-                            G.log('补上一条问题：', prev[:20])
+                            G.log('补上一条问题：', G.safe_text(prev))
                             break
                 except Exception as e:
                     G.log('补问题失败：', repr(e))
-            _mentioned_names = []
-            if is_group:
-                for _hit in _mention_re.findall('@\\s*([^\\s@，,：:！!~～…?？。—]+)', _at_text):
-                    _name = str(_hit).strip()
-                    if _name and _name not in self.aliases and (_name not in _mentioned_names):
-                        _mentioned_names.append(_name)
-            G.log('收到', '群' if is_group else '私聊', self.display_name(username), '←', nickname, '（%d 字）' % len(content))
-            payload = {'chat_id': username, 'chat_type': 'group' if is_group else 'private', 'user_id': sender or 'unknown', 'senderId': sender or 'unknown', 'sender_id': sender or 'unknown', 'senderName': nickname, 'nickname': nickname, 'text': content, 'msg_id': '%s:%s:%s' % (username, msg.get('shard') or '', msg.get('local_id')), 'at_me': addressed, 'mentioned_names': _mentioned_names, 'chat_title': self.display_name(username) if is_group else ''}
+            _mentioned_names = list(_mention['mentioned_names'])
+            if is_group and not addressed and '@' in content:
+                # 同一组「@对象」在每个群只提醒一次，避免正常 @ 别人也刷屏。
+                # 这次「@许愿 被跳过」如果留着这条日志，一眼就能看到称呼表不对。
+                G.log_throttled(
+                    'mention-miss:%s:%s' % (
+                        username, ','.join(sorted(_mentioned_names[:4])) or '?'),
+                    '群消息含 @ 但没认出是叫我：@对象=%s 当前称呼=%s 会话=%s 消息id=%s:%s'
+                    % (','.join(G.safe_name(x) for x in _mentioned_names[:4]) or '-',
+                       ','.join(G.safe_name(x) for x in _names[:6]) or '-',
+                       G.safe_id(username), msg.get('shard') or '', msg.get('local_id')),
+                )
+            G.log('收到', '群' if is_group else '私聊', G.safe_name(self.display_name(username)), '←', G.safe_name(nickname), '（%d 字）' % len(content))
+            # 给内核的只放显示名；wxid/账号目录只参与 @ 元数据判断，别拿去匹配正文。
+            try:
+                _ids = self.self_identity_ids()
+            except Exception:
+                _ids = set()
+            _payload_names = [n for n in (_names or []) if n not in _ids]
+            payload = {'chat_id': username, 'chat_type': 'group' if is_group else 'private', 'user_id': sender or 'unknown', 'senderId': sender or 'unknown', 'sender_id': sender or 'unknown', 'senderName': nickname, 'nickname': nickname, 'text': content, 'msg_id': '%s:%s:%s' % (username, msg.get('shard') or '', msg.get('local_id')), 'at_me': addressed, 'mentioned_names': _mentioned_names, 'self_names': _payload_names, 'chat_title': self.display_name(username) if is_group else ''}
             try:
                 headers = {'x-whale-bridge': '1'}
                 if self.token:
@@ -394,19 +494,29 @@ class ReceiverMixin:
                     if G.CONN_STATE.get('ok') is not False:
                         G.CONN_STATE['ok'] = False
                 else:
-                    G.log_throttled('webhook-fail:' + _msg[:40], '请求鲸鲸失败：', _msg)
+                    G.log_throttled(
+                        'webhook-fail:' + _msg[:40],
+                        '请求鲸鲸失败：会话=%s 消息id=%s:%s:%s 原因=%s'
+                        % (G.safe_name(self.display_name(username)), msg.get('shard') or '',
+                           msg.get('local_id'), type(e).__name__, _msg[:120]),
+                    )
                 return
             if G.CONN_STATE.get('ok') is not True:
                 G.CONN_STATE['ok'] = True
                 G.log('已连上鲸鲸服务：', self.bot_url.rsplit('/webhook', 1)[0])
             if data.get('action') != 'reply' or not data.get('reply'):
-                if is_group and addressed:
-                    G.log('鲸鲸没接话：', nickname, '| 原因:', data.get('reason'), '| %d 字' % len(content))
+                # 私聊也要留一条：否则“为什么没回”在日志里完全空白。
+                G.log_throttled(
+                    'no-reply:%s:%s' % (username, msg.get('local_id')),
+                    '鲸鲸没接话：%s 会话=%s 消息id=%s:%s 原因=%s 字数=%d'
+                    % (G.safe_name(nickname), G.safe_id(self.display_name(username)), msg.get('shard') or '',
+                       msg.get('local_id'), data.get('reason'), len(content)),
+                )
                 return
             if data.get('mock') and (not G.MOCK_NOTICED['done']):
                 G.MOCK_NOTICED['done'] = True
                 G.log('[!] 服务端现在是「演示模式」：没配置 API Key，她回的是内置台词，不是真模型。')
-                G.log('    去网页右上角「设置」填一把 Key（DeepSeek / 智谱 都行）就会切成真模型。')
+                G.log('    去启动器「设置」填一把 Key（DeepSeek / 智谱 都行）就会切成真模型。')
             target = self.display_name(username)
             bubbles = data.get('bubbles')
             if not isinstance(bubbles, list):
@@ -416,7 +526,7 @@ class ReceiverMixin:
                 bubbles = [str(data['reply'])]
             mention = str(data.get('mention') or '').strip()
             if not G.rate_guard(username):
-                G.log('这一分钟回太多了，先停一下：', target)
+                G.log('这一分钟回太多了，先停一下：', G.safe_name(target))
                 return
             if data.get('stickerOnly') is True:
                 sticker = data.get('sticker')
@@ -448,11 +558,13 @@ class ReceiverMixin:
                         first = False
                         G.time.sleep(0.6)
                         continue
-                    G.log('真 @ 失败，退回普通文本：', mention)
+                    G.log('真 @ 失败，退回普通文本：', G.safe_name(mention))
                     if not line.startswith('@'):
                         line = '@%s %s' % (mention, line)
-                quote_text = content if first and G.QUOTE_REPLY and data.get('commandType') != 'admin_spell' else None
-                if not self.send_text(line, target, username, quote_text=quote_text):
+                quote_latest = bool(first and G.QUOTE_REPLY
+                                    and data.get('commandType') != 'admin_spell'
+                                    and self.is_latest_message(username, msg))
+                if not self.send_text(line, target, username, quote_latest=quote_latest):
                     G.log('[delivery] stage=text result=failed reason=send_failed remainingBubbles=cancelled stickers=cancelled')
                     return
                 first = False
@@ -486,7 +598,7 @@ class ReceiverMixin:
             return [run[-1]]
         merged['content'] = '\n'.join(parts)
         merged['local_id'] = '|'.join(ids)
-        G.log('合并 %d 条连发消息一起回：%s' % (len(run), ' / '.join(parts)[:60]))
+        G.log('合并 %d 条连发消息一起回：%s' % (len(run), G.safe_text(' / '.join(parts))))
         return [merged]
 
     def flush_chat(self, chat, listener):
@@ -518,7 +630,7 @@ class ReceiverMixin:
             if create_time and create_time < G.START_TS - G.SKIP_OLDER_THAN:
                 return
             if create_time and G.time.time() - create_time > G.STALE_AFTER:
-                G.log('跳过过期消息（%.0fs 前）：%s' % (G.time.time() - create_time, (msg.get('content') or '')[:20]))
+                G.log('跳过过期消息（%.0fs 前）：%s' % (G.time.time() - create_time, G.safe_text(msg.get('content') or '')))
                 return
             chat = username or 'unknown'
             if self.batches.push(chat, msg):

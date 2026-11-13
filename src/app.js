@@ -24,8 +24,13 @@ const personaStore = require('./persona/store');
 const { StickerService } = require('./services/stickerService');
 const stickersAdapter = require('./adapters/stickers');
 const probe = require('./infra/probe');
+const { Scheduler } = require('./infra/scheduler');
 const { ContactsCache } = require('./services/contacts');
+const { MomentsService } = require('./services/moments');
+const { MomentsPublisher } = require('./services/momentsPublisher');
 const { ReminderService } = require('./services/reminderService');
+const { DiaryService } = require('./services/diary');
+const { DigestService } = require('./services/digest');
 const locationProbe = require('./services/location');
 
 const VERSION = require('../package.json').version;
@@ -52,7 +57,7 @@ function createRuntime({ root = path.resolve(__dirname, '..'), env = process.env
   // 放到 listen 之后再开会永远看不到那 10 秒。默认关，WHALE_PROBE_LOOP=1 才启动。
   const loopProbe = probe.startEventLoopProbe(logger);
   // 配置体检：非法值以前会被各处的 `Number(x) || 默认` 静默吃掉，
-  // 用户在调试台填错了也看不出来。这里启动时报一次，不阻断运行。
+  // 用户在启动器或 config.json 里填错了也看不出来。这里启动时报一次，不阻断运行。
   try {
     const configErrors = configSchema.validate(config);
     if (configErrors.length) {
@@ -83,7 +88,7 @@ function createRuntime({ root = path.resolve(__dirname, '..'), env = process.env
   // 每次启动留一份记忆快照：换目录/重装/误点重置都能捞回来
   try {
     const snap = features.isOn(config, 'memorySnapshot') ? memoryBackup.writeSnapshot(root, 'startup') : null;
-    if (snap) logger.info('记忆快照：' + snap);
+    if (snap) logger.info('记忆快照：' + path.basename(String(snap)));
   } catch (err) {
     logger.warn('记忆快照失败（不影响使用）：' + describeError(err));
   }
@@ -98,28 +103,41 @@ function createRuntime({ root = path.resolve(__dirname, '..'), env = process.env
       if (mc.removed) logger.info(`媒体缓存清理：删 ${mc.removed} 个文件，释放 ${mc.freedMB} MB`);
     }
   } catch (err) {
-    logger.warn('媒体缓存清理失败（不影响使用）：' + err.message);
+    logger.warn('媒体缓存清理失败（不影响使用）：' + describeError(err));
   }
 
   const runtime = { config, logger, store, startedAt: Date.now(), version: VERSION, loopProbe };
   runtime.child = child;
+  // 进程内定时任务统一入口：日记 tick、记忆快照、朋友圈定时读取共用，
+  // 关服务只需要 stopAll；请求超时/桥接轮询不归它管。
+  runtime.scheduler = new Scheduler({ logger: child('scheduler') });
 
   // 长时间挂着也要有断点：每 30 分钟留一份（启动那份可能已经是几十小时前了）
   try {
-    const timer = setInterval(() => {
-      try {
-        if (!features.isOn(runtime.config, 'memorySnapshot')) return;
-        const file = memoryBackup.writeSnapshot(root, 'cron');
-        if (file) logger.info('记忆快照（定时）：' + file);
-      } catch (err) {
-        logger.warn('定时记忆快照失败：' + describeError(err));
-      }
-    }, 30 * 60 * 1000);
-    if (timer.unref) timer.unref();
-    runtime.snapshotTimer = timer;
+    runtime.scheduler.every('memory.snapshot', 30 * 60 * 1000, () => {
+      if (!features.isOn(runtime.config, 'memorySnapshot')) return;
+      const file = memoryBackup.writeSnapshot(root, 'cron');
+      if (file) logger.info('记忆快照（定时）：' + path.basename(String(file)));
+    });
   } catch { /* 定时器起不来不影响主流程 */ }
 
   runtime.llm = new DeepSeekClient({ config, logger: child('llm') });
+  runtime.diary = new DiaryService(config, {
+    store,
+    llm: runtime.llm,
+    logger: child('diary'),
+    scheduler: runtime.scheduler,
+    // 日记写完要发给主人时，借用提醒的主动发送队列；runtime.reminders 在下面才创建，
+    // 所以这里用闭包延迟取，真正发日记时它已经存在。
+    enqueue: (item) => runtime.reminders.enqueueNow(item),
+  });
+  runtime.diary.start();
+  // 消息汇总：用户在启动器点「生成」时才跑，不占后台定时器，也不自动烧 token。
+  runtime.digest = new DigestService(config, {
+    store,
+    llm: runtime.llm,
+    logger: child('digest'),
+  });
   // 记忆层用同一个模型做 episode 摘要/抽取（后台跑，不在回复热路径）
   store.llm = runtime.llm;
   // 判定链：为什么回 / 为什么不回。默认只记原因和状态；正文在 data/trace/raw 里留 24 小时，
@@ -131,12 +149,14 @@ function createRuntime({ root = path.resolve(__dirname, '..'), env = process.env
   });
   runtime.trace = trace;
   runtime.bot = new Bot({ config, store, llm: runtime.llm, logger: child('pipeline'), trace, version: VERSION });
+  // 主人问起日记时，聊天模型通过 [[diary:日期]] 标记读取；不给它直接塞全文。
+  runtime.bot.diary = runtime.diary;
   // 本机所在地：后台探一次（Windows 定位服务优先，挂 VPN 也准），之后定期刷新。
   // 只放在内存里，给 <env> 块用；关掉 features.envContext 或 env.autoDetect=false 就完全不动。
   try {
     runtime.stopLocationProbe = locationProbe.startAutoProbe(config, { logger: child('env') });
   } catch (err) {
-    logger.warn('所在地探测没起来（不影响聊天）：' + ((err && err.message) || err));
+    logger.warn('所在地探测没起来（不影响聊天）：' + describeError(err));
   }
   // 表情包任务队列：内存态，重启不重放（避免把上一条没发出去的表情再补发一次）
   // store 用来记动作账：发了哪张、桥接确认没确认，下一轮提示词才看得见
@@ -145,6 +165,18 @@ function createRuntime({ root = path.resolve(__dirname, '..'), env = process.env
   runtime.bot.stickerService = runtime.stickerService;
   // 联系人缓存：桥接推上来的 wxid 清单，给启动器选择器和 care 白名单用
   runtime.contacts = new ContactsCache(config, { logger: child('contacts') });
+  runtime.moments = new MomentsService({
+    dir: path.join(config.paths.dataDir, 'moments'),
+    logger: child('moments'),
+    llm: runtime.llm,
+    config,
+    scheduler: runtime.scheduler,
+  });
+  runtime.bot.moments = runtime.moments;
+  runtime.moments.startAutoRead();
+  runtime.momentsPublisher = new MomentsPublisher({
+    config, store, llm: runtime.llm, logger: child('moments'),
+  });
   // 提醒：到点由桥接来取（/api/reminders/due），这里只管存和状态
   runtime.reminders = new ReminderService(config, {
     logger: child('reminder'),
@@ -168,7 +200,7 @@ function createRuntime({ root = path.resolve(__dirname, '..'), env = process.env
     const swept = runtime.reminders.sweepStale();
     if (swept.expired) logger.info(`提醒清理：${swept.expired} 条已过期（过了提醒时间，不再补发）`);
   } catch (err) {
-    logger.warn('提醒清理失败（不影响使用）：' + err.message);
+    logger.warn('提醒清理失败（不影响使用）：' + describeError(err));
   }
   // 启动：检测 30 分钟空闲的 episode 补写 L2；超过 3,200 token 的按需压缩。
   // 后台跑，不阻塞服务启动；原文已经在磁盘上，补写失败也只是晚一轮。

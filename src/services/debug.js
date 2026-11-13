@@ -10,21 +10,24 @@ const context = require('../core/context');
 const { estimateTokens } = require('../memory/tokens');
 const { recentSenders, budgetSnapshot } = require('./status');
 const envInfo = require('./envInfo');
+const time = require('../infra/time');
 
-// 程序版本：调试台的 system 预览要跟真实发出去的一致，环境块里也有版本号
+// 程序版本：启动器诊断页的 system 预览要跟真实发出去的一致，环境块里也有版本号
 const VERSION = require('../../package.json').version;
 
-function debugState(runtime) {
+function debugState(runtime, { now = Date.now() } = {}) {
   const { config, llm, gateways, store } = runtime;
   const rt = resolveRuntime(config);
-  const now = new Date();
-  const mood = persona.moodFor(now);
+  // 诊断页要跟真实提示词看同一个「现在」：人设按 env.timezone 换了墙上时间，
+  // 这里如果还用系统本地时间，时区一改就会出现「预览和实际不一样」。
+  const at = time.zonedDate(Number(now) || Date.now(), time.resolveTimeZone(config));
+  const mood = persona.moodFor(at);
   const master = (config.persona && config.persona.master) || {};
   return {
     ok: true,
-    nowLabel: `${persona.timeLabel(now)} ${['周日', '周一', '周二', '周三', '周四', '周五', '周六'][now.getDay()]}`,
+    nowLabel: `${persona.timeLabel(at)} ${['周日', '周一', '周二', '周三', '周四', '周五', '周六'][at.getDay()]}`,
     mood: { name: mood.name, hint: mood.hint },
-    activity: persona.activityFor(now),
+    activity: persona.activityFor(at),
     persona: {
       name: config.persona.name,
       aliases: config.persona.aliases || [],
@@ -32,7 +35,7 @@ function debugState(runtime) {
       master: {
         names: master.names || [],
         wxids: master.wxids || [],
-        // 填错了（比如把微信号当 wxid）的时候，调试台直接说出来，别让人瞎猜
+        // 填错了（比如把微信号当 wxid）的时候，启动器诊断页直接说出来，别让人瞎猜
         warnings: masterWarnings(config),
       },
     },
@@ -93,7 +96,7 @@ function debugState(runtime) {
 function debugSessions(runtime) {
   const list = [];
   for (const chat of runtime.store.chatStore.chats.values()) {
-    // 调试台只给计数，不给记忆正文（用户看不到任何记忆）
+    // 诊断页只给计数，不给记忆正文（用户看不到任何记忆）
     let people = 0;
     let events = 0;
     for (const card of chat.people.values()) {
@@ -124,7 +127,7 @@ async function debugPrompt(runtime, body) {
   const chatType = body.chatType === 'group' ? 'group' : 'private';
   const chatTitle = String(body.chatTitle || '').trim();
   const text = String(body.text || '');
-  // 和微信里真正跑消息时用同一个判定（src/core/master.js），否则调试台会「说认了、实际没认」
+  // 和微信里真正跑消息时用同一个判定（src/core/master.js），否则诊断页会「说认了、实际没认」
   const masterHit = matchMaster(config, { platform: 'wechat', senderId, senderName });
   const isMaster = masterHit.isMaster;
 
@@ -133,7 +136,11 @@ async function debugPrompt(runtime, body) {
     const urls = links.extractUrls(text);
     if (urls.length) {
       try {
-        linkText = links.formatForPrompt(await links.describeLink(urls[0]));
+        linkText = links.formatForPrompt(await links.describeLink(urls[0], {
+          timeoutMs: (runtime.config.links && runtime.config.links.timeoutMs) || 6000,
+          cacheMinutes: (runtime.config.links && runtime.config.links.cacheMinutes) || 60,
+          allowPrivate: Boolean(runtime.config.links && runtime.config.links.allowPrivate),
+        }));
       } catch {
         linkText = `对方发了一个链接（${urls[0]}），但读取失败。`;
       }
@@ -144,7 +151,7 @@ async function debugPrompt(runtime, body) {
   const msg = { platform: 'wechat', chatType, senderName, chatTitle, isMaster, linkText, text, ts: now.getTime() };
   // system 只放静态块；每轮会变的东西（说话人、时间、字数、梗、链接、联网…）在 tail 里，
   // 真发请求时 tail 挂在最后一条 user 消息后面。这里两块分开返回，方便对照。
-  // 环境块也按真实配置拼一份带进来，调试台看到的 system 跟实际发出的才是同一份。
+  // 环境块也按真实配置拼一份带进来，诊断页看到的 system 跟实际发出的才是同一份。
   const parts = persona.buildPromptParts({
     config,
     msg,
@@ -153,7 +160,13 @@ async function debugPrompt(runtime, body) {
     now,
     envBlock: envInfo.systemBlock(config, VERSION),
   });
-  const turns = context.buildTurns({ ...msg, cleanText: text }, [], '', parts.tail);
+  const turns = context.buildTurns(
+    { ...msg, cleanText: text },
+    [],
+    '',
+    parts.tail,
+    time.resolveTimeZone(config)
+  );
   const prompt = parts.system + '\n\n' + turns.map((t) => t.content).join('\n\n');
   return {
     ok: true,
@@ -162,7 +175,7 @@ async function debugPrompt(runtime, body) {
     system: parts.system,
     tail: parts.tail,
     turns,
-    // 拼装后模型真正看到的东西（system + 历史 + 尾部），测试和调试台都看这个
+    // 拼装后模型真正看到的东西（system + 历史 + 尾部），测试和诊断页都看这个
     prompt,
     systemTokens: estimateTokens(parts.system),
     tailTokens: estimateTokens(parts.tail),

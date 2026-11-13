@@ -81,14 +81,16 @@ if (release) {
 // 5) 版本号与 CHANGELOG 首条一致
 try {
   const pkg = JSON.parse(read('package.json'));
-  const cl = read('CHANGELOG.md');
+  const cl = read('docs/CHANGELOG.md');
   const m = cl.match(/^##\s*([0-9]+\.[0-9]+(?:\.[0-9]+){0,2})/m);
   check('package.json 版本 = CHANGELOG 最新条目', Boolean(m) && m[1] === pkg.version,
     `package=${pkg.version} changelog=${m ? m[1] : '没找到'}`);
 
   // 6) 一个改动 = 一个版本号：不允许重复版本 / 跳号 / 空条目
-  const heads = [...cl.matchAll(/^##\s*((\d+)\.(\d+)(?:\.(\d+)(?:\.\d+)?)?)\s*$/gm)].map((x) => ({
-    raw: x[1], maj: Number(x[2]), min: Number(x[3]), pat: Number(x[4] || 0), at: x.index }));
+  const heads = [...cl.matchAll(/^##\s*([0-9]+)\.([0-9]+)(?:\.([0-9]+))?(?:\.([0-9]+))?\s*$/gm)].map((x) => ({
+    raw: x[1] + '.' + x[2] + (x[3] === undefined ? '' : '.' + x[3]) + (x[4] === undefined ? '' : '.' + x[4]),
+    maj: Number(x[1]), min: Number(x[2]), pat: x[3] === undefined ? 0 : Number(x[3]),
+    hot: x[4] === undefined ? 0 : Number(x[4]), at: x.index }));
   const seen = new Map();
   const dupes = [];
   for (const h of heads) {
@@ -117,6 +119,26 @@ try {
     if (!body) empty.push(heads[i].raw);
   }
   check('每个版本都有说明内容', empty.length === 0, empty.length ? '空条目：' + empty.join(', ') : '');
+
+  // 6.1) 版本号升级类型必须和内容匹配：
+  //   第二位 = 新功能；第三位 = 修复/改进；第四位 = 紧急热修。
+  const latest = heads[0];
+  const prev = heads[1];
+  if (latest && prev && latest.raw === pkg.version) {
+    const latestBody = cl.slice(latest.at, prev.at);
+    const hasNew = /^###\s*新增/m.test(latestBody);
+    if (latest.raw.split('.').length >= 4) {
+      const sameBase = latest.maj === prev.maj && latest.min === prev.min && latest.pat === prev.pat;
+      check('紧急热修版本必须跟在同一条已发布版本后', sameBase,
+        sameBase ? `${latest.raw} ← ${prev.raw}` : `${latest.raw} 的热修基线应是 ${latest.maj}.${latest.min}.${latest.pat}，当前上一条是 ${prev.raw}`);
+    } else if (latest.maj > prev.maj || latest.min > prev.min) {
+      check('次版本号只用于新增功能', hasNew,
+        hasNew ? '' : `${latest.raw} 升了次版本，但 CHANGELOG 没有「新增」小节`);
+    } else if (latest.pat > prev.pat) {
+      check('补丁版本只放修复 / 改进', !hasNew,
+        hasNew ? `${latest.raw} 里有「新增」，请升次版本号（例如 4.0→4.1）` : '');
+    }
+  }
 
   // 7) 版本号必须在台面上可见：包名与启动横幅
   try {
@@ -155,7 +177,7 @@ try {
 
 // 9) 不能把自己的隐私带进包里：密钥、真实 wxid、账号目录名、群号、手机号、邮箱、
 //    本机用户名路径，以及 exe/dll 里的调试路径。
-//    这些以前都漏过：BUGS.md 写了真实路径、真实小号目录名进了测试、带 PDB 路径的 exe
+//    这些以前都漏过：docs/BUGS.md 写了真实路径、真实小号目录名进了测试、带 PDB 路径的 exe
 //    进了仓库。规则与遍历统一收在 scripts/privacy-scan.js，这里只把它接进自检。
 try {
   const privacy = require('./privacy-scan');

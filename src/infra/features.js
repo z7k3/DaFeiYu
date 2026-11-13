@@ -78,6 +78,14 @@ const REGISTRY = [
     default: true,
   },
   {
+    key: 'momentsPublish',
+    path: 'moments.publishFeatureEnabled',
+    label: '朋友圈发表总开关（实验性）',
+    desc: '默认关闭。开启后可以测试发表，也可以单独设置定时发表。',
+    default: false,
+    experimental: true,
+  },
+  {
     key: 'careOnlyMaster',
     path: 'care.onlyMaster',
     label: '主动搭话只找主人',
@@ -102,8 +110,8 @@ const REGISTRY = [
     key: 'proactiveCare',
     path: 'care.enabled',
     label: '主动找话题（群聊里绝不主动）',
-    desc: '没聊的时候她自己来一句「在干啥」。默认关：群里突然说早安很容易社死。开着也只私聊，不会进群。',
-    default: false,
+    desc: '没聊的时候她自己来一句「在干啥」。默认开但只私聊，不会进群；群里突然说早安很容易社死。',
+    default: true,
   },
   {
     key: 'quoteReply',
@@ -133,7 +141,7 @@ function isOn(config, key) {
   return toBool(getByPath(config, f.path), f.default);
 }
 
-/** 给控制台看的：所有开关 + 当前值 */
+/** 给启动器和接口看的：所有开关 + 当前值 */
 function list(config) {
   return REGISTRY.map((f) => ({
     key: f.key,

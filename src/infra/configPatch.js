@@ -5,6 +5,8 @@ const path = require('node:path');
 const { loadConfig, DEFAULT_CONFIG } = require('./config');
 const configSchema = require('./configSchema');
 const { getByPath } = require('./objpath');
+const time = require('./time');
+const { describeError } = require('./errors');
 
 /* ------------------------------------------------------------------ */
 /* 设置接口：直接读写 config.json（改完立刻生效，不用重启）            */
@@ -12,12 +14,14 @@ const { getByPath } = require('./objpath');
 
 // 这些路径设置接口会写进 data/settings.json，而它的优先级高于 config.json
 const SETTINGS_SHADOW = {
-  provider: ['provider'],
-  'deepseek.provider': ['provider'],
+  // 切服务商时旧 Key/地址/模型不能继续盖住新 provider，否则会拿 A 的 Key 打 B。
+  provider: ['provider', 'apiKey', 'baseUrl', 'model', 'thinking'],
+  'deepseek.provider': ['provider', 'apiKey', 'baseUrl', 'model', 'thinking'],
   'deepseek.apiKey': ['apiKey'],
   'deepseek.baseUrl': ['baseUrl'],
   'deepseek.model': ['model'],
   'deepseek.temperature': ['temperature'],
+  'deepseek.thinking': ['thinking'],
   'deepseek.mock': ['mock'],
   'persona.ownerName': ['userName'],
 };
@@ -28,7 +32,6 @@ const SECRET_PATHS = new Set([
   'vision.apiKey',
   'voice.apiKey',
   'gateway.wechat.inboundToken',
-  'gateway.douyin.inboundToken',
   'admin.spell',
 ]);
 
@@ -78,10 +81,38 @@ function coerceValue(config, dotted, value) {
   return String(value);
 }
 
+/**
+ * 时间类字段统一在这里落成规范形式：
+ * - diary.time：9:00 → 09:00
+ * - care.windows：09:00~12:00、09:00到12:00 → 09:00-12:00
+ * 非法值不在这里改，交给 configSchema 报错，避免“静默变成默认值”。
+ */
+function normalizeBySpec(value, spec) {
+  if (!spec) return value;
+  if (spec.type === 'clock') {
+    const minutes = time.parseClock(value);
+    return minutes === null ? value : time.formatClock(minutes);
+  }
+  if (spec.type === 'windows') {
+    if (time.invalidWindows(value).length) return value;
+    return time.normalizeWindows(value);
+  }
+  if (spec.type === 'timezone') return String(value == null ? '' : value).trim();
+  return value;
+}
+
 /** 给界面看的配置：去掉内部字段，密钥留空但告诉它「配没配」 */
 function publicConfig(config) {
   const internal = new Set(['env', 'paths', 'root', 'configExists', 'configError']);
   const out = JSON.parse(JSON.stringify(config, (k, v) => (internal.has(k) ? undefined : v)));
+  // env 是「进程环境变量 + config.json 的 env 段」的合体，不能整份吐给界面；
+  // 但时区/地点是用户设置，必须让设置页读得到。只回这三个安全字段。
+  const envCfg = (config && config.env) || {};
+  out.env = {
+    location: String(envCfg.location || ''),
+    timezone: String(envCfg.timezone || ''),
+    autoDetect: envCfg.autoDetect !== false,
+  };
   const secrets = {};
   for (const p of SECRET_PATHS) {
     const v = getByPath(config, p);
@@ -118,7 +149,13 @@ function clearSettingsShadow(runtime, paths) {
     }
   }
   if (cleared.length) {
-    try { fs.writeFileSync(file, JSON.stringify(cur, null, 2), 'utf8'); } catch { /* 写不了就算了 */ }
+    try {
+      fs.writeFileSync(file, JSON.stringify(cur, null, 2), 'utf8');
+    } catch (err) {
+      runtime.logger?.error?.('清理 settings.json 覆盖项失败：' + describeError(err));
+      // 没真正清掉就返回空，调用方不会假装“已清掉旧覆盖项”。
+      return [];
+    }
   }
   return cleared;
 }
@@ -131,7 +168,23 @@ function clearSettingsShadow(runtime, paths) {
  */
 function mergeConfigInPlace(target, src) {
   for (const [key, value] of Object.entries(src || {})) {
-    if (key === 'paths' || key === 'env' || key === 'root' || key === 'configExists') continue;
+    if (key === 'paths' || key === 'root' || key === 'configExists') continue;
+    // 配置来自可编辑的 config.json / 接口 patch：__proto__ 这类键会把原型链改掉。
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+    // env 比较特殊：它是「进程环境变量（原型）+ config.json 的 env 段（自有键）」。
+    // 不能整段跳过，否则启动器把 env.timezone 存进 config.json 后运行时读不到；
+    // 也不能整段替换，否则会丢掉 process.env 的原型视图。只同步自有键。
+    if (key === 'env') {
+      if (!isPlainObject(target.env)) target.env = {};
+      for (const envKey of Object.keys(target.env)) {
+        if (!Object.prototype.hasOwnProperty.call(value || {}, envKey)) delete target.env[envKey];
+      }
+      for (const [envKey, envValue] of Object.entries(value || {})) {
+        if (envKey === '__proto__' || envKey === 'constructor' || envKey === 'prototype') continue;
+        target.env[envKey] = envValue;
+      }
+      continue;
+    }
     const cur = target[key];
     const both = isPlainObject(value) && isPlainObject(cur);
     if (both) mergeConfigInPlace(cur, value);
@@ -145,7 +198,17 @@ function reloadRuntimeConfig(runtime) {
   // 人设另存在 persona.json；重载时必须与启动时一样合并，否则改称呼会把名字盖回默认。
   const personaStore = require('../persona/store');
   personaStore.apply(next, personaStore.load(next));
-  return mergeConfigInPlace(runtime.config, next);
+  const result = mergeConfigInPlace(runtime.config, next);
+  // 预算/关系开关是记忆裁剪的输入，热更新后必须让 Store 重算 plan。
+  try { runtime.store?.replan?.(runtime.config); } catch { /* 预算重算失败不阻断配置保存 */ }
+  // envContext 从关到开时，启动时跳过的地点探测要重新启动。
+  try {
+    if (runtime.stopLocationProbe) runtime.stopLocationProbe();
+    const locationProbe = require('../services/location');
+    runtime.stopLocationProbe = locationProbe.startAutoProbe(runtime.config, { logger: runtime.logger });
+  } catch { /* 探测失败不影响对话 */ }
+  runtime.momentsPublisher?.reconcile();
+  return result;
 }
 
 /**
@@ -195,8 +258,8 @@ function applyConfigPatch(runtime, patch) {
     if (!p) continue;
     // 密钥留空 = 不改（界面上看不到已存的 Key，不能一保存就把它清了）
     if (SECRET_PATHS.has(p) && p !== 'admin.spell' && (value === '' || value === null || value === undefined)) continue;
-    const next = coerceValue(runtime.config, p, value);
     const spec = configSchema.FIELDS[p];
+    const next = normalizeBySpec(coerceValue(runtime.config, p, value), spec);
     if (spec) {
       const message = configSchema.checkValue(next, spec);
       if (message) {
@@ -217,6 +280,8 @@ function applyConfigPatch(runtime, patch) {
   fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8');
   const cleared = clearSettingsShadow(runtime, changed);
   reloadRuntimeConfig(runtime);
+  // 定时任务里只有朋友圈读取的间隔来自配置；配置一改就重排，别等重启。
+  runtime.moments?.startAutoRead?.();
   runtime.stickerService?.reconcile();
   if (runtime.llm && typeof runtime.llm.reload === 'function') runtime.llm.reload();
   runtime.logger.info(`设置接口保存了配置：${changed.join('、')}${cleared.length ? `（同时清了 ${cleared.join('、')}，让改动真的生效）` : ''}`);
@@ -274,11 +339,12 @@ function watchConfigFile(runtime) {
           const raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
           JSON.parse(raw); // 先确认是合法 JSON，写坏了就别覆盖内存里的好配置
           reloadRuntimeConfig(runtime);
+          runtime.moments?.startAutoRead?.();
           runtime.stickerService?.reconcile();
                   if (runtime.llm && typeof runtime.llm.reload === 'function') runtime.llm.reload();
           runtime.logger.info('config.json 已重新加载（改动已生效，不用重启）');
         } catch (err) {
-          runtime.logger.warn(`config.json 改了但没读成功，先按老配置跑：${err && err.message}`);
+          runtime.logger.warn('config.json 改了但没读成功，先按老配置跑：' + describeError(err));
         }
       }, 250);
     });
@@ -286,14 +352,14 @@ function watchConfigFile(runtime) {
     // 目录被删/改名时 fs.watch 会 emit('error')，不接住就会把整个进程带崩
     // （沙箱/临时目录里实测：EPERM 直接 throw）。监听失效不该影响服务本身。
     watcher.on?.('error', (err) => {
-      runtime.logger.warn(`停止监听 config.json（${err && err.message}）；手动改完请重启服务`);
+      runtime.logger.warn('停止监听 config.json（' + describeError(err) + '）；手动改完请重启服务');
       try { watcher.close(); } catch { /* ignore */ }
       runtime.configWatcher = null;
     });
     runtime.configWatcher = watcher;
     runtime.stopConfigWatch = () => { if (timer) clearTimeout(timer); timer = null; watcher.close(); };
   } catch (err) {
-    runtime.logger.warn(`监听 config.json 失败（手动改完记得重启服务）：${err && err.message}`);
+    runtime.logger.warn('监听 config.json 失败（手动改完记得重启服务）：' + describeError(err));
   }
 }
 
@@ -310,8 +376,8 @@ function saveConfigPatch(config, patch) {
   const pending = [];
   const errors = [];
   for (const [dotted, value] of Object.entries(patch)) {
-    const next = coerceValue(config, dotted, value);
     const spec = configSchema.FIELDS[dotted];
+    const next = normalizeBySpec(coerceValue(config, dotted, value), spec);
     if (spec) {
       const message = configSchema.checkValue(next, spec);
       if (message) { errors.push(dotted + '：' + message); continue; }
@@ -334,13 +400,11 @@ function saveConfigPatch(config, patch) {
       );
     }
   }
-  for (const [dotted, next] of pending) {
-    setByPath(raw, dotted, next);
-    // 立刻改内存里的那份（bot / llm 拿的都是同一个 config 引用）
-    setByPath(config, dotted, next);
-  }
+  for (const [dotted, next] of pending) setByPath(raw, dotted, next);
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  // 先落盘成功，再改进程内存；磁盘失败时不能留下“内存新值、磁盘旧值”。
   fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+  for (const [dotted, next] of pending) setByPath(config, dotted, next);
   return pending.map(([dotted]) => dotted);
 }
 
