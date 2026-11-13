@@ -98,7 +98,12 @@ async function cnSearchCities(name, opts = {}) {
     .filter(x => x && typeof x.ref === 'string')
     .map(x => {
       const parts = x.ref.split('~');
-      return { code: String(parts[0] || ''), label: String(parts[2] || '').trim() };
+      return {
+        code: String(parts[0] || ''),
+        label: String(parts[2] || '').trim(),
+        // ref 结构：code~pinyin~name~en~name~en~areacode~zip~abbr~省份
+        province: String(parts[9] || '').trim(),
+      };
     })
     .filter(x => /^\d{9}(\d{3})?$/.test(x.code));
 }
@@ -155,6 +160,20 @@ async function cnCityCode(city, opts = {}) {
     });
   }
   if (!pool.length) return null;
+  // 同名多地：同一个名字在不同省份都有（西湖/东湖/新建…）。这种情况先别猜，
+  // 让上层反问用户是哪个——猜错比反问更让人恼火。
+  const exactLabels = new Set([name, candidates[candidates.length - 1]].filter(Boolean));
+  const sameName = pool.filter(x => exactLabels.has(x.row.label));
+  const provinces = [...new Set(sameName.map(x => x.row.province).filter(Boolean))];
+  if (provinces.length >= 2) {
+    return {
+      ambiguous: true,
+      options: sameName
+        .filter(x => x.row.province)
+        .map(x => ({ province: x.row.province, label: x.row.label, code: x.row.code }))
+        .slice(0, 6),
+    };
+  }
   pool.sort((a, b) => b.score - a.score || a.order - b.order);
   const best = pool[0].row;
   const truncated = best.code.length > 9;
@@ -220,6 +239,23 @@ async function cnWeatherResult(city, opts = {}) {
       if (fallback) place = { ...fallback, label: fallback.label + '（' + String(city).trim() + '暂无区县数据）' };
     }
     if (!place) return [];
+    // 同名多地（西湖/东湖/新建…）：这一轮不给天气数据，只让模型反问一句。
+    // 猜错城市比反问一次更让人恼火；而且这类问题多半发生在区县级别。
+    if (place.ambiguous) {
+      const provinces = [...new Set((place.options || []).map(o => o.province).filter(Boolean))];
+      const first = provinces[0] || '';
+      return [{
+        title: String(city || '') + '（多个同名地点）',
+        url: 'https://www.weather.com.cn/',
+        // 这里只陈述事实（外部资料不能写成指令）：同名地点无法确定是哪一处。
+        snippet: '「' + String(city || '') + '」有多个同名地点：'
+          + (provinces.join('、') || '多个省份') + '都有叫这个名字的地方，只凭名字无法确定是哪一处。'
+          + (first ? '（按字面最先匹配到的是' + first + '那一个）' : ''),
+        provider: 'cnweather',
+        fetchedAt: new Date().toISOString(),
+        publishedAt: null,
+      }];
+    }
     const url = 'https://d1.weather.com.cn/weather_index/' + place.code + '.html?_=' + Date.now();
     const text = await getText(url, {
       ...opts, deadline,

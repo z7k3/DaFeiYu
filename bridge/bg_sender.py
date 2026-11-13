@@ -1136,6 +1136,40 @@ def _send_by_enter(hwnd, sender, log=None, wait=1.4):
     return False
 
 
+
+def _foreground_now():
+    try:
+        return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def _restore_foreground(prev, wechat_hwnd=None, log=None):
+    """把前台还给 prev 那个窗口（微信刚抢过去的）。
+
+    切换会话/点击都会让微信自己激活到最前，而整轮发送要一两秒——用户看到的就是
+    「回个消息微信闪一下」。切完会话立刻还回去，闪烁时间能从 ~2s 压到 ~0.3s。
+    不做激进操作：失败就算了，绝不影响发送本身。
+    """
+    try:
+        prev = int(prev or 0)
+        if not prev or prev == _foreground_now():
+            return False
+        user32_ = ctypes.windll.user32
+        for _ in range(3):
+            # ALT 轻敲一下解除前台锁（Windows 的前台保护）
+            user32_.keybd_event(0x12, 0, 0, 0)
+            user32_.keybd_event(0x12, 0, 2, 0)
+            user32_.SetForegroundWindow(wintypes.HWND(prev))
+            time.sleep(0.12)
+            if _foreground_now() == prev:
+                return True
+        return _foreground_now() == prev
+    except Exception as e:
+        if log:
+            log("后台通道：还原前台失败（不影响发送） %r" % (e,))
+        return False
+
 def _type_text(sender, edit, text, *, mode, char_gap=0.04,
                strip_unencodable=True, log=None):
     """写正文：优先 UIA SetValue，失败才回退 WM_CHAR。返回 (ok, skipped)。"""
@@ -1620,9 +1654,15 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
 
             # 先切会话，再看输入框：微信可能停在朋友圈 / 通讯录，
             # 这时 edit 不存在，但会话列表行还在，点一下就能回到聊天页。
+            # 切会话要点会话行，微信会把自己激活到最前：记下当前前台，切完立刻还回去。
+            _fg_before = _foreground_now()
             if chat and not open_chat(sender, chat, log=log):
                 return False, "chat_not_found"
 
+            # 切完会话立刻还前台：整轮发送要一两秒，不还的话用户看到的就是微信亮一下。
+            if _fg_before and _foreground_now() != _fg_before:
+                if _restore_foreground(_fg_before, log=log):
+                    log("后台通道：切会话抢了前台，已立刻还回去")
             info = read_ui(hwnd)                   # 切过会话要重读（按钮位置会变）
             if info["edit"] is None:
                 # 点完会话后微信会重建一次控件树（实测 150 → 81 再回来），补一次物化
@@ -1789,6 +1829,9 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
                 _remember_char_mode(hwnd, mode, log)
             time.sleep(TIMING["afterClick"])
             sender.end_input()
+            # 回车/点击之后前台若又被抢走，再还一次（兜底，别影响发送结果）
+            if _fg_before and _foreground_now() != _fg_before:
+                _restore_foreground(_fg_before, log=log)
 
             partial = "sent_partial" if skipped else "sent"
             if not verify:
