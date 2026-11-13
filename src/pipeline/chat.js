@@ -784,12 +784,33 @@ class Bot {
     // 对别人的话仍然旁听存档，但不触发命令、回怼或接话。
     // 显式 @/回复她、主人说话、正叫她的名字、明确骂她时不能被 60 秒前的
     // 旧 @ 记录一票否决，否则主人刚 @ 过同事下一句就被无视。
+    // 上一条消息是不是她自己发的（且刚发不久）：决定了对方说「你」时是不是在说她。
+    // 例子：她刚回完一句，群里接着说「那我超级反弹你不炸了」——没有她名字、也没有 @，
+    // 但上一句就是她说的，「你」显然指她。没这个信号时 groupAddressGuard 会当成
+    // 「在跟别人说话」直接跳过（用户实见：这两句都没回）。
+    let botSpokeLast = false;
+    if (isGroup) {
+      try {
+        const recent = this.store.messages(key, 4) || [];
+        for (let i = recent.length - 1; i >= 0; i -= 1) {
+          const m = recent[i];
+          if (!m || !m.role) continue;
+          botSpokeLast = m.role === 'assistant'
+            && nowMs - Number(m.ts || 0) <= 10 * 60000;
+          break;
+        }
+      } catch { /* 读不到历史就按没有这个信号处理 */ }
+    }
+
     const _earlyNames = addressing.herNames(this, msg);
     const _earlyForHer = addressing.isAddressed(atMe, msg)
       || isMaster
       || addressing.namedHerIn(clean.text || '', _earlyNames)
       || INSULT_RE.test(clean.text || '');
     if (isGroup && msg.directedElsewhere && !_earlyForHer) {
+      // 影子对比：这条被判成「在跟别人说话」，新仲裁器怎么看？
+      this._addrShadow({ msg, clean, atMe, isGroup, state, nowMs, isMaster, botSpokeLast },
+        { wake: false, reason: 'addressed_to_other' });
       return { action: 'ignore', key, msg, reason: 'addressed_to_other' };
     }
 
@@ -818,24 +839,9 @@ class Bot {
     await this.messagePlugins.run('chat.received', pluginInput);
     const pluginTrigger = await this.messagePlugins.run('chat.pre_reply', pluginInput);
     if (pluginTrigger.action === 'skip') return { action: 'ignore', reason: 'plugin_skip', key, msg, atMe };
-    // 上一条消息是不是她自己发的（且刚发不久）：决定了对方说「你」时是不是在说她。
-    // 例子：她刚回完一句，群里接着说「那我超级反弹你不炸了」——没有她名字、也没有 @，
-    // 但上一句就是她说的，「你」显然指她。没这个信号时 groupAddressGuard 会当成
-    // 「在跟别人说话」直接跳过（用户实见：这两句都没回）。
-    let botSpokeLast = false;
-    if (isGroup) {
-      try {
-        const recent = this.store.messages(key, 4) || [];
-        for (let i = recent.length - 1; i >= 0; i -= 1) {
-          const m = recent[i];
-          if (!m || !m.role) continue;
-          botSpokeLast = m.role === 'assistant'
-            && nowMs - Number(m.ts || 0) <= 10 * 60000;
-          break;
-        }
-      } catch { /* 读不到历史就按没有这个信号处理 */ }
-    }
     const triggerResult = this.computeTrigger({ msg, atMe, clean, isGroup, state, nowMs, isMaster, muted, botSpokeLast });
+    // 影子对比：新仲裁器 vs 现有 trigger 判定（只记日志，不改行为）。
+    this._addrShadow({ msg, clean, atMe, isGroup, state, nowMs, isMaster, botSpokeLast }, triggerResult);
     if (pluginTrigger.action === 'wake' && !['silent', 'minute_cap', 'no_text'].includes(triggerResult.reason)) {
       triggerResult.wake = true;
       triggerResult.reason = 'plugin';
@@ -1307,6 +1313,43 @@ class Bot {
       return { action: 'reply', key, msg, atMe, system, tail, turns, mock: true, text, reason: triggerResult.reason, turnState, budget: promptBudget };
     }
     return { action: 'reply', key, msg, atMe, system, tail, turns, mock: false, reason: triggerResult.reason, turnState, budget: promptBudget };
+  }
+
+  /**
+   * 影子模式：算一遍新仲裁器（addressing.analyze），只记日志对比，不改任何行为。
+   *
+   * 用来验证「统一裁决」能不能替代现在分散在 trigger/chat 里的判定。等影子日志
+   * 跑够样本、分歧都能解释，再一处处切过去（切的时候也靠它做回归对照）。
+   * 日志只写原因码/置信度/长度，不写聊天正文。
+   */
+  _addrShadow(args, oldDecision) {
+    if (!this.config || !(this.config.group && this.config.group.addressShadow)) return;
+    try {
+      const msg = args.msg || {};
+      const text = String((args.clean && args.clean.text) || msg.text || '');
+      const names = addressing.herNames(this, msg);
+      const guardOn = features.isOn(this.config, 'groupAddressGuard');
+      const verdict = addressing.analyze(this, {
+        msg, text, atMe: args.atMe, isGroup: args.isGroup !== false, state: args.state || {},
+        nowMs: args.nowMs, isMaster: args.isMaster, names, guardOn,
+        botSpokeLast: Boolean(args.botSpokeLast),
+      });
+      // 旧判定：wake=true 表示"会回复"；skip 类里 addressed_to_other 也算"不回"。
+      const oldWake = Boolean(oldDecision && oldDecision.wake);
+      const oldReason = String((oldDecision && oldDecision.reason) || '-');
+      const newWake = verdict.addressee === 'her';
+      if (oldWake === newWake) return;
+      if (this.logger) {
+        this.logger.info('[addr-shadow] diverge old=' + (oldWake ? 'wake' : 'skip')
+          + '(' + oldReason + ') new=' + (newWake ? 'her' : verdict.addressee)
+          + '(' + verdict.reason + ') conf=' + verdict.confidence
+          + ' evidence=' + (verdict.evidence.join('+') || '-')
+          + ' topics=' + verdict.topicMentions.length
+          + ' len=' + text.length);
+      }
+    } catch (err) {
+      this.logger && this.logger.warn('[addr-shadow] 计算失败（不影响正常流程）：' + describeError(err));
+    }
   }
 
   computeTrigger(args) {

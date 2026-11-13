@@ -274,6 +274,8 @@ const DEFAULT_CONFIG = {
     cooldownSec: 0,
     masterAlwaysReply: true,
     careReply: true,
+    // 影子模式：只记「新仲裁器 vs 旧判定」的分歧日志，不改行为。收集样本用，稳定后可删。
+    addressShadow: false,
     engagedMinutes: 6,
     silentMinutes: 10,
     maxRepliesPerMinute: 15,
