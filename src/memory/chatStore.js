@@ -20,6 +20,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { readJson, writeJsonAtomic } = require('../infra/jsonFile');
+const { tagId } = require('../infra/privacy');
 const { chatHash, personHash } = require('./hash');
 const { LIMITS, DAY_MS } = require('./constants');
 const { estimateTokens, messageTokens } = require('./tokens');
@@ -103,10 +104,11 @@ function normalizeSummary(raw, chatId) {
 }
 
 class ChatStore {
-  constructor({ dir, logger = null, now = () => Date.now() }) {
+  constructor({ dir, logger = null, now = () => Date.now(), maxMessages = LIMITS.maxMessagesPerChat }) {
     this.dir = dir;
     this.logger = logger;
     this.now = typeof now === 'function' ? now : () => now;
+    this.maxMessages = Math.max(100, Number(maxMessages) || LIMITS.maxMessagesPerChat);
     this.chats = new Map();
     this.manifest = null;
     this._saveTimers = new Map();
@@ -226,7 +228,7 @@ class ChatStore {
       }
       const card = personCard.normalizeCard(raw, { chatId: chat.chatId, uid: expectedUid });
       if (!card) {
-        if (this.logger) this.logger.warn(`人物卡 chatId 不符，已跳过：${chat.chatId}/${file}`);
+        if (this.logger) this.logger.warn(`人物卡 chatId 不符，已跳过：${tagId(chat.chatId)}/${file}`);
         continue;
       }
       chat.people.set(card.uid, card);
@@ -263,7 +265,7 @@ class ChatStore {
         bad += 1; // 崩溃时最后一行可能是半截，跳过即可
       }
     }
-    if (bad && this.logger) this.logger.warn(`记忆原文有 ${bad} 行损坏，已跳过（聊天 ${chat.chatId}）`);
+    if (bad && this.logger) this.logger.warn(`记忆原文有 ${bad} 行损坏，已跳过（聊天 ${tagId(chat.chatId)}）`);
     out.sort((a, b) => a.seq - b.seq);
     return out;
   }
@@ -345,7 +347,7 @@ class ChatStore {
         if (victim) {
           chat.people.delete(victim.uid);
           try { fs.unlinkSync(path.join(chat.dir, 'people', `${personHash(victim.uid)}.json`)); } catch { /* ignore */ }
-          if (this.logger) this.logger.info(`人物卡到上限，淘汰最久没出现的（chat ${chat.chatId}）`);
+          if (this.logger) this.logger.info(`人物卡到上限，淘汰最久没出现的（chat ${tagId(chat.chatId)}）`);
         }
       }
       card = personCard.newCard({ chatId: chat.chatId, uid: id, name, now: at });
@@ -500,19 +502,22 @@ class ChatStore {
   pruneRaw(chat, now = this.now()) {
     const covered = Number(chat.summary && chat.summary.coveredThroughSeq) || 0;
     const cutoff = now - LIMITS.rawRetentionDays * DAY_MS;
+    const recent = now - DAY_MS;
     const lastSeq = (chat.messages[chat.messages.length - 1] || {}).seq || 0;
-    const hardBefore = lastSeq - LIMITS.maxMessagesPerChat;
+    const hardBefore = lastSeq - (Number(this.maxMessages) || LIMITS.maxMessagesPerChat);
     const keep = [];
     let dropped = 0;
     for (const m of chat.messages) {
-      const canDrop = m.seq <= covered && (m.ts < cutoff || m.seq <= hardBefore);
+      // 超过 maxMessagesPerChat 也不能删最近 24 小时的原文：日记是按天从
+      // messages 里取素材的，长上下文被压缩后如果连当天原文都清掉，日记就会缺段。
+      const canDrop = m.seq <= covered && (m.ts < cutoff || (m.seq <= hardBefore && m.ts < recent));
       if (canDrop) dropped += 1;
       else keep.push(m);
     }
     if (!dropped) return { dropped: 0 };
     chat.messages = keep;
     this._rewriteMessages(chat);
-    if (this.logger) this.logger.info(`记忆原文清理：${dropped} 条已覆盖的旧消息（chat ${chat.chatId}）`);
+    if (this.logger) this.logger.info(`记忆原文清理：${dropped} 条已覆盖的旧消息（chat ${tagId(chat.chatId)}）`);
     return { dropped };
   }
 

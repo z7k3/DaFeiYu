@@ -11,6 +11,7 @@ const { StickerService } = require('../src/services/stickerService');
 const { startServer } = require('../server');
 const { loadConfig } = require('../src/infra/config');
 const { Gateway: GatewayAdapter } = require('../src/adapters/gateway');
+const { tagName } = require('../src/infra/privacy');
 const GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==', 'base64');
 function fixture(t, on = true) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whale-sticker-fix-'));
@@ -122,7 +123,7 @@ test('没有冷却：私聊也能连续发；同一会话同时只排一个任�
   assert.ok(second, '确认后立刻可以再发（无冷却）');
   service.claim(second.id); service.ack(second.id, 'confirmed');
   assert.ok(service.plan(msg, '其他'), '再紧接着也还能发');
-  assert.equal(service.plan({ ...msg, platform: 'web' }, '其他'), null, '网页聊天不排表情包');
+  assert.equal(service.plan({ ...msg, platform: 'web' }, '其他'), null, '非微信平台不排表情包');
 });
 
 test('任务过期不重试，满队列明确报错而非静默丢任务', (t) => {
@@ -197,7 +198,7 @@ test('网关默认关回包真正无sticker字段，不给远程/其他平台发
   assert.equal(Object.hasOwn(remote, 'sticker'), false);
 });
 
-test('HTTP：自动回包带一次性任务，网页SSE不泄漏本地路径，网页聊天不占微信配额', async (t) => {
+test('HTTP：自动回包带一次性任务，聊天 SSE 不泄漏本地路径，聊天请求不占微信配额', async (t) => {
   const { root, inst, request, toggle } = await live(t);
   await toggle(true);
   await request('/api/stickers/upload', { emotion: 'other', files: [{ name: 'a.gif', data: GIF.toString('base64') }] });
@@ -214,7 +215,7 @@ test('HTTP：自动回包带一次性任务，网页SSE不泄漏本地路径，�
     headers: { 'content-type': 'application/json', 'x-bot-token': 'sticker-test-token' },
     body: JSON.stringify({ text: '在吗', sessionId: 'sticker-visibility' }) });
   assert.equal((await web.text()).includes('"sticker"'), false);
-  assert.equal(inst.runtime.stickerService.jobs.size, 1, '网页聊天不该排队表情包');
+  assert.equal(inst.runtime.stickerService.jobs.size, 1, '非微信聊天不该排队表情包');
   await toggle(false);
   const off = await fetch(inst.url + '/webhook/wechat', { method: 'POST',
     headers: { 'content-type': 'application/json', 'x-bot-token': 'sticker-test-token', 'x-whale-bridge': '1' },
@@ -337,7 +338,8 @@ test('分类认不出：照发一张，记 fallbackFrom 并 warn 说明改发了
   assert.ok(job, '认不出也要发得出去');
   assert.equal(job.emotion, 'happy');
   assert.equal(job.fallbackFrom, '猫猫头');
-  assert.ok(log.lines.some((line) => line.startsWith('warn') && line.includes('猫猫头') && line.includes('改发')), '要说明改发了哪一类');
+  assert.ok(log.lines.some((line) => line.startsWith('warn') && line.includes(tagName('猫猫头')) && line.includes('改发')), '要说明改发了哪一类（分类名只留哈希）');
+  assert.ok(!log.lines.some((line) => line.includes('猫猫头')), '分类名不能原样进日志');
 });
 
 test('有自定义分类时，兜底优先发用户自己建的分类里的图', (t) => {

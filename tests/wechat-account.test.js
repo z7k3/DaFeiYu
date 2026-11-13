@@ -2,7 +2,7 @@
 
 /**
  * 微信多账号（双开）相关：
- *   - 网页「设置 → 微信账号」靠 /api/wechat/accounts 列出本机账号
+ *   - 启动器「设置 → 微信账号」靠 /api/wechat/accounts 列出本机账号
  *   - 选账号 = 把 config.json 的 wechat.account 改成目标账号目录
  *   - 桥接心跳要上报「现在用的是哪个号」
  *   - 桥接 / uia_compat 里必须有关键的「钉账号」代码（静态守住，别被后来的人改丢）
@@ -151,7 +151,7 @@ test('切号后桥接没重启成功时，发送闸要拦住（别从旧号发�
 
 test('桥接源码里必须留着「钉账号」的关键代码（别被后来的改动弄丢）', () => {
   const bridge = require('./helpers/bridge-source');
-  assert.match(bridge, /--list-accounts/, '要有给网页列账号的一次性模式');
+  assert.match(bridge, /--list-accounts/, '要有给启动器列账号的一次性模式');
   assert.match(bridge, /def resolve_account_dir/, '要能把目录名/wxid/昵称解析成账号目录');
   assert.match(bridge, /db\.account != acct/, '建库后要断言没被库偷偷换号');
   assert.match(bridge, /def ensure_account_window/, '发送前要确认窗口还活着');
@@ -166,4 +166,22 @@ test('桥接源码里必须留着「钉账号」的关键代码（别被后来�
   assert.match(compat, /def pinned_window/, '要能查当前钉住哪个窗口');
   assert.match(compat, /_pinned_hwnd/, '_find_main 要先认钉住的窗口');
   assert.match(compat, /def _session_rows_of/, '要能只读某个窗口的会话行（认账号用）');
+  assert.match(compat, /def ensure_chat_page/, '要能从通讯录/收藏/发现/朋友圈回到聊天页');
+  assert.match(compat, /_AUX_WINDOW_PREFIXES/, '自动发现不能把朋友圈/设置/图片窗口当主窗');
+  assert.match(compat, /mmui::sns/, '要明确排除朋友圈页面窗口');
+});
+
+test('同一账号多个候选窗用窗口证据确认', () => {
+  const bridge = require('./helpers/bridge-source');
+  assert.doesNotMatch(bridge, /len\(matched\)\s*!=\s*1/);
+  assert.match(bridge, /account_window_candidates\(win32gui, win32process, hwnds\)/);
+  assert.match(bridge, /resolve_account_windows\(matched\)/);
+});
+
+test('微信 4.2 用会话列表证据区分主窗和隐藏辅助窗', () => {
+  const bridge = require('./helpers/bridge-source');
+  assert.match(bridge, /SESSION_MARKERS = \("mmui::ChatSessionList", "mmui::ChatSessionCell"\)/, '缺少窗口级会话列表标记');
+  assert.match(bridge, /def resolve_account_windows/, '缺少多候选窗口的会话证据解析');
+  assert.match(bridge, /tree_state\(hwnd, timeout=0\.5, max_nodes=500, account_window=True\)/, '择窗时必须检查指定 hwnd 自己的会话列表');
+  assert.match(bridge, /所选账号有多个候选窗口，未能确认聊天主窗/, '跨进程分不清时应该继续等待，不能串号');
 });

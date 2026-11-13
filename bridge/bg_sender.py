@@ -4,9 +4,9 @@
 
 按 `docs/微信消息后台发送.md` 实现，三条腿全部走窗口消息：
 
-    物化  SPI_SETSCREENREADER（让 Qt 把 UIA 树长出来）
+    物化  节点 ≤ 1 先按 Ctrl+Alt+W 唤醒；再 SPI_SETSCREENREADER / gate 热激活
     读    UIA FindAll(Descendants)，认 AutomationId=chat_input_field / Name=发送
-    写    PostMessage WM_SETFOCUS → GBK 字节逐个 WM_CHAR → PostMessage 点发送
+    写    优先 UIA ValuePattern.SetValue()；失败才回退 WM_CHAR 逐字投递
 
 全程不调用 `SetForegroundWindow` / `SetWindowPos` / `SetFocus` / `SendInput` /
 `keybd_event`，所以是**结构上不碰前台**，不是「碰完再还原」。
@@ -32,6 +32,10 @@ import re
 import threading
 import time
 from ctypes import wintypes
+try:
+    from bridge_log import safe_name, safe_text
+except ImportError:  # 测试里按 `bridge.bg_sender` 导入时走包内相对路径
+    from .bridge_log import safe_name, safe_text
 
 # 后台通道里的「固定等待」（秒）。这些都是防丢字/等控件就绪的保险，默认值来自线上实测；
 # 想快一点不用改代码：在 config.json 的 wechat.bgSend.timing 里覆盖同名键即可
@@ -110,6 +114,7 @@ WM_LBUTTONUP = 0x0202
 SPI_GETSCREENREADER = 0x0046
 SPI_SETSCREENREADER = 0x0047
 SPIF_UPDATEINIFILE = 0x01
+SPIF_SENDCHANGE = 0x02
 
 ERROR_ACCESS_DENIED = 5
 
@@ -117,6 +122,10 @@ ERROR_ACCESS_DENIED = 5
 CHAT_INPUT_AID = "chat_input_field"
 SEND_BUTTON_NAME = "发送"
 SESSION_LIST_AIDS = ("session_list",)
+#: 左侧导航栏：微信/通讯录/收藏/发现，顺序固定；点第一栏回聊天页。
+MAIN_TAB_BAR_CLS = "mmui::MainTabBar"
+TAB_ITEM_CLS = "mmui::XTabBarItem"
+CHAT_TAB_NAME = "微信"
 
 #: 树「够用」的节点数门限：默认 2 个节点 = 没物化；62~67 = TreeWalker 断在中间；
 #: 150+ = FindAll 拿到全部。20 是个宽松下限，能找到输入框就行。
@@ -256,11 +265,37 @@ class _ScreenReader:
     _on = False
     _prev = 0
 
+    _verified = False
+    _last_error = ""
+
+    @classmethod
+    def _set(cls, value):
+        try:
+            ok = user32.SystemParametersInfoW(
+                SPI_SETSCREENREADER, 0, ctypes.c_void_p(1 if value else 0),
+                SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+            )
+            if not ok:
+                cls._last_error = "WinError %s" % ctypes.get_last_error()
+        except Exception as e:                  # noqa: BLE001
+            cls._last_error = repr(e)
+            ok = False
+        readback = ctypes.c_uint(0)
+        try:
+            user32.SystemParametersInfoW(SPI_GETSCREENREADER, 0,
+                                         ctypes.byref(readback), 0)
+        except Exception:
+            readback = ctypes.c_uint(0 if value else 1)
+        cls._verified = bool(ok and int(readback.value) == (1 if value else 0))
+        if not cls._verified and not cls._last_error:
+            cls._last_error = "读回值=%s" % int(readback.value)
+        return cls._verified
+
     @classmethod
     def enable(cls):
         with cls._lock:
             if cls._on:
-                return
+                return cls._verified
             prev = ctypes.c_uint(0)
             try:
                 user32.SystemParametersInfoW(SPI_GETSCREENREADER, 0,
@@ -268,26 +303,16 @@ class _ScreenReader:
             except Exception:
                 prev = ctypes.c_uint(0)
             cls._prev = int(prev.value)
-            try:
-                user32.SystemParametersInfoW(
-                    SPI_SETSCREENREADER, 0, ctypes.c_void_p(1), SPIF_UPDATEINIFILE
-                )
-            except Exception:
-                pass
+            cls._set(True)
             cls._on = True
+            return cls._verified
 
     @classmethod
     def restore(cls):
         with cls._lock:
             if not cls._on:
                 return
-            try:
-                user32.SystemParametersInfoW(
-                    SPI_SETSCREENREADER, 0, ctypes.c_void_p(cls._prev),
-                    SPIF_UPDATEINIFILE
-                )
-            except Exception:
-                pass
+            cls._set(bool(cls._prev))
             cls._on = False
 
     @classmethod
@@ -298,7 +323,9 @@ class _ScreenReader:
                                          ctypes.byref(v), 0)
         except Exception:
             return False
-        # 文档 §4.1：这个读回值不可信（树起来了它也可能是 0），只作调试参考
+        # 4.2 实测：树起来了标志也可能读回 0，所以这里只作调试参考；
+        # 真正是否生效以「设定后立刻读回」的 _verified 为准。
+
         return bool(v.value)
 
 
@@ -377,11 +404,27 @@ def _tree_ok(info, want_edit=False):
     return True
 
 
-def _ensure_tree(hwnd, log=None, unhide=True, want_edit=False):
+def _wake_with_hotkey(hwnd, log=None):
+    """调用 uia_boot 的 Ctrl+Alt+W 唤醒；导入失败不影响后续 SPI/gate 兜底。"""
+    log = log or _noop
+    try:
+        try:
+            from . import uia_boot as boot
+        except ImportError:
+            import uia_boot as boot
+        return bool(boot.wake_by_hotkey(hwnd, log=log))
+    except Exception as e:                  # noqa: BLE001
+        log("后台通道：唤醒微信失败 %r" % (e,))
+        return False
+
+
+def _ensure_tree(hwnd, log=None, unhide=True, want_edit=False, wake=True):
     """保证控件树是物化的，返回一次 `read_ui()` 结果。
 
-    顺序（每一步都不碰前台）：
-      1. 窗口被隐藏（缩在托盘）→ `SW_SHOWNOACTIVATE` 显示出来；
+    顺序：
+      0. 节点 ≤ 1 说明是托盘/冻结空壳 —— 直接按微信自己的 Ctrl+Alt+W，
+         不再先走一遍 SPI/gate/激活（实测空壳自愈 14.7 秒 → 5.4 秒）；
+      1. 窗口被隐藏（缩在托盘）→ `SW_SHOWNOACTIVATE` 兜底显示；
       2. 开 `SPI_SETSCREENREADER`（Qt 靠它决定要不要暴露控件树）；
       3. 还不行就写 wechatauto 的 accessibility gate 字节（0→1 重新触发）。
 
@@ -389,6 +432,18 @@ def _ensure_tree(hwnd, log=None, unhide=True, want_edit=False):
     时就是这样），会继续尝试物化；实在没有就返回现状，由调用方决定点会话还是放弃。
     """
     log = log or _noop
+
+    info = read_ui(hwnd)
+    if _tree_ok(info, want_edit):
+        return info
+    if wake and len(info["nodes"]) <= 1:
+        log("后台通道：控件树只有 %d 个节点，直接唤醒微信（跳过 SPI/gate 空转）"
+            % len(info["nodes"]))
+        if _wake_with_hotkey(hwnd, log=log):
+            info = read_ui(hwnd)
+            if _tree_ok(info, want_edit):
+                log("后台通道：控件树已物化（Ctrl+Alt+W 唤醒），%d 个节点" % len(info["nodes"]))
+                return info
 
     if unhide:
         try:
@@ -409,7 +464,10 @@ def _ensure_tree(hwnd, log=None, unhide=True, want_edit=False):
         # 树是活的，只是没停在聊天页 —— 物化也变不出输入框，交给调用方点会话
         return info
 
-    _ScreenReader.enable()
+    spi_ok = _ScreenReader.enable()
+    if not spi_ok:
+        log("后台通道：SPI_SETSCREENREADER 未生效（%s），继续尝试 gate 热激活"
+            % (_ScreenReader._last_error or "未知原因"))
     time.sleep(TIMING["spiSettle"])        # 文档 §4.1：实测 1~1.5 秒（可用 bgSend.timing 覆盖）
     info = read_ui(hwnd)
     if _tree_ok(info, want_edit):
@@ -857,6 +915,49 @@ def encode_gbk(text, strip_unencodable=True):
     return bytes(buf), skipped
 
 
+_UIA_WRITE_LOGGED = set()
+
+
+def _uia_write(edit, text):
+    """用 UIA ValuePattern 直接写正文，不经过键盘。
+
+    后台补发第二个气泡时，``WM_CHAR`` 常因为焦点/时序问题丢字（回读 0 字，
+    触发 input_dirty）。SetValue 直接落到控件模型里，不怕抢焦点，也没有
+    逐字投递的时序问题；只有它失败时才回退 WM_CHAR。
+    """
+    if edit is None:
+        return False
+    try:
+        edit.GetValuePattern().SetValue(str(text or ""))
+        return True
+    except Exception:
+        return False
+
+
+def _type_text(sender, edit, text, *, mode, char_gap=0.04,
+               strip_unencodable=True, log=None):
+    """写正文：优先 UIA SetValue，失败才回退 WM_CHAR。返回 (ok, skipped)。"""
+    log = log or _noop
+    expected = _expected_text(text, mode, strip_unencodable)
+    if expected is None:
+        return False, []
+    skipped = []
+    if mode != "utf16":
+        _payload, skipped = encode_gbk(text, strip_unencodable)
+    if _uia_write(edit, expected):
+        try:
+            hwnd = int(getattr(sender, "hwnd", 0) or 0)
+        except Exception:
+            hwnd = 0
+        if hwnd not in _UIA_WRITE_LOGGED:
+            _UIA_WRITE_LOGGED.add(hwnd)
+            log("后台通道：打字通道 = UIA SetValue")
+        return True, skipped
+    log("后台通道：UIA SetValue 不可用，回退 WM_CHAR")
+    return sender.type_text(text, char_gap=char_gap,
+                            strip_unencodable=strip_unencodable, mode=mode)
+
+
 # ---------------------------------------------------------------- 读取端（文档 §5.2）
 def _uia():
     import uiautomation as auto
@@ -933,7 +1034,7 @@ def read_ui(hwnd):
     树没物化时 `nodes` 为空、其余为 None / 空列表。
     """
     info = {"ctrl": None, "nodes": [], "edit": None, "chat": None,
-            "value": None, "send_xy": None, "rows": []}
+            "value": None, "send_xy": None, "rows": [], "tabs": []}
     if not hwnd:
         return info
     try:
@@ -946,6 +1047,20 @@ def read_ui(hwnd):
 
     nodes = _descendants(info["ctrl"])
     info["nodes"] = nodes
+
+    # 左侧导航栏：微信/通讯录/收藏/发现。页面窗口里会话列表可能整片不在，
+    # 但导航栏一直都在；用它判断并回到聊天页。
+    for c in nodes:
+        try:
+            if (getattr(c, "ClassName", "") or "") == MAIN_TAB_BAR_CLS:
+                info["tabs"] = [
+                    (norm_chat_name(getattr(k, "Name", "") or ""), k)
+                    for k in c.GetChildren()
+                    if (getattr(k, "ClassName", "") or "") == TAB_ITEM_CLS
+                ]
+                break
+        except Exception:
+            continue
 
     for c in nodes:
         try:
@@ -1055,11 +1170,59 @@ def _chat_is_target(current, aliases):
     return (best is not None and best <= 1), cur
 
 
+def _chat_tab_target(info):
+    """从 read_ui 的 tabs 里选「微信」栏；找不到名字时退回第一栏。"""
+    tabs = info.get("tabs") or []
+    for name, ctrl in tabs:
+        if (name or "").strip() == CHAT_TAB_NAME:
+            return ctrl
+    return tabs[0][1] if tabs else None
+
+
+def _ensure_chat_page(sender, info, log=None, timeout=2.5, force=False):
+    """微信停在通讯录 / 收藏 / 发现 / 朋友圈时，点左侧「微信」栏回聊天页。
+
+    只点导航栏，不碰搜索框；点完重新读控件树，等到会话列表或输入框出现。
+    窄窗口里开着会话时第一下只回到聊天页、会话还开着，需要再点一下才退出。
+    ``force=True`` 用于「已经开着别的会话，但要看会话列表」：必须点掉当前会话。
+    """
+    log = log or _noop
+    for _ in range(2):
+        if info.get("rows"):
+            return info
+        if info.get("edit") is not None and not force:
+            return info
+        force = True
+        tab = _chat_tab_target(info)
+        if tab is None:
+            return info
+        try:
+            r = tab.BoundingRectangle
+            if (r.right - r.left) < 20 or (r.bottom - r.top) < 20:
+                return info
+            sender.click_screen((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+        except Exception as e:
+            log("后台通道：点「%s」栏失败 %r" % (CHAT_TAB_NAME, e))
+            return info
+        deadline = time.time() + max(0.5, float(timeout))
+        while time.time() < deadline:
+            time.sleep(TIMING["pollSwitch"])
+            info = read_ui(sender.hwnd)
+            if info.get("rows"):
+                log("后台通道：已从其它页面回到聊天页")
+                return info
+    return info
+
+
 def open_chat(sender, aliases, timeout=6.0, log=None):
     """在会话列表里点开目标会话。返回是否已切过去。
 
     只点列表行、不碰搜索框：4.1.15+ 搜索入口是收起的，展开要额外点一次；
     而机器人回消息时，那个会话本来就在列表最上面。
+
+    **只接受完全相同的行名**。以前会按「包含/成员名集合」挑最像的一行，
+    「群A」和「群A2」互相包含时就会点错，把发给 A 的消息发到 B。找不到
+    精确行就返回 False，交给会搜索的前台通道。
 
     会话列表只有最近 9~12 个会话，更早的找不到 —— 这时返回 False，
     调用方退回前台通道（那边会自己搜索）。
@@ -1076,21 +1239,31 @@ def open_chat(sender, aliases, timeout=6.0, log=None):
     if cur and any(name_score(a, cur) == 0 for a in aliases):
         return True
     if not info["rows"]:
+        # 通讯录 / 收藏 / 发现 / 朋友圈没有会话列表；先点「微信」栏回聊天页。
+        info = _ensure_chat_page(sender, info, log=log,
+                                 force=bool(info.get("edit") is not None))
+        cur = info["chat"]
+        if cur and any(name_score(a, cur) == 0 for a in aliases):
+            return True
+    if not info["rows"]:
         return False
 
     scored = []
     for nm, ctrl in info["rows"]:
+        # 模糊匹配（score 1/2）不再用于点击：宁可让前台通道去搜索，也不点错人。
+        if not any(name_score(a, nm) == 0 for a in aliases):
+            continue
         best = None
         for a in aliases:
-            sc = name_score(a, nm)
-            if sc is None:
+            if name_score(a, nm) != 0:
                 continue
-            cand = (sc, abs(len(nm) - len(a)), nm, ctrl)
+            cand = (0, abs(len(nm) - len(a)), nm, ctrl)
             if best is None or cand[:2] < best[:2]:
                 best = cand
         if best is not None:
             scored.append(best)
     if not scored:
+        log("后台通道：会话列表里没有目标 %r 的精确行，交给前台通道搜索" % ([safe_name(x) for x in aliases],))
         return False
     scored.sort(key=lambda x: (x[0], x[1]))
     _sc, _d, nm, ctrl = scored[0]
@@ -1110,14 +1283,14 @@ def open_chat(sender, aliases, timeout=6.0, log=None):
         info = read_ui(sender.hwnd)
         cur = info["chat"]
         if cur and name_score(nm, cur) == 0:
-            log("后台通道：已切到会话 %r" % (nm,))
+            log("后台通道：已切到会话 %r" % (safe_name(nm),))
             return True
         # 点完之后控件树可能被微信重建（实测会从 150 掉到 81、输入框暂时消失），
         # 这时再补一次物化，别急着判失败。
         if not rematerialized and len(info["nodes"]) < MIN_NODES:
             rematerialized = True
             _ensure_tree(sender.hwnd, log=log)
-    log("后台通道：切会话超时（目标 %r，当前 %r）" % (nm, cur))
+    log("后台通道：切会话超时（目标 %r，当前 %r）" % (safe_name(nm), safe_name(cur)))
     return False
 
 
@@ -1253,7 +1426,7 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             if chat:
                 ok_same, cur_chat = _chat_is_target(info.get("chat"), chat)
                 log("后台通道：核对 目标=%r 当前=%r → %s"
-                    % (chat, cur_chat, "通过" if ok_same else "不是目标，拒绝发送"))
+                    % (safe_name(chat), safe_name(cur_chat), "通过" if ok_same else "不是目标，拒绝发送"))
                 if not ok_same:
                     return False, "chat_mismatch"
             # 空框 UIA 读出来是 '\n'，按真值判会误报 input_not_empty（M1）；
@@ -1288,7 +1461,7 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
                 mode = confirmed
             if mode not in _MODE_LOGGED:
                 _MODE_LOGGED.add(mode)
-                log("后台通道：打字编码 = %s（WM_CHAR）" % mode)
+                log("后台通道：打字编码 = %s（UIA SetValue 优先，失败回退 WM_CHAR）" % mode)
             # 校验失败本身无法区分丢字、格式差异和乱码。只有短探测读回正确，才重写正文。
             for attempt in range(2):
                 current = read_ui(hwnd)
@@ -1299,8 +1472,9 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
                     return False, "content_mismatch" if attempt else "gbk_unsupported"
                 input_before = _input_snapshot()
                 draft_dirty = True
-                ok, skipped = sender.type_text(text, char_gap=char_gap,
-                                               strip_unencodable=strip_unencodable, mode=mode)
+                ok, skipped = _type_text(sender, current.get("edit"), text,
+                                         mode=mode, char_gap=char_gap,
+                                         strip_unencodable=strip_unencodable, log=log)
                 if not ok:
                     sender.end_input()
                     return False, "input_dirty"
@@ -1421,10 +1595,10 @@ def probe(hwnd=0, log=print, with_send=None, unhide=True):
         result["rows"] = [n for n, _c in info["rows"]][:8]
 
         log("① 物化：节点数 = %d（160+ 说明成功；2 说明没物化）" % result["nodes"])
-        log("② 读：输入框 = %s | 当前会话 = %r | 输入框内容 = %r"
-            % (result["edit"], result["chat"], result["value"]))
+        log("② 读：输入框 = %s | 当前会话 = %s | 输入框内容 = %s"
+            % (result["edit"], safe_name(result["chat"]), safe_text(result["value"])))
         log("   发送按钮中心 = %s" % (result["send_xy"],))
-        log("   会话列表 = %s" % (result["rows"],))
+        log("   会话列表 = %s" % ([safe_name(x) for x in result["rows"]],))
         hint = tree_hint(result["nodes"])
         if hint:
             log("   ！" + hint)

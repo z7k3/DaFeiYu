@@ -38,7 +38,7 @@ function usageSnapshot(runtime) {
 }
 
 /**
- * 单轮预算（只给内部 status / 调试台计数；不接 UI、不提供预算接口）。
+ * 单轮预算（只给内部 status / 启动器计数；不接 UI、不提供预算接口）。
  * system 只测量，不参与裁剪。
  */
 function budgetSnapshot(runtime) {
@@ -89,6 +89,8 @@ function statusPayload(runtime) {
     },
     gateways: [...gateways.values()].map((g) => g.status()),
     webhookPaths: [...gateways.keys()].map((p) => `/webhook/${p}`),
+    // 统一调度的只读快照：下次什么时候跑、上轮有没有失败（不含业务正文）。
+    scheduler: runtime.scheduler && typeof runtime.scheduler.list === 'function' ? runtime.scheduler.list() : [],
   };
 }
 

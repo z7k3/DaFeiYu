@@ -1,6 +1,8 @@
 'use strict';
 
 const { configuredWhitelist, sendDenial } = require('../core/wechatSendPolicy');
+const { sameWxid } = require('../core/master');
+const time = require('../infra/time');
 
 // 读布尔开关：兼容老配置里的字符串 "false"（Boolean("false") 会被当成开）
 const { toBool } = require('../infra/features');
@@ -9,7 +11,7 @@ const { toBool } = require('../infra/features');
  * 主动搭话（care）：没事的时候她自己来找你说句话，问问「在干啥 / 累不累」。
  *
  * 桥接定时问服务端「该不该发」，服务端说该发就生成内容。
- * 区别是这里由调试台控制**时间窗**和**频率**，而且用纯函数算，方便测试。
+ * 区别是这里由启动器设置控制**时间窗**和**频率**，而且用纯函数算，方便测试。
  *
  * 设计要点：
  *   - 时间窗用 `'09:00-12:00'` 这种字符串，跨零点（22:00-02:00）也认；
@@ -20,66 +22,12 @@ const { toBool } = require('../infra/features');
 
 const DEFAULT_WINDOW = '09:00-23:00';
 
-/** 一天里的分钟数：'09:30' → 570 */
-function parseClock(text) {
-  const m = String(text || '').trim().match(/^(\d{1,2})[:：](\d{2})$/);
-  if (!m) return null;
-  const h = Number(m[1]);
-  const min = Number(m[2]);
-  if (!Number.isFinite(h) || !Number.isFinite(min)) return null;
-  if (h < 0 || h > 24 || min < 0 || min > 59) return null;
-  if (h === 24 && min !== 0) return null;
-  return h * 60 + min;
-}
-
-/** '09:00-12:00' → { start: 540, end: 720, raw: '09:00-12:00' }；写错了返回 null */
-function parseWindow(text) {
-  const raw = String(text == null ? '' : text).trim();
-  if (!raw) return null;
-  const cleaned = raw.replace(/[~～—–到至]/g, '-');
-  const m = cleaned.match(/^(.+?)-(.+)$/);
-  if (!m) return null;
-  const start = parseClock(m[1]);
-  const end = parseClock(m[2]);
-  if (start === null || end === null) return null;
-  // 24:00 当一天结束处理
-  return { start, end: end === 1440 ? 1440 : end, raw };
-}
-
-function pad2(n) {
-  return String(n).padStart(2, '0');
-}
-
-function formatMinutes(min) {
-  const m = Math.max(0, Math.min(1440, Math.round(min)));
-  return `${pad2(Math.floor(m / 60))}:${pad2(m % 60)}`;
-}
-
-/** 把配置里的时间段整理成数组；空/写错就退回默认（全天 09:00-23:00） */
-function parseWindows(list) {
-  const arr = Array.isArray(list) ? list : list ? String(list).split(/[\n,;，；]+/) : [];
-  const out = [];
-  for (const item of arr) {
-    const w = parseWindow(item);
-    if (w) out.push(w);
-  }
-  return out;
-}
-
-/** 一个时间点在不在这些时间段里（支持跨零点） */
-function inWindows(minutesOfDay, windows) {
-  const list = windows && windows.length ? windows : parseWindows([DEFAULT_WINDOW]);
-  const now = ((Math.round(minutesOfDay) % 1440) + 1440) % 1440;
-  for (const w of list) {
-    if (w.start === w.end) continue;                    // 空区间（09:00-09:00）跳过
-    if (w.start < w.end) {
-      if (now >= w.start && now < w.end) return true;
-    } else if (now >= w.start || now < w.end) {          // 跨零点，比如 22:00-02:00
-      return true;
-    }
-  }
-  return false;
-}
+// 时间解析统一在 infra/time：这里只保留同名入口，老调用方/测试不用改。
+const parseClock = time.parseClock;
+const parseWindow = time.parseWindow;
+const parseWindows = time.parseWindows;
+const inWindows = time.inWindows;
+const formatMinutes = time.formatClock;
 
 /** 配置 → 规范化的 care 设置（缺省值都在这里，别散落各处） */
 function normalizeCare(config) {
@@ -127,8 +75,8 @@ function careDue(config, { lastSentTs = 0, sentToday = 0, now = Date.now() } = {
   const care = normalizeCare(config);
   if (!care.enabled) return { due: false, reason: 'disabled', care };
 
-  const d = new Date(now);
-  const minutesOfDay = d.getHours() * 60 + d.getMinutes();
+  const tz = time.resolveTimeZone(config);
+  const minutesOfDay = time.minutesOfDay(now, tz);
   const windows = care.windows.length ? care.windows : parseWindows([DEFAULT_WINDOW]);
   if (!inWindows(minutesOfDay, windows)) {
     return {
@@ -242,7 +190,12 @@ function cleanCareText(raw) {
   return t.slice(0, 40).trim();
 }
 
-/** 白名单默认值：主人 + 文件传输助手（自己给自己发，永远安全） */
+function onlyMasterEnabled(config) {
+  const care = config?.care || {};
+  return typeof care.onlyMaster === 'boolean' ? care.onlyMaster : care.allowOthers !== true;
+}
+
+/** 默认找已绑定的主人；关闭「只找主人」时才保留文件传输助手。 */
 function defaultWhitelist(config) {
   const out = [];
   const masters = ((config && config.persona && config.persona.master) || {}).wxids || [];
@@ -250,26 +203,26 @@ function defaultWhitelist(config) {
     const wxid = String(id || '').trim();
     if (wxid) out.push(wxid);
   }
-  out.push('filehelper');
+  if (!onlyMasterEnabled(config)) out.push('filehelper');
   return [...new Set(out)];
 }
 
 /**
  * 当前生效的白名单（wxid 列表）。
- * 没配就退回默认值（主人 + 文件传输助手），而不是空数组 —— 空数组会让这个功能静默失效。
+ * 没配时使用默认名单；只找主人且没有绑定对象时，名单可以为空。
  */
 function careWhitelist(config = {}) {
   const list = configuredWhitelist(config);
   return list.length || config.wechat?.whitelistOnly === true ? list : defaultWhitelist(config);
 }
 
-/** 是不是主人（wxid 命中，或 filehelper 视为主人自己的会话） */
+/** 按绑定 wxid 或联系人昵称确认主人。 */
 function isMasterTarget(config, wxid, contacts = null) {
   const id = String(wxid || '').trim();
-  if (!id) return false;
-  if (id === 'filehelper') return true;
+  if (!id || id.toLowerCase() === 'filehelper') return false;
   const masters = ((config && config.persona && config.persona.master) || {}).wxids || [];
-  if (masters.some((m) => String(m || '').trim() && String(m).trim() === id)) return true;
+  // 主人 wxid 可能填的是账号目录名（多 4 位哈希），按归一化后的 id 比。
+  if (masters.some((m) => String(m || '').trim() && sameWxid(m, id))) return true;
   // 没填 wxid 时按昵称兜底（以前 wxids 为空 → 一个目标都发不出去）
   const names = ((config && config.persona && config.persona.master) || {}).names || [];
   const hit = contacts && typeof contacts.get === 'function' ? contacts.get(id) : null;
@@ -279,7 +232,7 @@ function isMasterTarget(config, wxid, contacts = null) {
 
 /**
  * 白名单是否被显式配置过（空数组 = 没配，走默认值）。
- * 默认值只带主人 wxid + filehelper；wxid 没填时靠这里再用昵称从联系人缓存里补。
+ * wxid 没填时可用主人昵称从联系人缓存里补。
  */
 function hasExplicitWhitelist(config) {
   return configuredWhitelist(config).length > 0;
@@ -306,7 +259,7 @@ function resolveByName(contacts, names) {
  */
 function careTargets(config, { contacts = null, onlyMaster, allowOthers, allowGroups } = {}) {
   const cfg = (config && config.care) || {};
-  const master = onlyMaster === undefined ? !(cfg.allowOthers === true) : Boolean(onlyMaster);
+  const master = onlyMaster === undefined ? onlyMasterEnabled(config) : Boolean(onlyMaster);
   const others = allowOthers === undefined ? cfg.allowOthers === true : Boolean(allowOthers);
   const groups = allowGroups === undefined ? cfg.allowGroups === true : Boolean(allowGroups);
   let whitelist = careWhitelist(config);
@@ -319,19 +272,14 @@ function careTargets(config, { contacts = null, onlyMaster, allowOthers, allowGr
   const out = [];
   for (const raw of whitelist) {
     const wxid = String(raw).trim();
-    const isFile = wxid === 'filehelper';
+    const isFile = wxid.toLowerCase() === 'filehelper';
     const isGroup = !isFile && /@chatroom$/i.test(wxid);
     const hit = contacts && typeof contacts.get === 'function' ? contacts.get(wxid) : null;
     const name = isFile ? '文件传输助手' : (hit ? hit.label || hit.name : wxid);
     if (sendDenial(config, { id: wxid, names: [name, hit?.name, hit?.remark], isGroup })) continue;
-    const masterHit = isFile || isMasterTarget(config, wxid, contacts);
-    if (isGroup) {
-      if (!groups) continue;
-    } else if (!masterHit) {
-      // 非主人的私聊：只有开了「允许主动找别人」才发
-      if (master && !others) continue;
-      if (!master && !others) continue;
-    }
+    const masterHit = !isGroup && isMasterTarget(config, wxid, contacts);
+    if (master && !masterHit) continue;
+    if (isGroup ? !groups : !isFile && !masterHit && !others) continue;
     out.push({ wxid, name, isGroup, kind: isGroup ? 'group' : (masterHit ? 'master' : 'other') });
   }
   // 排序：真主人 → 文件传输助手 → 别人的私聊 → 群（主人优先，别先发给自己）
@@ -364,7 +312,7 @@ function careDecide(config, { contacts = null, lastSentTs = 0, sentToday = 0, ac
       reason: whitelist.length ? 'whitelist_filtered' : 'whitelist_empty',
       target: null,
       whitelist,
-      onlyMaster: !(cfg.allowOthers === true),
+      onlyMaster: onlyMasterEnabled(config),
       allowOthers: cfg.allowOthers === true,
       allowGroups: cfg.allowGroups === true,
     };

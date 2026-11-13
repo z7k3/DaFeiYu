@@ -1,0 +1,629 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace WhaleLauncher
+{
+    internal sealed record PluginInfo(string Id, string Name, string Author, string Version, string MinAppVersion,
+        string Description, string ResultLabel, int Api, string Download = null, string Sha256 = null, string Kind = "tool",
+        string MaxAppVersion = null, int DiscussionIssue = 0, string HostAction = null,
+        string[] Hooks = null, string[] Permissions = null, string Signature = null)
+    {
+        internal bool IsPersona => Kind == "persona";
+        internal bool IsMessage => Api == 3 && Kind == "message";
+        internal string CompatibilityLabel => string.IsNullOrEmpty(MaxAppVersion)
+            ? $"鲸鲸 {MinAppVersion} 及以上" : $"鲸鲸 {MinAppVersion} – {MaxAppVersion}";
+    }
+    internal sealed record PluginFeedback(int Comments, int Favorites);
+    internal sealed record PluginPackage(PluginInfo Info, byte[] Module, string Prompt = null);
+
+    internal sealed class PluginMarket
+    {
+        internal const string CatalogUrl = "https://raw.githubusercontent.com/Banan1cee/whale-girl-plugins/main/index.json";
+        internal const string DigestAction = "chat.summary";
+        private const string CatalogV2Url = "https://raw.githubusercontent.com/Banan1cee/whale-girl-plugins/main/index-v2.json";
+        private const string CatalogV3Url = "https://raw.githubusercontent.com/Banan1cee/whale-girl-plugins/main/index-v3.json";
+        private const string PersonaCatalogUrl = "https://raw.githubusercontent.com/Banan1cee/whale-girl-plugins/main/index-personas.json";
+        private const int PackageLimit = 1024 * 1024;
+        private const int PluginTimeoutMs = 3000;
+        private static readonly HttpClient Http = CreateClient();
+        private static readonly JsonSerializerOptions ReadOptions = new() { PropertyNameCaseInsensitive = true };
+
+        private sealed class DownloadMissingException : IOException
+        {
+            internal DownloadMissingException() : base("下载文件不存在") { }
+        }
+
+        private static HttpClient CreateClient()
+        {
+            var client = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("WhaleGirl-PluginMarket");
+            return client;
+        }
+        private readonly string _baseDir;
+        private readonly string _root;
+
+        internal PluginMarket(string baseDir)
+        {
+            _baseDir = baseDir;
+            _root = Path.Combine(baseDir, "data", "plugins");
+        }
+
+        private void EnsureRoot()
+        {
+            var data = Directory.CreateDirectory(Path.GetDirectoryName(_root));
+            if ((data.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("插件数据目录不能是链接");
+            if ((Directory.CreateDirectory(_root).Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("插件目录不能是链接");
+        }
+
+        private static bool ValidId(string id) => Regex.IsMatch(id ?? "", @"\A[a-z][a-z0-9-]{0,47}\z")
+            && !Regex.IsMatch(id, @"\A(?:con|prn|aux|nul|com[1-9]|lpt[1-9])\z");
+
+        /// <summary>展示前把换行、控制字符和双向文本标记压成空格，避免用清单字段伪造对话框。</summary>
+        internal static string SafeText(string value, int max = 600)
+        {
+            if (string.IsNullOrEmpty(value)) return "";
+            var text = new StringBuilder(value.Length);
+            var pendingSpace = false;
+            foreach (var ch in value)
+            {
+                if (char.IsControl(ch) || ch is '\u061C' or '\u200E' or '\u200F'
+                    || ch is >= '\u202A' and <= '\u202E' || ch is >= '\u2066' and <= '\u2069')
+                {
+                    pendingSpace = text.Length > 0;
+                    continue;
+                }
+                if (pendingSpace && (ch == ' ' || ch == '\t'))
+                {
+                    text.Append(' ');
+                    pendingSpace = false;
+                    continue;
+                }
+                if (pendingSpace)
+                {
+                    text.Append(' ');
+                    pendingSpace = false;
+                }
+                text.Append(ch);
+            }
+            var result = text.ToString().Trim();
+            return result.Length > max ? result[..max] : result;
+        }
+
+        /// <summary>工具结果保留换行，但仍清掉控制字符和双向文本标记。</summary>
+        internal static string SafeMultiline(string value, int max = 65536)
+        {
+            if (string.IsNullOrEmpty(value)) return "";
+            var text = new StringBuilder(value.Length);
+            foreach (var ch in value)
+            {
+                if (ch is '\n' or '\r' or '\t') { text.Append(ch); continue; }
+                if (char.IsControl(ch) || ch is '\u061C' or '\u200E' or '\u200F'
+                    || ch is >= '\u202A' and <= '\u202E' || ch is >= '\u2066' and <= '\u2069') continue;
+                text.Append(ch);
+            }
+            var result = text.ToString();
+            return result.Length > max ? result[..max] : result;
+        }
+
+        internal static bool SameAuthor(string left, string right) =>
+            string.Equals((left ?? "").Trim(), (right ?? "").Trim(), StringComparison.OrdinalIgnoreCase);
+
+        internal static bool Compatible(PluginInfo info, string version) =>
+            Version.TryParse(version, out var app) && Version.TryParse(info.MinAppVersion, out var min) && app >= min
+            && (string.IsNullOrEmpty(info.MaxAppVersion) || (Version.TryParse(info.MaxAppVersion, out var max) && app <= max));
+
+        private static bool Valid(PluginInfo info) => info != null && ValidId(info.Id) && (info.Api == 1 && info.HostAction == null
+                || info.Api == 2 && info.Kind == "tool" && info.HostAction is null or DigestAction
+                || info.IsMessage && info.HostAction == null && info.Hooks is { Length: > 0 and <= 7 }
+                    && info.Hooks.Distinct().Count() == info.Hooks.Length
+                    && info.Hooks.All(h => h is "chat.received" or "chat.pre_reply" or "chat.prompt" or "chat.generate" or "chat.reply" or "chat.before_send" or "chat.dispatched")
+                    && info.Permissions is { Length: <= 2 }
+                    && info.Permissions.All(p => p is "chat.history" or "model.prompt"))
+            && Version.TryParse(info.Version, out _) && Version.TryParse(info.MinAppVersion, out var min)
+            && (!info.IsMessage || min >= new Version(4, 1, 0))
+            && (string.IsNullOrEmpty(info.MaxAppVersion) || (Version.TryParse(info.MaxAppVersion, out var max) && max >= min))
+            && info.DiscussionIssue >= 0
+            && info.Name?.Trim().Length is > 0 and <= 80
+            && info.Author?.Trim().Length is > 0 and <= 80
+            && SafeText(info.Name, 80).Length > 0
+            && SafeText(info.Author, 80).Length > 0
+            && info.Description?.Length is <= 600 && (info.IsPersona || info.IsMessage ||
+                (info.Kind == "tool" && info.ResultLabel?.Trim().Length is > 0 and <= 80
+                    && SafeText(info.ResultLabel, 80).Length > 0));
+
+        internal static PluginPackage ReadPackage(byte[] bytes)
+        {
+            if (bytes.Length > PackageLimit) throw new InvalidDataException("插件包超过 1 MiB");
+            using var zip = new ZipArchive(new MemoryStream(bytes), ZipArchiveMode.Read);
+            if (zip.Entries.Count != 2 || zip.GetEntry("plugin.json") is not { } manifest)
+                throw new InvalidDataException("ZIP 根目录必须包含 plugin.json 和一个插件文件");
+            using var metadata = manifest.Open();
+            var info = JsonSerializer.Deserialize<PluginInfo>(ReadLimited(metadata, 8192), ReadOptions);
+            if (!Valid(info)) throw new InvalidDataException("插件清单无效或接口版本不支持");
+            if (info.IsPersona)
+            {
+                using var preset = (zip.GetEntry("persona.json") ??
+                    throw new InvalidDataException("人设包需要 persona.json")).Open();
+                using var json = JsonDocument.Parse(ReadLimited(preset, 64 * 1024));
+                var data = json.RootElement;
+                if (data.ValueKind != JsonValueKind.Object ||
+                    !data.TryGetProperty("customPrompt", out var value) || value.ValueKind != JsonValueKind.String ||
+                    value.GetString()?.Trim().Length is not (> 0 and <= 24000))
+                    throw new InvalidDataException("人设正文须填写在 customPrompt，最多 24000 字符");
+                return new PluginPackage(info, null, value.GetString().Trim());
+            }
+            using var code = (zip.GetEntry("plugin.wasm") ??
+                throw new InvalidDataException("工具包需要 plugin.wasm")).Open();
+            var wasm = ReadLimited(code, 512 * 1024);
+            if (wasm.Length < 8 || !wasm.AsSpan(0, 8).SequenceEqual(new byte[] { 0, 97, 115, 109, 1, 0, 0, 0 }))
+                throw new InvalidDataException("插件缺少有效的 WebAssembly 模块");
+            return new PluginPackage(info, wasm);
+        }
+
+        private static byte[] ReadLimited(Stream stream, int limit)
+        {
+            using var output = new MemoryStream();
+            var buffer = new byte[8192];
+            int count;
+            while ((count = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                if (output.Length + count > limit) throw new InvalidDataException("插件文件超过大小限制");
+                output.Write(buffer, 0, count);
+            }
+            return output.ToArray();
+        }
+
+        // GitHub raw / releases 在部分网络会被拦；按直达 → jsDelivr → 公共反代的顺序试。
+        // 只有原始地址通过 GitHub HTTPS 校验后才生成镜像，镜像本身也不允许带用户信息。
+        private static IEnumerable<string> DownloadCandidates(string url)
+        {
+            yield return url;
+            if (url.StartsWith("https://raw.githubusercontent.com/", StringComparison.Ordinal))
+            {
+                var rest = url.Substring("https://raw.githubusercontent.com/".Length);
+                var parts = rest.Split('/');
+                if (parts.Length >= 3)
+                    yield return $"https://cdn.jsdelivr.net/gh/{parts[0]}/{parts[1]}@{parts[2]}/{string.Join("/", parts.Skip(3))}";
+            }
+            if (url.StartsWith("https://raw.githubusercontent.com/", StringComparison.Ordinal)
+                || url.StartsWith("https://github.com/", StringComparison.Ordinal)
+                || url.StartsWith("https://release-assets.githubusercontent.com/", StringComparison.Ordinal)
+                || url.StartsWith("https://objects.githubusercontent.com/", StringComparison.Ordinal))
+            {
+                yield return "https://gh-proxy.com/" + url;
+                yield return "https://ghfast.top/" + url;
+            }
+        }
+
+        private static async Task<byte[]> DownloadAsync(string url, int limit, bool feedback = false, bool stopOnNotFound = false)
+        {
+            Exception last = null;
+            foreach (var candidate in DownloadCandidates(url))
+            {
+                try
+                {
+                    return await DownloadOnce(candidate, limit, feedback, stopOnNotFound);
+                }
+                catch (DownloadMissingException) { throw; }
+                catch (Exception ex) when (ex is HttpRequestException or InvalidDataException
+                    or OperationCanceledException or IOException)
+                {
+                    last = ex;
+                }
+            }
+            throw last ?? new InvalidDataException("插件下载失败");
+        }
+
+        private static async Task<byte[]> DownloadOnce(string url, int limit, bool feedback = false, bool stopOnNotFound = false)
+        {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) throw new InvalidDataException("下载地址无效");
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(feedback ? 5 : 20));
+            for (var hop = 0; hop < 5; hop++)
+            {
+                var allowedHost = uri.Host is "raw.githubusercontent.com" or "github.com" or "release-assets.githubusercontent.com"
+                    or "objects.githubusercontent.com" or "cdn.jsdelivr.net" or "gh-proxy.com" or "ghfast.top"
+                    || (feedback && uri.Host == "api.github.com");
+                if (uri.Scheme != Uri.UriSchemeHttps || !uri.IsDefaultPort || uri.UserInfo.Length != 0 || !allowedHost)
+                    throw new InvalidDataException("插件下载地址须使用 GitHub HTTPS");
+                using var response = await Http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+                if ((int)response.StatusCode is 301 or 302 or 303 or 307 or 308 && response.Headers.Location is { } location)
+                {
+                    uri = new Uri(uri, location);
+                    continue;
+                }
+                if (stopOnNotFound && response.StatusCode == HttpStatusCode.NotFound)
+                    throw new DownloadMissingException();
+                response.EnsureSuccessStatusCode();
+                if (response.Content.Headers.ContentLength > limit) throw new InvalidDataException("下载文件超过大小限制");
+                await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token);
+                using var result = new MemoryStream();
+                var buffer = new byte[8192];
+                int count;
+                while ((count = await stream.ReadAsync(buffer.AsMemory(), timeout.Token)) > 0)
+                {
+                    if (result.Length + count > limit) throw new InvalidDataException("下载文件超过大小限制");
+                    result.Write(buffer, 0, count);
+                }
+                return result.ToArray();
+            }
+            throw new InvalidDataException("下载重定向次数过多");
+        }
+
+        internal static async Task<PluginInfo[]> CatalogAsync()
+        {
+            // index.json 是主目录，拿不到或签名不对就整体拒绝；
+            // v2/v3 与人设目录是可选目录，缺签名时跳过，避免旧目录把整个市场拖死。
+            var items = await LoadCatalogAsync(CatalogUrl, 1, "tool");
+            try { items = items.Concat(await LoadCatalogAsync(CatalogV2Url, 2, "tool")).ToArray(); }
+            catch (Exception ex) when (ex is HttpRequestException or JsonException or InvalidDataException
+                or OperationCanceledException or InvalidOperationException)
+            { /* 独立目录可能尚未发布或尚未签名。 */ }
+            try { items = items.Concat(await LoadCatalogAsync(CatalogV3Url, 3, "message")).ToArray(); }
+            catch (Exception ex) when (ex is HttpRequestException or JsonException or InvalidDataException
+                or OperationCanceledException or InvalidOperationException) { }
+            try { items = items.Concat(await LoadCatalogAsync(PersonaCatalogUrl, 1, "persona")).ToArray(); }
+            catch (Exception ex) when (ex is HttpRequestException or JsonException or InvalidDataException
+                or OperationCanceledException or InvalidOperationException) { }
+            return items.GroupBy(i => i.Id).SelectMany(group => group
+                .GroupBy(i => i.Version).Select(version => version.First())).ToArray();
+        }
+
+        private static async Task<PluginInfo[]> LoadCatalogAsync(string url, int? expectedApi = null,
+            string expectedKind = null)
+        {
+            var bytes = await DownloadAsync(url, 256 * 1024);
+            string signature = null;
+            try
+            {
+                signature = Encoding.UTF8.GetString(await DownloadAsync(url + ".sig", 4096, stopOnNotFound: true)).Trim();
+            }
+            catch (DownloadMissingException)
+            {
+                // 目录还没签名时按未签名目录加载：市场初期没有 .sig，强制验签会把整个市场挡在门外。
+                // 一旦目录带了 .sig 就必须验过才用，签错依然拒绝（ParseSignedCatalog 里抛）。
+            }
+            if (string.IsNullOrWhiteSpace(signature)) return ParseCatalog(bytes, expectedApi, expectedKind);
+            return ParseSignedCatalog(bytes, signature, expectedApi, expectedKind);
+        }
+
+        internal static PluginInfo[] ParseSignedCatalog(byte[] bytes, string signature, int? expectedApi = null,
+            string expectedKind = null)
+        {
+            if (!PluginTrust.Verify(bytes, signature))
+                throw new InvalidDataException("市场目录签名无效，已拒绝加载");
+            return ParseCatalog(bytes, expectedApi, expectedKind);
+        }
+
+        internal static PluginInfo[] ParseCatalog(byte[] bytes, int? expectedApi = null, string expectedKind = null)
+        {
+            using var json = JsonDocument.Parse(bytes);
+            if (json.RootElement.ValueKind != JsonValueKind.Array)
+                throw new InvalidDataException("市场目录格式无效");
+            return json.RootElement.EnumerateArray().Select(item =>
+            {
+                try { return item.Deserialize<PluginInfo>(ReadOptions); }
+                catch (JsonException) { return null; }
+            }).Where(i => Valid(i) && (!expectedApi.HasValue || i.Api == expectedApi.Value)
+                && (expectedKind == null || i.Kind == expectedKind) && !string.IsNullOrWhiteSpace(i.Download)
+                && Regex.IsMatch(i.Sha256 ?? "", @"\A[0-9a-fA-F]{64}\z")).ToArray();
+        }
+
+        internal static async Task<Dictionary<int, PluginFeedback>> FeedbackAsync()
+        {
+            const string url = "https://api.github.com/repos/Banan1cee/whale-girl-plugins/issues?state=open&per_page=100";
+            using var payload = JsonDocument.Parse(await DownloadAsync(url, 1024 * 1024, feedback: true));
+            var feedback = new Dictionary<int, PluginFeedback>();
+            foreach (var issue in payload.RootElement.EnumerateArray())
+            {
+                if (issue.TryGetProperty("pull_request", out _)) continue;
+                var number = issue.GetProperty("number").GetInt32();
+                var comments = issue.GetProperty("comments").GetInt32();
+                var favorites = issue.GetProperty("reactions").GetProperty("heart").GetInt32();
+                feedback[number] = new PluginFeedback(comments, favorites);
+            }
+            return feedback;
+        }
+
+        private string FileFor(string id, string suffix)
+        {
+            if (!ValidId(id)) throw new InvalidDataException("插件 ID 无效");
+            var path = Path.Combine(_root, id + suffix);
+            if (File.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("插件文件不能是链接");
+            return path;
+        }
+
+        private static byte[] ReadFile(string path)
+        {
+            using var stream = File.OpenRead(path);
+            return ReadLimited(stream, PackageLimit);
+        }
+
+        internal PluginInfo[] Installed()
+        {
+            EnsureRoot();
+            var installed = new List<PluginInfo>();
+            foreach (var path in Directory.EnumerateFiles(_root, "*.zip"))
+            {
+                try
+                {
+                    var id = Path.GetFileNameWithoutExtension(path);
+                    var info = ReadPackage(ReadFile(FileFor(id, ".zip"))).Info;
+                    if (info.Id == id) installed.Add(info);
+                }
+                catch (Exception ex) when (ex is IOException or InvalidDataException or JsonException) { }
+            }
+            return installed.OrderBy(i => i.Name).ToArray();
+        }
+
+        internal bool Enabled(string id)
+        {
+            EnsureRoot();
+            return File.Exists(FileFor(id, ".enabled")) || File.Exists(FileFor(id, ".persona.json"));
+        }
+
+        internal void SetEnabled(string id, bool enabled)
+        {
+            EnsureRoot();
+            var marker = FileFor(id, ".enabled");
+            var preset = FileFor(id, ".persona.json");
+            if (!enabled)
+            {
+                File.Delete(FileFor(id, ".flow-grant.json"));
+                File.Delete(marker);
+                File.Delete(preset);
+                return;
+            }
+            var package = ReadPackage(ReadFile(FileFor(id, ".zip")));
+            if (package.Info.Id != id || !Compatible(package.Info, UpdateManifestService.LocalVersion(_baseDir)))
+                throw new InvalidDataException("插件标识或兼容版本无效");
+            if (package.Info.IsPersona)
+            {
+                WriteAtomically(preset, JsonSerializer.SerializeToUtf8Bytes(new
+                {
+                    name = package.Info.Name, description = package.Info.Description,
+                    version = package.Info.Version, customPrompt = package.Prompt
+                }));
+            }
+            else if (package.Info.IsMessage)
+            {
+                PublishMessagePackage(package);
+                SetMessageSettings(id, MessageSettings(id));
+                WriteAtomically(marker, []);
+            }
+            else if (!File.Exists(marker))
+                using (File.Open(marker, FileMode.CreateNew)) { }
+        }
+
+        internal void Uninstall(string id)
+        {
+            SetEnabled(id, false);
+            File.Delete(FileFor(id, ".zip"));
+            File.Delete(FileFor(id, ".flow.json"));
+            DeletePluginData(id);
+        }
+
+        /// <summary>清掉插件自己的设置与会话状态；插件包和清单由调用方决定是否保留。</summary>
+        private void DeletePluginData(string id)
+        {
+            File.Delete(FileFor(id, ".flow-settings.json"));
+            // 消息插件的会话状态是聊天派生数据，卸载或换作者时必须一起清掉；
+            // 否则同 ID 的新插件会继承旧状态，用户也会以为已经删干净了。
+            foreach (var pattern in new[] { id + ".*.state.json", id + ".*.state.json.*.tmp" })
+            {
+                foreach (var file in Directory.EnumerateFiles(_root, pattern))
+                {
+                    try { File.Delete(file); }
+                    catch (IOException) { /* 被占用时下次启动还能再清；卸载本身不应失败。 */ }
+                }
+            }
+        }
+
+        internal async Task InstallAsync(PluginInfo listing)
+        {
+            var bytes = await DownloadAsync(listing.Download, PackageLimit);
+            // 签名可选：条目里带了 Signature 就必须验过；没带就只靠 SHA-256 + 下载域名白名单。
+            if (!string.IsNullOrWhiteSpace(listing.Signature) && !PluginTrust.Verify(bytes, listing.Signature))
+                throw new InvalidDataException("插件包签名无效，已拒绝安装");
+            if (!Convert.ToHexString(SHA256.HashData(bytes)).Equals(listing.Sha256, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("插件包校验失败");
+            var info = ReadPackage(bytes).Info;
+            if (JsonSerializer.Serialize(info) != JsonSerializer.Serialize(listing with
+                {
+                    Download = info.Download, Sha256 = info.Sha256, DiscussionIssue = info.DiscussionIssue,
+                    Signature = info.Signature
+                }))
+                throw new InvalidDataException("插件清单与市场目录不一致");
+            Install(bytes, info);
+        }
+
+        internal bool InstallLocal(string file, Func<PluginInfo, PluginInfo, bool> confirm = null)
+        {
+            var bytes = ReadFile(file);
+            return Install(bytes, ReadPackage(bytes).Info, confirm);
+        }
+
+        private bool Install(byte[] bytes, PluginInfo info, Func<PluginInfo, PluginInfo, bool> confirm = null)
+        {
+            if (!Compatible(info, UpdateManifestService.LocalVersion(_baseDir)))
+                throw new InvalidDataException("这个插件需要更新的鲸鲸版本");
+            var target = FileFor(info.Id, ".zip");
+            PluginInfo current = null;
+            if (Directory.Exists(_root)) EnsureRoot();
+            if (File.Exists(target))
+            {
+                current = ReadPackage(ReadFile(target)).Info;
+                if (current.Kind != info.Kind) throw new InvalidDataException("同一插件 ID 不能更换类型");
+                if (Version.Parse(current.Version) >= Version.Parse(info.Version))
+                    throw new InvalidDataException("已安装相同或更新版本");
+                // 市场更新不能跨作者接管同一个 ID；本地 ZIP 仍可安装，但确认框会明确提示作者变化。
+                if (!SameAuthor(current.Author, info.Author) && confirm == null)
+                    throw new InvalidDataException("插件 ID 已被其他作者使用，请先卸载旧版本");
+            }
+            if (confirm != null && !confirm(info, current)) return false;
+            EnsureRoot();
+            // 本地确认允许换作者，但不能让新作者继承旧插件的授权和聊天状态。
+            if (current != null && !SameAuthor(current.Author, info.Author))
+            {
+                SetEnabled(info.Id, false);
+                DeletePluginData(info.Id);
+            }
+            if (current != null && info.IsPersona) SetEnabled(info.Id, false);
+            WriteAtomically(target, bytes);
+            if (info.IsMessage)
+            {
+                File.Delete(FileFor(info.Id, ".flow-grant.json"));
+                File.Delete(FileFor(info.Id, ".enabled"));
+                PublishMessagePackage(ReadPackage(bytes));
+            }
+            return true;
+        }
+
+        private void PublishMessagePackage(PluginPackage package)
+        {
+            var info = package.Info;
+            WriteAtomically(FileFor(info.Id, ".flow.json"), JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                id = info.Id, api = 3, hooks = info.Hooks, permissions = info.Permissions,
+                wasm = Convert.ToBase64String(package.Module)
+            }, new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
+        }
+
+        internal string MessageSettings(string id)
+        {
+            var file = FileFor(id, ".flow-settings.json");
+            if (!File.Exists(file)) return "{}";
+            return Encoding.UTF8.GetString(ReadFile(file));
+        }
+
+        internal void SetMessageSettings(string id, string settings)
+        {
+            EnsureRoot();
+            if (Encoding.UTF8.GetByteCount(settings) > 4096) throw new InvalidDataException("设置超过 4 KiB");
+            using var value = JsonDocument.Parse(settings);
+            if (value.RootElement.ValueKind != JsonValueKind.Object) throw new InvalidDataException("设置需要 JSON 对象");
+            var package = ReadPackage(ReadFile(FileFor(id, ".zip")));
+            if (!package.Info.IsMessage || package.Info.Id != id) throw new InvalidDataException("消息插件无效");
+            var flow = ReadFile(FileFor(id, ".flow.json"));
+            WriteAtomically(FileFor(id, ".flow-settings.json"), Encoding.UTF8.GetBytes(settings));
+            WriteAtomically(FileFor(id, ".flow-grant.json"), JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                enabled = true, hash = Convert.ToHexString(SHA256.HashData(flow)).ToLowerInvariant(), settings = value.RootElement
+            }));
+        }
+
+        private void WriteAtomically(string target, byte[] bytes)
+        {
+            var staging = Path.Combine(_root, Guid.NewGuid().ToString("N") + ".tmp");
+            try
+            {
+                using (var stream = File.Open(staging, FileMode.CreateNew)) stream.Write(bytes);
+                File.Move(staging, target, true);
+            }
+            finally { File.Delete(staging); }
+        }
+
+        internal async Task<string> RunAsync(string id, string input, string authorizedAction = null,
+            Func<string, Task<string>> host = null)
+        {
+            EnsureRoot();
+            if (!Enabled(id)) throw new InvalidOperationException("请先启用插件");
+            var package = ReadPackage(ReadFile(FileFor(id, ".zip")));
+            if (package.Info.IsPersona || package.Info.IsMessage || package.Info.Id != id || !Compatible(package.Info, UpdateManifestService.LocalVersion(_baseDir)))
+                throw new InvalidDataException("插件类型、标识或兼容版本无效");
+            if (package.Info.HostAction != authorizedAction)
+                throw new InvalidOperationException("此插件需要确认宿主权限");
+            if (authorizedAction != null)
+                input = await (host ?? throw new InvalidOperationException("此权限暂不可用"))(input);
+
+            var node = Path.Combine(_baseDir, "runtime", "node.exe");
+            if (!File.Exists(node)) throw new IOException("运行插件需要鲸鲸自带的 Node 运行时");
+            var start = new ProcessStartInfo(node)
+            {
+                UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true,
+                RedirectStandardOutput = true, RedirectStandardError = true,
+                StandardInputEncoding = new UTF8Encoding(false), StandardOutputEncoding = Encoding.UTF8,
+            };
+            start.Environment.Clear();
+            start.Environment["SystemRoot"] = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            start.ArgumentList.Add("--wasm-max-mem-pages=16");
+            start.ArgumentList.Add("--wasm-max-table-size=1024");
+            start.ArgumentList.Add("--max-old-space-size=64");
+            start.ArgumentList.Add("-e");
+            start.ArgumentList.Add(Runner);
+            using var worker = Process.Start(start) ?? throw new IOException("无法启动插件运行器");
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(PluginTimeoutMs));
+            var output = worker.StandardOutput.ReadToEndAsync();
+            var errors = worker.StandardError.ReadToEndAsync();
+            try
+            {
+                var bytes = Encoding.UTF8.GetBytes(input);
+                if (bytes.Length > 65536) throw new InvalidDataException("输入超过 64 KiB");
+                var payload = JsonSerializer.Serialize(new
+                {
+                    api = package.Info.Api, wasm = Convert.ToBase64String(package.Module),
+                    input = Convert.ToBase64String(bytes), timeoutMs = PluginTimeoutMs
+                });
+                await worker.StandardInput.WriteAsync(payload.AsMemory(), timeout.Token);
+                worker.StandardInput.Close();
+                await worker.WaitForExitAsync(timeout.Token);
+                var result = await output;
+                if (worker.ExitCode != 0 || (package.Info.Api == 1 && !int.TryParse(result, out _)))
+                    throw new InvalidDataException("插件执行失败，或请求了未开放的接口");
+                return result;
+            }
+            catch (OperationCanceledException) { throw new TimeoutException("插件运行超时"); }
+            finally
+            {
+                if (!worker.HasExited) worker.Kill(entireProcessTree: true);
+                await errors;
+            }
+        }
+
+        // 插件只拿到字节查询函数，无 WASI、文件、网络或微信接口。
+        private const string Runner = """
+            let data = '';
+            process.stdin.setEncoding('utf8').on('data', chunk => { data += chunk; }).on('end', () => {
+              let guard;
+              try {
+                const args = JSON.parse(data);
+                guard = setTimeout(() => process.exit(1), Math.max(1, Number(args.timeoutMs) || 3000) + 250);
+                const input = Buffer.from(args.input, 'base64');
+                const module = new WebAssembly.Module(Buffer.from(args.wasm, 'base64'));
+                const output = [];
+                const imports = {
+                  input_size: () => input.length, input_byte: i => input[i] ?? -1
+                };
+                if (args.api === 2) imports.output_byte = value => {
+                  if (output.length >= 65536 || value < 0 || value > 255) throw new Error();
+                  output.push(value);
+                };
+                if (WebAssembly.Module.imports(module).some(i =>
+                  i.module !== 'whale' || i.kind !== 'function' || !Object.hasOwn(imports, i.name)))
+                  throw new Error();
+                const wasm = new WebAssembly.Instance(module, { whale: imports });
+                const value = wasm.exports.run();
+                if (!Number.isInteger(value) || value !== (value | 0)) throw new Error();
+                if (args.api === 1) process.stdout.write(String(value));
+                else if (value === 0) process.stdout.write(new TextDecoder('utf-8', {fatal: true}).decode(Uint8Array.from(output)));
+                else throw new Error();
+                clearTimeout(guard);
+              } catch { clearTimeout(guard); process.exitCode = 1; }
+            });
+            """;
+    }
+}

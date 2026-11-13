@@ -42,7 +42,7 @@ test('开关能被配置关掉，关了就走旧行为', () => {
   fs.rmSync(root, { recursive: true, force: true, maxRetries: 6, retryDelay: 60 });
 });
 
-test('每个开关都有 label/desc，控制台才显示得出来', () => {
+test('每个开关都有 label/desc，启动器才显示得出来', () => {
   const { root, cfg } = boot();
   const list = features.list(cfg);
   assert.ok(list.length >= 5);
@@ -61,7 +61,7 @@ test('L1：@ 了别人时不算在说她（用 mentionedNames 判）', () => {
 });
 
 test('L1：「机器人」不再裸算叫她，要带指代', () => {
-  const src = fs.readFileSync(path.join(ROOT, 'src', 'core', 'trigger.js'), 'utf8');
+  const src = fs.readFileSync(path.join(ROOT, 'src', 'core', 'addressing.js'), 'utf8');
   assert.match(src, /function namedHerIn/, '要有统一的「是否在叫她」helper');
   assert.match(src, /这个\|那个\|你\|破\|臭\|傻\|烂\|死/, '机器人需要带指代才算叫她');
 });

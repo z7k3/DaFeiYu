@@ -4,7 +4,7 @@
 > certificate by [SignPath Foundation](https://signpath.org).
 
 本文件说明鲸鲸（whale_girl）的 Windows 发行包是怎么签名的、谁有权批准、怎么验证。
-对应的流水线在 [`.github/workflows/installer.yml`](.github/workflows/installer.yml)。
+对应的流水线在 [`.github/workflows/installer.yml`](../.github/workflows/installer.yml)。
 
 > **许可提示：** 本项目自 4.0.x 起采用 **AGPL-3.0-only**（OSI 认可的开源许可证）。
 > SignPath Foundation 的免费 OSS 签名要求 OSI 认可的许可证；AGPL-3.0 符合这一前提，
@@ -53,7 +53,7 @@
 
 本项目的完整隐私政策只有一份，位于仓库根目录：
 
-- [PRIVACY.md](../PRIVACY.md)
+- [PRIVACY.md](PRIVACY.md)
 
 这里不再重复政策正文，避免多处内容不一致。
 

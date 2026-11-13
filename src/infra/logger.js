@@ -10,15 +10,17 @@
  * 所以同一个 logger 可以「界面干净、文件完整」：debug 行不打印，但一定落盘。
  *
  * 来源定位（2026-11 起）：
- *   warn / error 会自动抓调用点，行首多一段 [pipeline/chat.js:422]。
- *   只有这两个级别抓栈——info/debug 量大，为了几微秒的定位去抓栈不值当；
+ *   warn / error / debug 会自动抓调用点，行首多一段 [pipeline/chat.js:422]。
+ *   info 不抓栈：info 主要看模块 tag，且调用频率高，抓栈不值当；
  *   需要模块名的 info 用 child('llm') 这种子 logger，会在行首打 [llm]。
- *   为什么只给 warn/error：用户报障时翻日志，最先找的就是这两级，
- *   而「哪一行报的」决定了能不能直接跳到代码，比搜文案快得多。
+ *   debug 抓栈是因为排查时最常见的问题就是「这条 debug 是哪行打的」；
+ *   它默认只进文件，不会增加控制台开销。
  */
 const fs = require('node:fs');
 const path = require('node:path');
 const util = require('node:util');
+const { scrubSensitive } = require('./privacy');
+const { registerSecrets, redactSecrets } = require('./redact');
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40, silent: 99 };
 const COLORS = {
@@ -129,7 +131,9 @@ function createLogger({ level = 'info', fileLevel = 'debug', file = null, tag = 
 
     const ts = TS_FORMAT.format(new Date());
     // 不省略：对象展开到任意深度、长字符串不截断，否则出错时看不到真正的现场。
-    const text = args
+    // 先按已知密钥打码（redact），再兜底扫描 wxid/群号/手机号等格式（privacy）。
+    for (const arg of args) registerSecrets(arg);
+    const text = scrubSensitive(redactSecrets(args
       .map((a) => (typeof a === 'string' ? a : util.inspect(a, {
         depth: null,
         maxArrayLength: 200,
@@ -137,9 +141,10 @@ function createLogger({ level = 'info', fileLevel = 'debug', file = null, tag = 
         colors: false,
         breakLength: 160,
       })))
-      .join(' ');
+      .join(' ')));
+    // 调用点应只写哈希/长度；这里再兜一层，防止新日志把 wxid、群号、手机号原样带出去。
     // warn/error 抓调用点；抓不到（打包压缩过）就退回模块 tag
-    const site = n >= LEVELS.warn ? callerSite() : '';
+    const site = (n >= LEVELS.warn || lv === 'debug') ? callerSite() : '';
     const prefix = (site || tagName) ? `${site || tagName}  ` : '';
     const line = `[${ts}] ${lv.toUpperCase().padEnd(5)} ${prefix}${text}`;
 

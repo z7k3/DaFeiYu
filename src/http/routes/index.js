@@ -16,8 +16,11 @@ const modules = [
   require('./bridge'),
   require('./stickers'),
   require('./reminders'),
+  require('./diary'),
+  require('./digest'),
   require('./budget'),
   require('./memory'),
+  require('./moments'),
   require('./kb'),
 ];
 

@@ -3,7 +3,7 @@
 /**
  * R2 回归：status 的 1.5 秒结果缓存。
  *
- * 启动器每 2 秒、网页每 3 秒都会拉一次 status。以前每次都同步全量扫库
+ * 启动器每 2 秒都会拉一次 status。以前每次都同步全量扫库
  * （565 张实测 450ms 纯阻塞）；现在异步扫描 + 1.5s 缓存，并且
  * 上传 / 删除 / 改分类 / 维护结束都会显式失效 —— 所以「刚传完立刻看得见」不能退化。
  */
@@ -91,4 +91,28 @@ test('queueOnly 走轻量路径：不扫库，但能看到维护进度', async (
   assert.equal(readdir.count, 0, 'queueOnly 不该读目录');
   assert.equal(body.pending, 0);
   assert.ok(body.maintenance && typeof body.maintenance.phase === 'string');
+});
+
+
+test('保存频率后立即读取缓存也返回新值，包含 0 和 100%', async t => {
+  const { cfg } = fixture(t);
+  cfg.sticker.demandChance = 0.7;
+  const service = new StickerService(cfg, { now: () => 10_000 });
+  assert.equal((await service.statusAsync()).demandChance, 0.7);
+  const readdir = spyReaddir(t);
+  for (const chance of [0.2, 0, 1]) {
+    cfg.sticker.demandChance = chance;
+    cfg.sticker.ensureSend = chance === 1;
+    const status = await service.statusAsync();
+    assert.equal(status.demandChance, chance);
+    assert.equal(status.ensureSend, chance === 1);
+  }
+  assert.equal(readdir.count, 0);
+});
+
+test('表情包频率草稿在轮询和保存时受到保护', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../launcher/Views/StickerPage.xaml.cs'), 'utf8');
+  assert.match(source, /!_demandDirty && !_savingDemand && demandRevision == _demandRevision/);
+  assert.match(source, /if \(res.Ok && revision == _demandRevision\)/);
+  assert.match(source, /SldDemand.IsEnabled = ChkEnsure.IsEnabled = true/);
 });

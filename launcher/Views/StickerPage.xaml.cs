@@ -43,6 +43,9 @@ namespace WhaleLauncher.Views
         private string _current = "";
         private bool _loading;
         private bool _savingCollect;
+        private bool _demandDirty;
+        private bool _savingDemand;
+        private int _demandRevision;
         private bool _importingPresets;
         private bool _loaded;
         private readonly SemaphoreSlim _refreshLock = new(1);
@@ -107,11 +110,18 @@ namespace WhaleLauncher.Views
 
         private async Task LoadCoreAsync()
         {
+            var demandRevision = _demandRevision;
             var tLoad = Stopwatch.StartNew();
             var online = _sup.NodeRunning;
             ChkEnabled.IsEnabled = TxtDir.IsEnabled = online;
             ChkCollect.IsEnabled = online && !_savingCollect;
             if (!online) BtnImportPresets.IsEnabled = false;
+            if (online && !ChkCollect.IsKeyboardFocusWithin)
+            {
+                var cfg = await Api.Get(_sup.Url, "/api/config");
+                if (cfg.Ok && cfg.Prop("config").TryGetProperty("sticker", out var sticker))
+                    ChkCollect.IsChecked = sticker.TryGetProperty("collectReceived", out var collect) && BoolProp(collect);
+            }
 
             var view = new ViewData();
             var tFetch = Stopwatch.StartNew();
@@ -166,12 +176,18 @@ namespace WhaleLauncher.Views
             _loading = false;
             if (!string.IsNullOrEmpty(view.Dir)) _libraryDir = view.Dir;
             // 频率 / 必发（main 上新增的 UI）：数据来自 status（内核在线）或库存脚本（离线）
-            SldDemand.Value = Math.Round(Math.Clamp(view.DemandChance, 0, 1) * 100);
-            ChkEnsure.IsChecked = view.EnsureSend;
-            TxtDemandValue.Text = Math.Round(SldDemand.Value) + "%";
-            var frequencyEnabled = view.Online && view.Enabled;
-            SldDemand.IsEnabled = ChkEnsure.IsEnabled = BtnSaveDemand.IsEnabled = frequencyEnabled;
-            BtnImportPresets.IsEnabled = frequencyEnabled && !_importingPresets
+            if (!_demandDirty && !_savingDemand && demandRevision == _demandRevision)
+            {
+                _loading = true;
+                SldDemand.Value = Math.Round(Math.Clamp(view.DemandChance, 0, 1) * 100);
+                ChkEnsure.IsChecked = view.EnsureSend;
+                TxtDemandValue.Text = Math.Round(SldDemand.Value) + "%";
+                _loading = false;
+            }
+            var frequencyEnabled = view.Enabled;
+            SldDemand.IsEnabled = ChkEnsure.IsEnabled = true;
+            BtnSaveDemand.IsEnabled = !_savingDemand;
+            BtnImportPresets.IsEnabled = view.Online && frequencyEnabled && !_importingPresets
                 && view.MaintPhase != "running" && view.MaintPhase != "pending";
             DemandHint.Opacity = frequencyEnabled ? 1 : 0.55;
 
@@ -265,20 +281,21 @@ namespace WhaleLauncher.Views
 
         private async void OnSaveStickerSettings(object sender, RoutedEventArgs e)
         {
-            if (_loading || !_sup.NodeRunning || TxtDir.Text.Trim() == _inventory.Str("configuredDir")) return;
-            var body = "{\"patch\":{"
-                + "\"sticker.dir\":\"" + Api.Esc(TxtDir.Text.Trim()) + "\""
-                + "}}";
-            var res = await Api.Post(_sup.Url, "/api/config", body);
+            if (_loading || TxtDir.Text.Trim() == _inventory.Str("configuredDir")) return;
+            var res = await _sup.PatchConfigurationAsync( new Dictionary<string, object>
+            {
+                ["sticker.dir"] = TxtDir.Text.Trim()
+            });
             StatusText.Text = res.Ok
                 ? "表情包设置已保存 · " + DateTime.Now.ToString("HH:mm:ss")
-                : "保存失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+                : "保存失败：" + Api.Message(res);
         }
 
         /* ── 页签 ──────────────────────────────────────────────── */
         private void OnDemandChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
             if (TxtDemandValue == null) return;
+            if (!_loading && IsLoaded) { _demandDirty = true; _demandRevision++; }
             TxtDemandValue.Text = Math.Round(e.NewValue) + "%";
             if (DemandHint == null) return;
             DemandHint.Text = e.NewValue >= 99.5
@@ -286,20 +303,39 @@ namespace WhaleLauncher.Views
                 : "0 = 只靠模型自觉；70% ≈ 一半多轮次提醒；100% = 每轮都提醒。勾选「必发」后，命中轮次即使模型没写标记也会补一张（难过/求助除外）。";
         }
 
+        private void OnEnsureChanged(object sender, RoutedEventArgs e)
+        {
+            if (_loading || !IsLoaded) return;
+            _demandDirty = true;
+            _demandRevision++;
+        }
+
         private async void OnSaveDemand(object sender, RoutedEventArgs e)
         {
-            if (_loading || !_sup.NodeRunning) return;
+            if (_loading || _savingDemand) return;
+            var revision = _demandRevision;
             var chance = Math.Round(Math.Clamp(SldDemand.Value / 100.0, 0, 1), 2);
             var ensure = ChkEnsure.IsChecked == true;
-            var body = "{\"patch\":{"
-                + "\"sticker.demandChance\":" + chance.ToString("0.##", CultureInfo.InvariantCulture)
-                + ",\"sticker.ensureSend\":" + (ensure ? "true" : "false")
-                + "}}";
-            var res = await Api.Post(_sup.Url, "/api/config", body);
-            StatusText.Text = res.Ok
-                ? $"表情包频率已保存：{Math.Round(chance * 100)}%" + (ensure ? "，必发已开" : "") + " · " + DateTime.Now.ToString("HH:mm:ss")
-                : "保存失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
-            if (res.Ok) await LoadAsync();
+            _savingDemand = true;
+            BtnSaveDemand.IsEnabled = false;
+            try
+            {
+                var res = await _sup.PatchConfigurationAsync(new Dictionary<string, object>
+                {
+                    ["sticker.demandChance"] = chance,
+                    ["sticker.ensureSend"] = ensure
+                });
+                if (res.Ok && revision == _demandRevision)
+                {
+                    _demandDirty = false;
+                    _demandRevision++;
+                }
+                StatusText.Text = res.Ok
+                    ? $"表情包频率已保存：{Math.Round(chance * 100)}%" + (ensure ? "，必发已开" : "")
+                    : "保存失败：" + Api.Message(res);
+            }
+            catch (Exception ex) { StatusText.Text = "保存失败：" + Api.FriendlyError(ex); }
+            finally { _savingDemand = false; BtnSaveDemand.IsEnabled = true; }
         }
 
         /* ── 页签 ──────────────────────────────────────────────── */
@@ -501,11 +537,9 @@ namespace WhaleLauncher.Views
             {
                 if (!CanManageOnline()) return;
                 var n = (string)((Button)s).Tag;
-                var confirm = MessageBox.Show($"删掉这张？\n\n{n}", "表情包", MessageBoxButton.OKCancel, MessageBoxImage.Question);
-                if (confirm != MessageBoxResult.OK) return;
-                var r = await Api.Post(_sup.Url, "/api/stickers/delete",
-                    $"{{\"emotion\":\"{Api.Esc(_current)}\",\"name\":\"{Api.Esc(n)}\"}}");
-                StatusText.Text = r.Ok ? "已删除 " + n : "删除失败：" + (r.Error.Length > 0 ? r.Error : r.Raw);
+                if (!AppDialog.Confirm(Window.GetWindow(this), $"删掉这张？\n\n{n}", "表情包")) return;
+                var r = await Api.PostJson(_sup.Url, "/api/stickers/delete", new { emotion = _current, name = n });
+                StatusText.Text = r.Ok ? "已删除 " + n : "删除失败：" + Api.Message(r);
                 if (r.Ok)
                 {
                     _renderedSignature = "";   // 强制下次重建
@@ -575,9 +609,8 @@ namespace WhaleLauncher.Views
                 StatusText.Text = "先写一个分类名，比如「猫猫」。文件夹会用同一个名字建出来。";
                 return;
             }
-            var res = await Api.Post(_sup.Url, "/api/stickers/category",
-                "{\"action\":\"add\",\"label\":\"" + Api.Esc(label) + "\"}");
-            StatusText.Text = res.Ok ? "已新增分类：" + label : "新增失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+            var res = await Api.PostJson(_sup.Url, "/api/stickers/category", new { action = "add", label });
+            StatusText.Text = res.Ok ? "已新增分类：" + label : "新增失败：" + Api.Message(res);
             if (res.Ok)
             {
                 TxtNewCat.Text = "";
@@ -592,13 +625,11 @@ namespace WhaleLauncher.Views
         {
             if (!_current.StartsWith("x:") || !CanManageOnline()) return;
             var label = _current.Substring(2);
-            var confirm = MessageBox.Show(
+            if (!AppDialog.Confirm(Window.GetWindow(this),
                 "从列表里移除分类「" + label + "」？\n\n文件夹和里面的图片都会保留，随时可以再加回来。",
-                "表情包分类", MessageBoxButton.OKCancel, MessageBoxImage.Question);
-            if (confirm != MessageBoxResult.OK) return;
-            var res = await Api.Post(_sup.Url, "/api/stickers/category",
-                "{\"action\":\"remove\",\"label\":\"" + Api.Esc(label) + "\"}");
-            StatusText.Text = res.Ok ? "已移除分类：" + label : "移除失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+                "表情包分类")) return;
+            var res = await Api.PostJson(_sup.Url, "/api/stickers/category", new { action = "remove", label });
+            StatusText.Text = res.Ok ? "已移除分类：" + label : "移除失败：" + Api.Message(res);
             if (res.Ok)
             {
                 _current = "";
@@ -611,10 +642,10 @@ namespace WhaleLauncher.Views
         // ── 动作 ────────────────────────────────────────────────
         private async void OnToggleEnabled(object sender, RoutedEventArgs e)
         {
-            if (_loading || !_sup.NodeRunning) return;
+            if (_loading) return;
             var on = ChkEnabled.IsChecked == true;
-            var res = await Api.Post(_sup.Url, "/api/features", $"{{\"key\":\"stickers\",\"value\":{(on ? "true" : "false")}}}");
-            StatusText.Text = res.Ok ? $"表情包已{(on ? "开启" : "关闭")}" : "保存失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+            var res = await _sup.SaveConfigurationAsync("/api/features", new { key = "stickers", value = on });
+            StatusText.Text = res.Ok ? $"表情包已{(on ? "开启" : "关闭")}" : "保存失败：" + Api.Message(res);
             _loaded = false;
             _nextRefresh = DateTime.MinValue;
             await LoadAsync();
@@ -631,14 +662,14 @@ namespace WhaleLauncher.Views
         {
             if (string.IsNullOrEmpty(_current) || !CanManageOnline()) return;
             var chat = (TxtTestChat.Text ?? "").Trim();
-            var body = "{\"emotion\":\"" + Api.Esc(_current) + "\""
-                + (chat.Length > 0 ? ",\"chat\":\"" + Api.Esc(chat) + "\"" : "") + "}";
-            var res = await Api.Post(_sup.Url, "/api/stickers/test", body);
+            var body = new Dictionary<string, object> { ["emotion"] = _current };
+            if (chat.Length > 0) body["chat"] = chat;
+            var res = await Api.PostJson(_sup.Url, "/api/stickers/test", body);
             QueueInfo.Text = res.Ok ? "已排队 1 张" : "排队失败";
             StatusText.Text = res.Ok
                 ? "已排队，接收会话：" + (chat.Length > 0 ? chat : "（配置里的默认会话）")
                   + "。桥接会核验目标，必要时短暂切换微信；以任务结果为准。"
-                : "排队失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+                : "排队失败：" + Api.Message(res);
         }
 
         private async void OnOpenFolder(object sender, RoutedEventArgs e)
@@ -649,16 +680,18 @@ namespace WhaleLauncher.Views
 
         private async void OnToggleCollect(object sender, RoutedEventArgs e)
         {
-            if (!_sup.NodeRunning || _savingCollect) return;
+            if (_savingCollect) return;
             var enabled = ChkCollect.IsChecked == true;
             _savingCollect = true;
             ChkCollect.IsEnabled = false;
             try
             {
-                var body = $"{{\"patch\":{{\"sticker.collectReceived\":{(enabled ? "true" : "false")}}}}}";
-                var res = await Api.Post(_sup.Url, "/api/config", body);
+                var res = await _sup.PatchConfigurationAsync( new Dictionary<string, object>
+                {
+                    ["sticker.collectReceived"] = enabled
+                });
                 if (!res.Ok) ChkCollect.IsChecked = !enabled;
-                CollectStatus.Text = res.Ok ? "已保存，桥接将在约 5 秒内应用" : "保存失败：" + res.Error;
+                CollectStatus.Text = res.Ok ? "已保存，桥接运行后将读取设置" : "保存失败：" + Api.Message(res);
             }
             catch (Exception ex)
             {
@@ -668,7 +701,7 @@ namespace WhaleLauncher.Views
             finally
             {
                 _savingCollect = false;
-                ChkCollect.IsEnabled = _sup.NodeRunning;
+                ChkCollect.IsEnabled = true;
             }
         }
 
@@ -707,8 +740,9 @@ namespace WhaleLauncher.Views
                 _importingPresets = false;
                 await RefreshAsync();
                 var copied = res.Long("copied");
-                MessageBox.Show(!res.Ok ? "导入失败：" + res.Error
-                    : copied > 0 ? $"已导入 {copied} 张预设表情包。" : "没有需要导入的新预设表情包。", "预设表情包");
+                AppDialog.Show(Window.GetWindow(this), !res.Ok ? "导入失败：" + res.Error
+                    : copied > 0 ? $"已导入 {copied} 张预设表情包。" : "没有需要导入的新预设表情包。", "预设表情包",
+                    danger: !res.Ok);
             }
             finally { _importingPresets = false; }
         }
@@ -765,7 +799,7 @@ namespace WhaleLauncher.Views
                 StatusText.Text = res.Ok
                     ? $"已上传 {uploaded} 张到「{_emotions.FirstOrDefault((x) => x.Key == _current)?.Label}」。"
                       + (skipped > 0 ? $"另有 {skipped} 张超过 4MB，已跳过。" : "")
-                    : "上传失败：" + (res.Error.Length > 0 ? res.Error : res.Raw);
+                    : "上传失败：" + Api.Message(res);
                 if (res.Ok)
                 {
                     _renderedSignature = "";
@@ -788,18 +822,37 @@ namespace WhaleLauncher.Views
             // 原因：内核经常跟着启动器一起提权，从提权进程里 spawn explorer.exe 在 Windows 上
             // 会“进程起来了但窗口不出现”（用户看到的就是「说已打开但其实没开」）。
             // 这里改用 ShellExecute（UseShellExecute=true），交给已经在跑的 explorer 处理。
-            var body = "{\"emotion\":\"" + Api.Esc(emotion ?? "") + "\""
-                + (string.IsNullOrEmpty(name) ? "" : ",\"name\":\"" + Api.Esc(name) + "\"")
-                + ",\"open\":false}";
+            var folderBody = new Dictionary<string, object> { ["emotion"] = emotion ?? "", ["open"] = false };
+            if (!string.IsNullOrEmpty(name)) folderBody["name"] = name;
             var res = _sup.NodeRunning
-                ? await Api.Post(_sup.Url, "/api/stickers/open-folder", body)
+                ? await Api.PostJson(_sup.Url, "/api/stickers/open-folder", folderBody)
                 : new ApiResult { Ok = false, Error = "内核未运行" };
 
-            string target = res.Ok ? res.Str("dir") : LocalPath(emotion, name);
+            string target = res.Ok ? res.Str("dir") : "";
+            if (string.IsNullOrEmpty(target)) target = LocalPath(emotion, name);
+            // 内核没启动、表情包开关关着、或本地库存脚本暂时不可用时，
+            // 「打开总目录」仍然应该能打开 data\stickers；目录不存在就建出来。
+            if (string.IsNullOrEmpty(target) && string.IsNullOrEmpty(emotion))
+                target = Path.Combine(_sup.DataDir, "stickers");
             if (string.IsNullOrEmpty(target))
             {
                 StatusText.Text = "打不开：" + Api.FriendlyError(res.Error.Length > 0 ? res.Error : "找不到这个文件夹");
                 return;
+            }
+            try
+            {
+                if (!string.IsNullOrEmpty(name) ? File.Exists(target) : Directory.Exists(target))
+                {
+                    // 已存在，直接打开。
+                }
+                else if (string.IsNullOrEmpty(name))
+                {
+                    Directory.CreateDirectory(target);
+                }
+            }
+            catch
+            {
+                // 目录建不出来时仍尝试打开，让系统给出更具体的错误。
             }
             // 三级兜底：ShellExecute → explorer.exe 命令行 → 至少把路径给用户手动开。
             // （有些环境——比如被沙箱/作业对象限制的父进程——会挡掉 ShellExecute，
@@ -812,46 +865,69 @@ namespace WhaleLauncher.Views
 
         private bool TryOpen(string target, bool select)
         {
+            // UseShellExecute=true 时不要用 ArgumentList（.NET 在部分版本会直接拒绝），
+            // 用 Arguments 字符串；路径统一加引号，空格/中文/括号都不会被拆开。
             try
             {
                 if (select && File.Exists(target))
                 {
-                    var psi = new ProcessStartInfo("explorer.exe") { UseShellExecute = true };
-                    psi.ArgumentList.Add("/select," + target);
+                    var psi = new ProcessStartInfo("explorer.exe")
+                    {
+                        UseShellExecute = true,
+                        Arguments = "/select,\"" + target + "\""
+                    };
                     using var p1 = Process.Start(psi);
                     return true;
                 }
-                // 首选：交给 shell 处理目录关联（不自己拼 explorer 命令行）
-                using var p2 = Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+                // 目录走 explorer 命令行，比让 shell 猜文件关联更稳。
+                if (Directory.Exists(target))
+                {
+                    var psi = new ProcessStartInfo("explorer.exe")
+                    {
+                        UseShellExecute = true,
+                        Arguments = "\"" + target + "\""
+                    };
+                    using var p2 = Process.Start(psi);
+                    return true;
+                }
+                // 目标不是目录（例如某些自定义路径）时再交给 shell。
+                using var p3 = Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
                 return true;
             }
             catch
             {
                 try
                 {
-                    var psi = new ProcessStartInfo("explorer.exe") { UseShellExecute = true };
-                    psi.ArgumentList.Add(target);
-                    using var p3 = Process.Start(psi);
+                    try { Clipboard.SetText(target); } catch { /* 剪贴板被占用就算了 */ }
+                    var psi = new ProcessStartInfo("explorer.exe")
+                    {
+                        UseShellExecute = false,
+                        Arguments = select && File.Exists(target) ? "/select,\"" + target + "\"" : "\"" + target + "\""
+                    };
+                    using var p4 = Process.Start(psi);
                     return true;
                 }
                 catch
                 {
-                    try { Clipboard.SetText(target); } catch { /* 剪贴板被占用就算了 */ }
                     return false;
                 }
             }
         }        private string LocalPath(string emotion, string name)
         {
-            if (string.IsNullOrEmpty(_libraryDir)) return null;
-            if (string.IsNullOrEmpty(emotion)) return _libraryDir;
+            // _libraryDir 只有在内核/本地库存成功返回后才会有值。
+            // 根目录不依赖它：默认库就是启动器数据目录下的 stickers，先给一个可打开的落点。
+            var root = string.IsNullOrEmpty(_libraryDir)
+                ? Path.Combine(_sup.DataDir, "stickers")
+                : _libraryDir;
+            if (string.IsNullOrEmpty(emotion)) return root;
             if (!string.IsNullOrEmpty(name))
             {
-                var full = Path.Combine(_libraryDir, name.Replace('/', Path.DirectorySeparatorChar));
+                var full = Path.Combine(root, name.Replace('/', Path.DirectorySeparatorChar));
                 return File.Exists(full) ? full : null;
             }
             var label = _emotions.FirstOrDefault((e) => e.Key == emotion)?.Label;
             if (string.IsNullOrEmpty(label)) return null;
-            var dir = Path.Combine(_libraryDir, label);
+            var dir = Path.Combine(root, label);
             return Directory.Exists(dir) ? dir : null;
         }
 

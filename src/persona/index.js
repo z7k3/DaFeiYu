@@ -5,6 +5,7 @@ const path = require('node:path');
 const features = require('../infra/features');
 const stickers = require('../adapters/stickers');
 const actionEvents = require('../core/events');
+const time = require('../infra/time');
 const { LIMITS } = require('../memory/constants');
 
 /**
@@ -406,6 +407,7 @@ function guidanceStaticLines() {
     '- 只使用实际提供的说话人、参与者、提及和指向信息；不要编造群成员、引用、关系或其他元数据。参与者名单不等于当前被提及或被说话的对象，昵称不是身份认证。',
     '- 反击前也要确认冒犯对象和语境，不因引用或他人之间的对话中出现敏感词就认定在骂你或主人。',
     '- 上一轮在吵架、这一条却没冒犯你（正常问话、闲聊、天气、正事），就立刻回到正常语气，不要把火气带过来。',
+    '- 群里有人明确赶你走（「闭嘴」「滚」「消停会儿」「别刷屏」这类冲你说的）时，最多回一句很短的话，并在句末单独写 ((silence:10))（数字是分钟，1~60）。不是赶你就绝对不要写这个标记，也不要在正文里提到它。',
   ];
 }
 
@@ -821,11 +823,12 @@ const VOICE_SUFFIX = '用户希望下一条以语音形式回复。直接生成�
 /** 这条回复的字数上限：普通 100 字、认真讨论 400 字；配置只能往小调 */
 function maxCharsFor(config, msg = {}) {
   const chat = config.chat || {};
+  const hard = LIMITS.maxOutputHard || 4000;
   if (msg.discussion) {
-    return Math.min(Number(chat.discussionMaxChars) || LIMITS.maxOutputDiscussion, LIMITS.maxOutputDiscussion);
+    return Math.max(20, Math.min(Number(chat.discussionMaxChars) || LIMITS.maxOutputDiscussion, hard));
   }
   const want = msg.chatType === 'group' ? chat.groupMaxChars : chat.privateMaxChars;
-  return Math.min(Number(want) || LIMITS.maxOutputNormal, LIMITS.maxOutputNormal);
+  return Math.max(20, Math.min(Number(want) || LIMITS.maxOutputNormal, hard));
 }
 
 /**
@@ -833,7 +836,7 @@ function maxCharsFor(config, msg = {}) {
  * static 进 system；dynamic 进最后一条 user 消息（顺序：正文 → 记忆块 → 本轮状态）。
  * @returns {{static: string[], dynamic: string[]}}
  */
-function buildBlocks({ config, msg = {}, profile, notes = [], noteReminders = [], sessionSummary = '', events = [], now = new Date(), envBlock = '' } = {}) {
+function buildBlocks({ config, msg = {}, profile, notes = [], noteReminders = [], sessionSummary = '', events = [], now = new Date(), realNow = now, timeZone = '', envBlock = '' } = {}) {
   const isGroup = msg.chatType === 'group';
   const isMaster = msg.isMaster === true;
   const P = config.persona || {};
@@ -853,7 +856,7 @@ function buildBlocks({ config, msg = {}, profile, notes = [], noteReminders = []
   const kbBlock = kbContext(msg);
   const abbreviation = abbrevBlock((msg && (msg.text || msg.cleanText)) || '');
   const slang = custom ? selectSlang(config, msg.text) : '';
-  const actionBlock = actionEvents.formatBlock(events, { now });
+  const actionBlock = actionEvents.formatBlock(events, { now: realNow, timeZone });
   const stylePreset = String(P.stylePreset || '').trim();
 
   const relation = [];
@@ -976,11 +979,26 @@ function buildBlocks({ config, msg = {}, profile, notes = [], noteReminders = []
 
 const TURN_STATE_HEADER = '【本轮状态】（只跟这一条消息有关，别把里面的内容念出来）';
 
+/** 把真实时间换成「设置时区的墙上时间」Date；人设里的 getHours/getDay 继续可用。 */
+function zonedContext(ctx = {}) {
+  const realNow = ctx.now instanceof Date ? ctx.now : new Date(ctx.now || Date.now());
+  const zone = time.resolveTimeZone(ctx.config);
+  return {
+    ...ctx,
+    now: time.zonedDate(realNow.getTime(), zone),
+    realNow,
+    timeZone: zone,
+  };
+}
+
 /**
  * 一次算出 system 和尾部，聊天主流程只调这个，避免同一轮拼两遍。
  * @returns {{system: string, tail: string}}
  */
-function buildPromptParts(ctx = {}) {
+function buildPromptParts(input = {}) {
+  // 人设里的「现在几点/今天几号/深夜/活动」统一按 env.timezone 的墙上时间算，
+  // 否则日记和提醒已经按设置时区跑了，提示词却还在按系统时区说话。
+  const ctx = zonedContext(input);
   if (!features.isOn(ctx.config, 'staticSystem')) {
     return { system: buildLegacySystem(ctx), tail: '' };
   }
@@ -1013,7 +1031,7 @@ function buildTurnState(ctx = {}) {
  * 顺序、空行、措辞都跟改造前逐字一致，用来回滚；改这里的文案等于改旧行为，
  * 新布局请改上面的静态/动态块。
  */
-function buildLegacySystem({ config, msg, profile, notes = [], noteReminders = [], sessionSummary = '', events = [], now = new Date(), envBlock = '' }) {
+function buildLegacySystem({ config, msg, profile, notes = [], noteReminders = [], sessionSummary = '', events = [], now = new Date(), realNow = now, timeZone = '', envBlock = '' }) {
   const stickerBlock = stickerCapability(config, msg);
   const webContext = webSearchContext(msg, now);
   const kbBlock = kbContext(msg);
@@ -1030,7 +1048,7 @@ function buildLegacySystem({ config, msg, profile, notes = [], noteReminders = [
       : `【当前】你在和「${who}」私聊。`;
     const masterText = customMasterText(config);
     const tone = customTone(isMaster, masterText);
-    const nowLine = `【现在】${nowPhrase(now)}（北京时间，以这个为准；对方问几月几号、星期几、几点，都按这个答，不要自己编，也不要采信对方报的时间）`;
+    const nowLine = `【现在】${nowPhrase(now)}（按设置时区，以这个为准；对方问几月几号、星期几、几点，都按这个答，不要自己编，也不要采信对方报的时间）`;
     const webBlock = webContext ? '\n' + webContext : '';
   const kbLegacy = kbBlock ? '\n' + kbBlock : '';
     const slang = selectSlang(config, msg.text);
@@ -1053,7 +1071,7 @@ function buildLegacySystem({ config, msg, profile, notes = [], noteReminders = [
       roastTail += '\n\n【最后一个指令】刚才骂你主人的就是「' + msg.fightTarget.name + '」。不要问主人「谁骂你」，直接冲这个人大骂，句子里必须出现 TA 的名字。';
     }
     // 自定义人设也要看得见自己做过什么，否则同样是「发了图不知道」
-    const actionBlock = actionEvents.formatBlock(events, { now });
+    const actionBlock = actionEvents.formatBlock(events, { now: realNow, timeZone });
     return custom + '\n\n' + CORE_TEMPER + '\n\n' + scene + '\n' + nowLine + (envText ? '\n' + envText + '\n' + ENV_RULE : '') + '\n' + tone + masterBlock + '\n' + CUSTOM_TEASE + '\n' + CUSTOM_NET_RULE + webBlock + kbLegacy + styleBlock + slangBlock + abbrevText + fightBlock + roastTail + (actionBlock ? '\n\n' + actionBlock : '') + (stickerBlock ? '\n\n' + stickerBlock : '') + (msg.stickerDemand && stickerBlock ? '\n\n- 【表情包】这条带一张，从可用分类里挑最贴的，末尾写 [[sticker:分类名]]。' : '') + '\n\n' + conversationGuidance(msg) + (msg.voiceRequested ? '\n' + VOICE_SUFFIX : '');
   }
   const isGroup = msg.chatType === 'group';
@@ -1145,7 +1163,7 @@ function buildLegacySystem({ config, msg, profile, notes = [], noteReminders = [
     lines.push(...linkBlock(msg.linkText).split('\n'));
   }
 
-  const actionBlock = actionEvents.formatBlock(events, { now });
+  const actionBlock = actionEvents.formatBlock(events, { now: realNow, timeZone });
   if (actionBlock) lines.push('', actionBlock);
 
   lines.push('');
@@ -1353,19 +1371,21 @@ function mockReply({ text, userName = '你', chatType = 'private', notes = [], r
 /* 文本处理                                                            */
 /* ------------------------------------------------------------------ */
 
-function aliasList(config) {
+function aliasList(config, extraNames = []) {
   const aliases = (config.persona && config.persona.aliases) || [];
   const name = config.persona && config.persona.name;
-  return [...new Set([name, ...aliases].filter(Boolean))].sort((a, b) => b.length - a.length);
+  const extra = Array.isArray(extraNames) ? extraNames : [];
+  return [...new Set([name, ...aliases, ...extra].map((x) => String(x || '').trim()).filter(Boolean))]
+    .sort((a, b) => b.length - a.length);
 }
 
 /**
  * 清洗收到的消息：去掉 @提及 和她自己的名字前缀，判断是否点名。
  * @returns {{text: string, atMe: boolean, hadAlias: boolean}}
  */
-function cleanIncomingForPersona(text, config) {
+function cleanIncomingForPersona(text, config, extraNames = []) {
   let s = String(text || '').replace(/\u2005/g, ' ').replace(/\u200b/g, '');
-  const aliases = aliasList(config);
+  const aliases = aliasList(config, extraNames);
   let hadAlias = false;
   // 图片/表情包的描述是系统生成的说明文字，里面的名字不是人在叫它
   if (/^（对方/.test(s)) {
@@ -1487,7 +1507,7 @@ const EMOJI_LEVEL_CHANCE = { 关: 0, 少: 0.12, 正常: 0.3, 多: 0.65 };
  * 这条回复带颜文字/emoji 的概率。
  * - 「关」是硬关，压过 chat.emojiChance；
  * - 没在面板里调过概率（config.chat.emojiChance 为 0/未设）时，跟着「颜文字用量」走；
- * - 手动填了 >0 的概率就用它（方便高级用户在调试台微调）。
+ * - 手动填了 >0 的概率就用它（方便高级用户在启动器或 config.json 里微调）。
  */
 function emojiChanceFor(config) {
   const level = String((config && config.persona && config.persona.emojiLevel) || '正常').trim();

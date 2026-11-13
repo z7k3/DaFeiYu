@@ -117,9 +117,9 @@ function summarize(bundle) {
 }
 
 function writeSnapshot(root, reason = 'manual') {
-  // 定时/启动快照默认脱敏：data/backups/ 最多保留 20 份，明文 Key 长期躺在磁盘上
-  // （网盘同步/误导诊断包）就是泄露面。恢复流程本来就会用当前 settings 合并回填，
-  // 快照里不含 Key 不影响恢复；确需带密钥的完整备份走导出日志包的显式选项。
+  // 自动/恢复前快照不带 Key：data/backups 经常被用户拷走或上传网盘；
+  // 恢复流程会用当前 settings 合并回填，不含 Key 不影响恢复。
+  // 需要显式含 Key 的备份走 exportTo(root, file, { withSecrets: true })。
   const bundle = collect(root, { withSecrets: false });
   const { sessions, messages } = summarize(bundle);
   if (!sessions && !messages && reason !== 'manual') return null;
@@ -202,21 +202,42 @@ function validateBundle(bundle) {
   return files;
 }
 
-function writeMemoryFiles(memoryDir, memory, { keepLegacy = true } = {}) {
+function writeMemoryFiles(memoryDir, memory, { keepLegacy = true, keepArchive = true } = {}) {
   const legacyDir = path.join(memoryDir, 'legacy');
   const legacyBackup = keepLegacy && fs.existsSync(legacyDir)
     ? fs.readdirSync(legacyDir).map((n) => ({ n, body: fs.readFileSync(path.join(legacyDir, n)) }))
     : [];
-  fs.rmSync(memoryDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 40 });
-  fs.mkdirSync(memoryDir, { recursive: true });
-  for (const [rel, body] of Object.entries(memory || {})) {
-    const target = path.join(memoryDir, rel);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, String(body), 'utf8');
+  // archive/ 是「只移动、不删除」的冷数据，不在 bundle 里。恢复当前活跃记忆时
+  // 必须先把它暂存出来，否则下面 rmSync(memoryDir) 会把几个月不活跃的会话一起删掉。
+  const archiveDir = path.join(memoryDir, 'archive');
+  const archiveTmp = `${memoryDir}.archive-keep-${process.pid}`;
+  let archiveKept = false;
+  if (keepArchive && fs.existsSync(archiveDir)) {
+    try {
+      fs.rmSync(archiveTmp, { recursive: true, force: true });
+      fs.cpSync(archiveDir, archiveTmp, { recursive: true });
+      archiveKept = true;
+    } catch { archiveKept = false; }
   }
-  if (legacyBackup.length) {
-    fs.mkdirSync(legacyDir, { recursive: true });
-    for (const item of legacyBackup) fs.writeFileSync(path.join(legacyDir, item.n), item.body);
+  try {
+    fs.rmSync(memoryDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 40 });
+    fs.mkdirSync(memoryDir, { recursive: true });
+    for (const [rel, body] of Object.entries(memory || {})) {
+      const target = path.join(memoryDir, rel);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, String(body), 'utf8');
+    }
+    if (legacyBackup.length) {
+      fs.mkdirSync(legacyDir, { recursive: true });
+      for (const item of legacyBackup) fs.writeFileSync(path.join(legacyDir, item.n), item.body);
+    }
+    if (archiveKept) {
+      fs.cpSync(archiveTmp, archiveDir, { recursive: true });
+    }
+  } finally {
+    if (archiveKept) {
+      try { fs.rmSync(archiveTmp, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
   }
 }
 

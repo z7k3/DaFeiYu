@@ -46,7 +46,7 @@ class SenderMixin:
         self.BG_STATS['last'] = why
         self.BG_STATS['lastAt'] = G.time.time()
         if why == 'chat_mismatch':
-            raise G.ChatIdentityError('后台通道：当前会话不是目标 %r' % chat_display_name)
+            raise G.ChatIdentityError('后台通道：当前会话不是目标 %s' % G.safe_name(chat_display_name))
         if why == 'content_mismatch':
             raise G.DraftDirtyError('正文回读校验未通过，本次输入已清理，未发送（%s）' % why)
         if why in ('input_dirty', 'residue_left', 'input_not_empty'):
@@ -56,7 +56,7 @@ class SenderMixin:
             self.BG_STATS['treeFails'] = 0
             G.log('后台通道发送成功（%s，%.1fs）' % (why, G.time.time() - t0))
             return True
-        G.log('后台通道没发出去（%s，%.1fs），换下一条通道：%s' % (why, G.time.time() - t0, chat_display_name))
+        G.log('后台通道没发出去（%s，%.1fs），换下一条通道：%s' % (why, G.time.time() - t0, G.safe_name(chat_display_name)))
         if why == 'tree_not_ready':
             self.BG_STATS['treeFails'] += 1
             if self.BG_STATS['treeFails'] >= 3:
@@ -70,7 +70,7 @@ class SenderMixin:
         elif why == 'tree_not_ready':
             G.log_throttled('bg-tree', '后台通道读不到控件树：确认微信没缩在托盘；4.2 需要 wechatauto 的 gate 热激活，必要时提权重试。诊断：python -m bridge --bg-probe')
         elif why == 'chat_not_found' and chat_username:
-            G.log('后台通道：%s 不在会话列表里，改用会搜索的通道' % chat_display_name)
+            G.log('后台通道：%s 不在会话列表里，改用会搜索的通道' % G.safe_name(chat_display_name))
         return False
 
     def uia_send(self, text, who, username=''):
@@ -127,7 +127,7 @@ class SenderMixin:
                 if username:
                     try:
                         self.open_cache[username] = u.current_chat() or ''
-                        G.log('UIA 已切到会话：', self.open_cache[username])
+                        G.log('UIA 已切到会话：', G.safe_name(self.open_cache[username]))
                     except Exception:
                         pass
             self._require_chat_identity(u, who, keys, 'UIA')
@@ -331,8 +331,8 @@ class SenderMixin:
                 G.log('键盘通道：读不到当前会话名，为防发错人这次不发')
                 raise G.ChatIdentityError('键盘通道读不到当前会话名')
             if not matched:
-                G.log('键盘通道：打开的是「%s」而不是「%s」，为防发错人这次不发' % (cur or '', chat_display_name))
-                raise G.ChatIdentityError('键盘通道打开的是 %r 而不是 %r' % (cur, chat_display_name))
+                G.log('键盘通道：打开的是「%s」而不是「%s」，为防发错人这次不发' % (G.safe_name(cur), G.safe_name(chat_display_name)))
+                raise G.ChatIdentityError('键盘通道打开的是 %s 而不是 %s' % (G.safe_name(cur), G.safe_name(chat_display_name)))
             set_clip(text)
             tap(ord('V'), (win32con.VK_CONTROL,))
             G.time.sleep(0.4)
@@ -425,15 +425,29 @@ class SenderMixin:
         G.log_throttled('send-policy-unavailable', '发言范围：内核未确认允许发送，已暂停', ttl=60)
         return False
 
-    def send_text(self, text, chat_display_name, chat_username='', force=False, quote_text=None):
+    def send_text(self, text, chat_display_name, chat_username='', force=False, quote_latest=False):
+        # dead_chats 用「{username: 拉黑时间}」：普通失败拉黑 10 分钟后自动放行探测，
+        # 「移出群聊」这类确定性证据写 inf 永久拉黑（上游仍是 set 永久拉黑）。
         if self.chat_dead(chat_username):
-            G.log('跳过已失效的会话：', chat_display_name)
+            G.log('跳过已失效的会话：', G.safe_name(chat_display_name))
             return False
         if chat_username and (not self.group_is_alive(chat_username)):
-            # 确定性证据（DB 里群成员没我）：永久拉黑（S3）
             self.dead_chats[chat_username] = float('inf')
-            G.log('群里已经没有我了（被移出？），以后跳过：', chat_display_name)
+            G.log('群里已经没有我了（被移出？），以后跳过：', G.safe_name(chat_display_name))
             return False
+        if chat_username and self.is_self_chat(chat_username):
+            # 微信里没有「和自己聊天」，只能发文件传输助手；否则会拿 wxid 去搜会话。
+            chat_username, chat_display_name = 'filehelper', '文件传输助手'
+        # 所有发送入口统一把「内部 id 当会话名」挡在这里。以前只有 care 会传 wxid，
+        # 现在不管调用方是谁，都先换成昵称/备注；换不出来就放弃，别让 open_chat 空转。
+        resolved = self.ui_chat_name(chat_username, chat_display_name)
+        if not resolved:
+            G.log_throttled('send-no-name-' + str(chat_username or chat_display_name)[:18],
+                            '发送跳过：%s 只拿到了内部 id，微信会话列表和搜索框都不认，先给 TA 加个备注再试' % G.safe_id(chat_username or chat_display_name),
+                            ttl=600)
+            return False
+        chat_display_name = resolved
+        display = G.safe_name(chat_display_name)
         if not self.account_send_allowed('发送'):
             return False
         # 连续相同回复折叠：两条并行会话同时撞上 LLM 超时/失败时，固定兜底文案会
@@ -465,7 +479,7 @@ class SenderMixin:
                 try:
                     if self.bg_send(text, chat_display_name, chat_username):
                         self._mark_send_ok(chat_username)
-                        G.log('发送成功（后台通道，%.1fs）→ %s' % (G.time.time() - t_start, chat_display_name))
+                        G.log('发送成功（后台通道，%.1fs）→ %s' % (G.time.time() - t_start, display))
                         return True
                 except G.DraftDirtyError as e:
                     # 脏输入 = 用户此刻正在微信输入框里打字（或有残留草稿）：输入法组合吞掉
@@ -502,13 +516,13 @@ class SenderMixin:
                         G.log_error('等待后仍是脏输入，放弃这条：' + _dirty_last)
                         return False
                 except G.ChatIdentityError as e:
-                    G.log_error('会话核对没通过，这条不发（%s）：%s' % (chat_display_name, e))
+                    G.log_error('会话核对没通过，这条不发（%s）：%s' % (display, e))
                     return False
                 except Exception as e:
                     G.log('后台通道异常，继续用旧通道：', repr(e))
                 if not G.BG_SEND.get('fallback', True):
                     allow_mark_dead = False
-                    G.log_error('后台通道失败且已关闭前台兜底，这条不发：', chat_display_name)
+                    G.log_error('后台通道失败且已关闭前台兜底，这条不发：', display)
                     return False
             # S1 快速失败：bg 说目标不在会话列表 + UIA open_chat 也连着打不开
             # （本轮发送之前已记满 2 次），就别再把引用/UIA×2/热激活/键盘/OCR
@@ -532,12 +546,16 @@ class SenderMixin:
                     G.log('初始化微信窗口驱动…（会抢一下焦点，约 5~10 秒）')
                     self.gui = self.new_window_driver()
             self.bind_gui_window(self.gui)
-            if quote_text and G.QUOTE_REPLY:
+            if quote_latest and G.QUOTE_REPLY:
                 G.touch()
                 try:
-                    if self.with_window_on_top(lambda: self.gui.quote_msg(text, who=chat_display_name, target_text=quote_text, verify=False)):
-                        G.log('引用回复成功 →', chat_display_name)
+                    # 不传 target_text：走上游 1.2.10 的「引用最近一条」路径
+                    # （UIA 行控件 + 像素重心），图片/表情/换行也不会 OCR 匹配失败。
+                    if self.with_window_on_top(lambda: self.gui.quote_msg(
+                            text, who=chat_display_name, verify=False)):
+                        G.log('引用回复成功 →', display)
                         return True
+                    G.log('引用回复未确认浮层/发送，回退普通发送：', display)
                 except Exception as e:
                     G.log('引用回复失败，回退普通发送：', repr(e))
                 G.touch()
@@ -555,11 +573,11 @@ class SenderMixin:
                 try:
                     if self.with_window_on_top(lambda: self.uia_send(text, chat_display_name, chat_username)):
                         self._mark_send_ok(chat_username)
-                        G.log('发送成功（%.1fs）→ %s' % (G.time.time() - t_start, chat_display_name))
+                        G.log('发送成功（%.1fs）→ %s' % (G.time.time() - t_start, display))
                         return True
                     G.log('UIA 发送未成功（第 %d 次，%.1fs），准备重试' % (attempt, G.time.time() - t_att))
                 except G.ChatIdentityError as e:
-                    G.log_error('会话核对没通过，这条不发（%s）：%s' % (chat_display_name, e))
+                    G.log_error('会话核对没通过，这条不发（%s）：%s' % (display, e))
                     return False
                 except Exception as e:
                     G.log('UIA 发送异常（第 %d 次，%.1fs）：%r' % (attempt, G.time.time() - t_att, e))
@@ -569,14 +587,14 @@ class SenderMixin:
                     try:
                         if self.with_window_on_top(lambda: self.uia_send(text, chat_display_name, chat_username)):
                             self._mark_send_ok(chat_username)
-                            G.log('重新激活 UIA 后发送成功（%.1fs）→ %s' % (G.time.time() - t_start, chat_display_name))
+                            G.log('重新激活 UIA 后发送成功（%.1fs）→ %s' % (G.time.time() - t_start, display))
                             return True
                     except G.ChatIdentityError as e:
-                        G.log_error('会话核对没通过，这条不发（%s）：%s' % (chat_display_name, e))
+                        G.log_error('会话核对没通过，这条不发（%s）：%s' % (display, e))
                         return False
                     except Exception as e:
                         G.log('重新激活后仍失败：', repr(e))
-                G.log('UIA 发不出去，跳过 OCR 兜底：', chat_display_name)
+                G.log('UIA 发不出去，跳过 OCR 兜底：', display)
             else:
                 G.log_throttled('uia-unavailable', 'UIA 不可用：先试键盘通道；如果一直这样，到启动器「诊断」页点「UIA 自检」看原因（常见：微信需要重新登录、鲸鱼娘不是管理员而微信是、微信缩在托盘）', ttl=600)
                 G.log('UIA 不可用，走 OCR 兜底')
@@ -585,10 +603,10 @@ class SenderMixin:
                 try:
                     if self.keyboard_send(text, chat_display_name, chat_username):
                         self._mark_send_ok(chat_username)
-                        G.log('发送成功（键盘通道，%.1fs）→ %s' % (G.time.time() - t_start, chat_display_name))
+                        G.log('发送成功（键盘通道，%.1fs）→ %s' % (G.time.time() - t_start, display))
                         return True
                 except G.ChatIdentityError as e:
-                    G.log_error('会话核对没通过，这条不发（%s）：%s' % (chat_display_name, e))
+                    G.log_error('会话核对没通过，这条不发（%s）：%s' % (display, e))
                     return False
             if not uia_available and not (_bg_chat_missing and self.open_chat_fail.get(_open_key, 0) >= 2):
                 G.touch()
@@ -629,20 +647,24 @@ class SenderMixin:
                     G.log('兜底发送异常：%r' % e)
             if chat_username and allow_mark_dead:
                 if G.time.time() - float(self.ACCOUNT.get('blockedAt') or 0) < 30:
-                    G.log('账号窗口没确认，这条不算会话失效，先不发：', chat_display_name)
+                    G.log('账号窗口没确认，这条不算会话失效，先不发：', display)
                     return False
                 self.fail_streak[chat_username] = self.fail_streak.get(chat_username, 0) + 1
                 if self.fail_streak[chat_username] >= 2:
-                    # S3：记时间戳，10 分钟后 chat_dead() 自动放行一条探测；
+                    # 记时间戳，10 分钟后 chat_dead() 自动放行一条探测；
                     # 以前是 set 永久拉黑，微信重启一下这个会话就永远不回了。
                     self.dead_chats[chat_username] = G.time.time()
-                    G.log('连续发送失败，先停掉这个会话（10 分钟后自动放行探测）：', chat_display_name)
+                    G.log('连续发送失败，先停掉这个会话（10 分钟后自动放行探测）：', display)
             G.log_error('发送最终失败，请把微信窗口保持在桌面、别最小化（这条 %d 字，正文不写日志）' % len(text))
             return False
 
     def send_at(self, member, text, chat_display_name, chat_username=''):
         """在群里真 @ 某个成员（UI 选人），失败返回 False 让调用方退回普通发送。"""
         if not member or not text:
+            return False
+        # 和 send_text 同一道闸：群名/成员名可能是 wxid，@ 的时候同样搜不到。
+        chat_display_name = self.ui_chat_name(chat_username, chat_display_name)
+        if not chat_display_name:
             return False
         if chat_username and (self.chat_dead(chat_username) or not self.group_is_alive(chat_username)):
             return False
@@ -665,9 +687,9 @@ class SenderMixin:
             try:
                 ok = bool(self.with_window_on_top(lambda: self.gui.at_member(member, text, who=chat_display_name, verify=False)))
                 if ok:
-                    G.log('已 @ %s → %s' % (member, chat_display_name))
+                    G.log('已 @ %s → %s' % (G.safe_name(member), G.safe_name(chat_display_name)))
                     return True
-                G.log('@ 成员失败（%s），改用普通发送' % member)
+                G.log('@ 成员失败（%s），改用普通发送' % G.safe_name(member))
             except Exception as e:
                 G.log('@ 成员异常：', repr(e))
         return False

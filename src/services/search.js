@@ -15,7 +15,7 @@ const links = require('../adapters/links');
 const ORIGINAL_TEXT_RE = /(歌词|副歌|台词|原文|全文|诗文|攻略|步骤|教程|说明书|玩法|怎么玩|怎么弄|怎么做)/;
 
 /** 单轮搜索的唯一入口；只返回证据，不读写会话存储或决定聊天回复。 */
-async function search({ text = '', history = [], llm, config = {}, now = new Date(), signal, trace } = {}, deps = {}) {
+async function search({ text = '', history = [], llm, config = {}, now = new Date(), timeZone = '', signal, trace } = {}, deps = {}) {
   const providers = deps.providers || web;
   const places = deps.places || weather;
   const routeSearch = deps.route || router.route;
@@ -70,7 +70,7 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
     if (gate.route && active()) {
       const routeStarted = Date.now();
       try {
-        route = await routeSearch(llm, text, { ...options(), now,
+        route = await routeSearch(llm, text, { ...options(), now, timeZone,
           history: typeof history === 'function' ? history() : history,
           // 2 秒对自建/较慢的模型太苛刻（实测 75% 超时回退关键词规则，热梗问题
           // 全被跳过）。3.5 秒内大部分路由能返回；总预算仍在 websearch.timeoutMs 内。

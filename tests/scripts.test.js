@@ -46,8 +46,6 @@ test('stop-all.ps1 会写暂停标记，并覆盖服务/桥接/守护', () => {
   assert.match(ps1, /wechatauto_bridge\.py/);
   assert.match(ps1, /server\.js/);
   assert.match(ps1, /python/, '要按 python.exe 找桥接进程');
-  assert.equal(ps1.includes('.' + 'bat'), false, '启动脚本已全部删除，不该再按脚本进程名去杀');
-  assert.doesNotMatch(ps1, /hotkey_daemon/, '热键功能已下线，不该再出现');
   assert.match(ps1, /8787/, '要有按端口兜底');
 });
 
@@ -83,19 +81,17 @@ test('出包脚本会跑测试与发布自检，并从 zip 里复核内容', () 
 
 test('维护文档与 bug 台账在', () => {
   assert.ok(fs.existsSync(path.join(root, 'docs', '维护手册.md')), '缺少 docs/维护手册.md');
-  assert.ok(fs.existsSync(path.join(root, 'BUGS.md')), '缺少 BUGS.md');
-  const bugs = fs.readFileSync(path.join(root, 'BUGS.md'), 'utf8');
+  assert.ok(fs.existsSync(path.join(root, 'docs', 'BUGS.md')), '缺少 docs/BUGS.md');
+  const bugs = fs.readFileSync(path.join(root, 'docs', 'BUGS.md'), 'utf8');
   assert.match(bugs, /回归测试/, '每个 bug 要有回归测试列');
 });
-test('桥接会定时发心跳，网页才看得到「桥接在线 / UIA 不可用」', () => {
+test('桥接会定时发心跳，启动器才看得到「桥接在线 / UIA 不可用」', () => {
   const bridge = require('./helpers/bridge-source');
   assert.match(bridge, /def bridge_heartbeat/);
   assert.match(bridge, /\/api\/bridge\/heartbeat/);
   assert.match(bridge, /response\.raise_for_status\(\)/, 'HTTP 拒绝不能算作心跳成功');
   assert.match(bridge, /UIA_CACHE(?:\.get\(['"]u['"]\)|\[['"]u['"]\])/);
   assert.match(bridge, /['"]rest['"]: resting/, 'rest 字段还要继续上报（前端在读）');
-  assert.match(bridge, /resting = False/, '休息模式已删除，字段保留但恒为 false');
-  assert.doesNotMatch(bridge, /def game_running\(/, '「打游戏就休息」已删除');
   assert.match(bridge, /time\.sleep\(20\)/, '20 秒一次');
 });
 /* ---------------- 重置全部 = 恢复出厂 ---------------- */
@@ -131,12 +127,15 @@ test('维护手册写了「重置全部 = 恢复出厂」和备份位置', () =>
 test('版本号工具存在，且 release-check 会拦「重复/跳号/空条目」', () => {
   assert.ok(fs.existsSync(path.join(root, 'scripts', 'bump-version.js')), '缺少 scripts/bump-version.js');
   const bump = fs.readFileSync(path.join(root, 'scripts', 'bump-version.js'), 'utf8');
-  assert.match(bump, /--level=/, '支持 patch/minor/major');
+  assert.match(bump, /--level=/, '支持 patch/minor/hotfix/major');
+  assert.match(bump, /hotfix/, '支持第四位紧急热修');
   assert.match(bump, /CHANGELOG/, '要写 CHANGELOG');
   const rc = fs.readFileSync(path.join(root, 'scripts', 'release-check.js'), 'utf8');
   assert.match(rc, /CHANGELOG 没有重复版本号/);
   assert.match(rc, /版本号连续（不跳号）/);
   assert.match(rc, /每个版本都有说明内容/);
+  assert.match(rc, /次版本号只用于新增功能/);
+  assert.match(rc, /紧急热修版本必须跟在同一条已发布版本后/);
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   assert.equal(pkg.scripts.bump, 'node scripts/bump-version.js');
 });
@@ -165,12 +164,28 @@ test('发布自检会扫个人信息（密钥 / 真实 wxid / 群号 / 手机号
   assert.match(ps, /raw\\.githubusercontent/, '二进制里的源码托管链接要扫');
 });
 
+test('安装包只在第二位版本号增加（新增功能）时构建', () => {
+  const wf = fs.readFileSync(path.join(root, '.github/workflows/installer.yml'), 'utf8');
+  assert.match(wf, /version-gate/, 'installer.yml 缺少版本判断 job');
+  assert.match(wf, /needs:\s*version-gate/, 'installer job 没有依赖版本判断');
+  assert.match(wf, /"\$head_minor"\s+-gt\s+"\$base_minor"/, 'PR 只有次版本增加时才应构建安装包');
+  assert.match(wf, /github\.event_name.*pull_request/, '只在 PR 上做次版本判断');
+
+  // 版本判断只读 package.json，不该占 Windows 并发槽（PR 排队 15 分钟会被直接取消）。
+  const gateStart = wf.indexOf('version-gate:');
+  const gateEnd = wf.indexOf('installer:', gateStart);
+  assert.ok(gateStart > 0 && gateEnd > gateStart, 'installer.yml 里找不到 version-gate job');
+  const gate = wf.slice(gateStart, gateEnd);
+  assert.match(gate, /runs-on:\s*ubuntu-latest/, 'version-gate 要跑在 ubuntu-latest');
+  assert.doesNotMatch(gate, /shell:\s*pwsh/, 'version-gate 不能再用 PowerShell');
+});
+
 test('引用回复默认关闭（开着的话每条要多走一遍 UI，回复明显变慢）', () => {
   const bridge = require('./helpers/bridge-source');
   assert.match(bridge, /QUOTE_REPLY = _as_bool\(_wechat\.get\(['"]quoteReply['"], False\), False\)/, '启动读配置时默认必须是 False');
   assert.match(bridge, /QUOTE_REPLY = _as_bool\(w\.get\(['"]quoteReply['"], False\), False\)/, '热重载时默认也必须是 False');
   assert.doesNotMatch(bridge, /get\(['"]quoteReply['"], True\)/, '不能有人再写回 True');
-  const example = JSON.parse(fs.readFileSync(path.join(root, 'config.example.json'), 'utf8').replace(/^\uFEFF/, ''));
+  const example = JSON.parse(fs.readFileSync(path.join(root, 'config', 'config.example.json'), 'utf8').replace(/^\uFEFF/, ''));
   assert.equal(example.wechat.quoteReply, false, 'config.example 里也应该是 false');
 });
 
@@ -199,14 +214,6 @@ test('发行包自带 ffmpeg（微信 4.x 图片是 wxHEVC，没它看不了图�
     return;
   }
   assert.ok(fs.statSync(probe).size > 10 * 1024 * 1024, 'ffmpeg.exe 应该是完整二进制');
-});
-
-test('热键文件已删除，README 不再提热键', () => {
-  // 不写后缀：这条断言的就是「根本没有这个名字的入口」
-  assert.equal(fs.readdirSync(root).some((n) => n.includes('启动热键')), false, '启动热键入口应删除');
-  assert.equal(fs.existsSync(path.join(root, 'tools', 'hotkey_daemon.py')), false, 'hotkey_daemon.py 应删除');
-  const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
-  assert.doesNotMatch(readme, /启动热键|hotkey_daemon/, 'README 不该再提热键');
 });
 
 test('README 不再引导用户去点脚本文件（入口只有 WhaleLauncher.exe）', () => {

@@ -98,10 +98,10 @@ class _SendStateScope:
     旧的「固定 40 秒一刀切」会把这种合法慢发送当卡死杀掉（H3）。
     """
 
-    def __init__(self, text_len=0):
+    def __init__(self, text_len=0, *, budget=0):
         # 编码热切换时最多输入两次（一次 GBK、一次 UTF-16），并留出回读/清理时间。
-        # 0.16 秒/字：bg 通道逐字投递 + 回读校验的实测下限（与 docstring 一致）。
-        self.budget = max(40.0, float(text_len or 0) * 0.16 + 8.0)
+        # 0.16 秒/字：bg 通道逐字投递 + 回读校验的实测下限；调用方可再抬预算（budget）。
+        self.budget = max(40.0, float(text_len or 0) * 0.16 + 8.0, float(budget))
 
     def __enter__(self):
         SEND_STATE["active"] = True

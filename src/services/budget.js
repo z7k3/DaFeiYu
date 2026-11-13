@@ -19,6 +19,7 @@ const { LIMITS } = require('../memory/constants');
 const { estimateTokens } = require('../memory/tokens');
 const { planBudget, nearestTier, TIERS } = require('../memory/budgetPlan');
 const persona = require('../persona');
+const time = require('../infra/time');
 
 const PRICING = Object.freeze({
   model: 'deepseek-flash',
@@ -35,15 +36,19 @@ const PER_MILLION = 1e6;
 
 /**
  * 现在是不是高峰时段。
- * 高峰 = 周一至周五 9:00-12:00、14:00-18:00（本地时间）；
+ * 高峰 = 周一至周五 9:00-12:00、14:00-18:00（DeepSeek 计费时区，北京时间）；
  * 其余时段（含午休、夜间、周末 / 节假日）都算谷时。
+ * 注意：这是账单口径，不跟 env.timezone 走；用户把显示时区改成纽约，
+ * DeepSeek 的峰谷也不会跟着变。
  */
-function isPeakHour(now = new Date()) {
+function isPeakHour(now = new Date(), timeZone = 'Asia/Shanghai') {
   const d = now instanceof Date ? now : new Date(now);
   if (Number.isNaN(d.getTime())) return false;
-  const day = d.getDay(); // 0 = 周日、6 = 周六
-  if (day === 0 || day === 6) return false;
-  const minutes = d.getHours() * 60 + d.getMinutes();
+  const zone = timeZone === undefined || timeZone === null ? 'Asia/Shanghai' : String(timeZone);
+  const p = time.parts(d.getTime(), zone);
+  const weekday = new Date(Date.UTC(p.year, p.month - 1, p.day)).getUTCDay(); // 0 = 周日、6 = 周六
+  if (weekday === 0 || weekday === 6) return false;
+  const minutes = p.hour * 60 + p.minute;
   return (minutes >= 9 * 60 && minutes < 12 * 60) || (minutes >= 14 * 60 && minutes < 18 * 60);
 }
 
@@ -54,12 +59,13 @@ function isPeakHour(now = new Date()) {
  * @param {string} provider 服务商标识（保留参数：价格按模型定，不按服务商）
  * @param {string} model 模型名（例如 deepseek-flash / deepseek-v4.1-flash）
  * @param {Date|number} [now] 计价时刻（默认现在；测试里传固定时间）
+ * @param {string} [timeZone] 计费时区；默认北京时间，不跟 env.timezone 走
  * @returns {{model:string, band:'idle'|'peak', price:{inputHit:number, inputMiss:number, output:number}}|null}
  */
-function pricingFor(provider, model, now = new Date()) {
+function pricingFor(provider, model, now = new Date(), timeZone = 'Asia/Shanghai') {
   const m = String(model == null ? '' : model).trim().toLowerCase();
   if (!PRICED_MODELS.includes(m)) return null;
-  const band = isPeakHour(now) ? 'peak' : 'idle';
+  const band = isPeakHour(now, timeZone) ? 'peak' : 'idle';
   return { model: m, band, price: PRICING[band] };
 }
 
@@ -115,9 +121,12 @@ function costOf(price, inputTokens, cachedTokens, outputTokens) {
  * @param {object} config 运行时 config（用 config.memory.dialogueBudget / persona / chat / group）
  * @param {{outputTokens?:number, dialogueBudget?:number}} [opts]
  *   dialogueBudget 传了就用它（启动器滑块实时预览用，不必先保存）
- * @returns {object} 给启动器/调试台看的估算结果
+ * @returns {object} 给启动器状态面板看的估算结果
  */
-function estimate(config, { outputTokens = LIMITS.maxOutputNormal, dialogueBudget: override } = {}) {
+function estimate(config, {
+  outputTokens = LIMITS.maxOutputNormal, dialogueBudget: override,
+  provider = '', model = '', now = new Date(), timeZone = 'Asia/Shanghai',
+} = {}) {
   const overrideNum = Number(override);
   const budget = Number.isFinite(overrideNum) && overrideNum > 0
     ? Math.round(overrideNum)
@@ -128,7 +137,7 @@ function estimate(config, { outputTokens = LIMITS.maxOutputNormal, dialogueBudge
   const maxInputTokens = systemTokens + budget;
   const out = Math.max(0, Number(outputTokens) || 0);
   // 这个预算实际会被分成几块（recent / memory / summary / reserve / relations），
-  // 给启动器的说明区和调试台/status 用
+  // 给启动器的说明区和 /api/status 用
   const plan = planBudget(budget, { relations: false });
   // 启动器只显示三类，太细的拆分别放界面上
   const split = {
@@ -152,8 +161,12 @@ function estimate(config, { outputTokens = LIMITS.maxOutputNormal, dialogueBudge
     hitRate: promptTokens > 0 ? hitTokens / promptTokens : 0,
     tailRefresh: TAIL_REFRESH,
   };
-  const firstCost = costOf(PRICING.idle, promptTokens, 0, out);
-  const cachedCost = costOf(PRICING.idle, promptTokens, hitTokens, out);
+  const asksPricing = Boolean(provider || model);
+  const priced = asksPricing ? pricingFor(provider, model, now, timeZone) : { model: PRICING.model };
+  // 只对公开价目模型算钱；别的服务商返回 null，和 pipeline 的 lastUsage.cost 一致，
+  // 不要拿 DeepSeek 的价格冒充智谱 / OpenCode。
+  const firstCost = priced ? costOf(PRICING.idle, promptTokens, 0, out) : null;
+  const cachedCost = priced ? costOf(PRICING.idle, promptTokens, hitTokens, out) : null;
 
   return {
     ok: true,
@@ -184,8 +197,12 @@ function estimate(config, { outputTokens = LIMITS.maxOutputNormal, dialogueBudge
         recentShare: Number((p.recent / p.dialogueBudget).toFixed(3)),
       };
     }),
-    pricing: { model: PRICING.model, idle: PRICING.idle, peak: PRICING.peak },
-    cost: {
+    pricing: {
+      model: priced ? priced.model : null,
+      idle: priced ? PRICING.idle : null,
+      peak: priced ? PRICING.peak : null,
+    },
+    cost: priced ? {
       // 谷时（空闲时段）
       idle: { first: firstCost, cached: cachedCost },
       // 高峰时段，只为参照
@@ -193,7 +210,7 @@ function estimate(config, { outputTokens = LIMITS.maxOutputNormal, dialogueBudge
         first: costOf(PRICING.peak, promptTokens, 0, out),
         cached: costOf(PRICING.peak, promptTokens, hitTokens, out),
       },
-    },
+    } : null,
   };
 }
 

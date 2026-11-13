@@ -2,6 +2,7 @@
 """bridge composition root: creates BridgeRuntime and runs start()."""
 import engine as G
 from account_mixin import AccountMixin
+from parent_watch import start_watchdog
 from window_mixin import WindowMixin
 from sender_mixin import SenderMixin
 from sticker_mixin import StickerMixin
@@ -18,6 +19,9 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
             return G.list_accounts_cli()
         if '--bg-probe' in G.sys.argv or '--bg-send' in G.sys.argv:
             return G._bg_cli()
+        # 启动器正常关闭会直接结束进程树；被强杀时只剩 stdin 管道关闭，
+        # 这里读到 EOF 就退出，避免留下孤儿桥接。
+        start_watchdog(on_close=lambda: G.log('启动器已退出，桥接随之关闭。'))
         try:
             import bg_sender
             bg_sender.ensure_dpi_aware()
@@ -32,7 +36,7 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
         except Exception:
             pass
         if any((ord(ch) > 127 for ch in G.ROOT)):
-            G.log_warn('[!] 路径里有中文/非英文字符：', G.ROOT)
+            G.log_warn('[!] 路径里有中文/非英文字符：', G.safe_path(G.ROOT))
             G.log('    微信 UI 自动化在这种路径下会失败（发送一直报「拒绝访问」）。')
             G.log('    请把整个文件夹移到纯英文路径再启动，例如 D:\\whale-girl-3.0')
         # 单实例锁：占一个本地 TCP 端口。bind 失败不一定是「已有实例」——端口被系统
@@ -41,6 +45,8 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
         #   能连上 → 真的已有实例，正常退出；连不上 → 端口不可用，报明确错误并非 0 退出。
         _lock_sock = None
         try:
+            # 单实例锁用多端口探测（instance_lock.py）：WSL2 镜像网络会把宿主机
+            # 一整段临时端口保留掉（本机实测 44620-48715），官方单端口 bind 在这里必失败。
             import instance_lock as _lock
             _state = _lock.acquire(getattr(G, 'BRIDGE_LOCK_PORTS', (G.BRIDGE_LOCK_PORT,)))
             if _state['status'] == 'running':
@@ -61,6 +67,7 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
             # 锁模块本身出问题（比如漏拷文件）不该拦住桥接：退回「不占锁」继续跑，只是不挡双开。
             G.log_warn('[!] 单实例锁没装上（%r），这次不挡双开。' % (e,))
             _lock_sock = None
+            G.log_warn('单实例锁获取失败，继续启动（可能重复收消息）：', repr(e))
         try:
             import faulthandler
             # I1：启动时把超大的 hang/crash 日志截断（以前只增不减，也没有轮转）
@@ -76,6 +83,8 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
             try:
                 _hang_file = open(G.os.path.join(G.ROOT, 'data', 'bridge-hang.log'), 'a', encoding='utf-8')
 
+                # 只在「发送临界区 active 且 40 秒无进度」时转储：固定 40 秒一次
+                # （上游 repeat=False 方案）会在健康运行时也写一份全线程栈，噪音大。
                 def _hang_watch():
                     # I1：旧实现 dump_traceback_later(40, repeat=True) 不管卡没卡，
                     # 每 40 秒都把全线程堆栈追加一遍，一天能长 20MB+。改成只有
@@ -123,6 +132,26 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
             self.MediaDownloader = MediaDownloader
             self.WeChatDB = WeChatDB
             self.WeChatGUI = WeChatGUI
+            # 第三方库默认把每条发送正文写进 wechatauto_logs/app_*.log。
+            # 那是完整聊天内容，不能跟着诊断包扩散；关掉它的文件日志，
+            # 需要排查时由桥接自己的脱敏日志给出结构证据。
+            try:
+                from wechatauto.param import WxParam as _WxParam
+                _WxParam.ENABLE_FILE_LOGGER = False
+                # 如果它在 import 阶段已经建过 handler，这里也一并摘掉，避免继续写正文。
+                from wechatauto.logger import wxlog as _wxlog
+                _old_handler = getattr(_wxlog, 'file_handler', None)
+                if _old_handler is not None:
+                    try:
+                        import logging as _logging
+                        _logging.getLogger().removeHandler(_old_handler)
+                        _old_handler.close()
+                    except Exception:
+                        pass
+                    _wxlog.file_handler = None
+                G.log('wechatauto 文件日志已关闭（避免把发送正文写进 wechatauto_logs）')
+            except Exception as _wxlog_err:
+                G.log_warn('关闭 wechatauto 文件日志失败 type=%s' % type(_wxlog_err).__name__)
             _here = G.os.path.dirname(G.os.path.abspath(__file__))
             if _here not in G.sys.path:
                 G.sys.path.insert(0, _here)
@@ -142,6 +171,21 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
                     G.boot('uia_compat 已按文件路径加载并生效')
                 except Exception:
                     G.boot('uia_compat 未生效: %r' % (_compat_err,))
+            G.boot('应用 moment_compat 补丁')
+            try:
+                import moment_compat
+                _moment_ok = moment_compat.install()
+                G.boot('moment_compat.install() = %r' % (_moment_ok,))
+                if not _moment_ok:
+                    G.log_warn('朋友圈兼容层未生效：wechatauto 可能升级改了结构')
+            except Exception as _moment_err:
+                G.boot('moment_compat 未生效: %r' % (_moment_err,))
+                G.log_warn('朋友圈兼容层加载失败 type=%s' % type(_moment_err).__name__)
+            try:
+                import wechatauto as _wechatauto_pkg
+                G.log('wechatauto 版本：%s' % getattr(_wechatauto_pkg, '__version__', '?'))
+            except Exception:
+                pass
             G.boot('import 完成')
         except Exception as e:
             G.boot('导入失败: %r' % (e,))
@@ -155,7 +199,8 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
                 G.log('    装完重启电脑，再回启动器「微信 · 桥接」页点「重启桥接」。')
                 G.log('    提示：Windows Server 默认不装 MFC，家庭版/专业版一般已有。')
             else:
-                G.log('请先运行："%LOCALAPPDATA%\\Programs\\Python\\Python312\\python.exe" -m pip install wechatauto-replica requests')
+                G.log('源码运行：先装 bridge/requirements.txt 里的依赖，并把 vendor/wechatauto 加进 PYTHONPATH；')
+                G.log('用启动器时它会自动从 runtime/python 加载，不用手动装包。')
             return 1
         self.cfg = G.read_config()
         self.token = G.bridge_config.wechat_token(self.cfg)
@@ -169,25 +214,25 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
             G.log('⚠️ webhook token 是空的！检查 config.json 的 gateway.wechat.inboundToken（文件要能正常解析）')
         self.db_dir = G.resolve_db_dir()
         if self.db_dir:
-            G.log('数据库目录：', self.db_dir)
+            G.log('数据库目录：', G.safe_path(self.db_dir))
         self.acct_dirs = G.find_account_dirs(self.db_dir) if self.db_dir else []
         self.acct = G.ACCOUNT_WANTED
         if self.acct:
             hit = G.resolve_account_dir(self.db_dir, self.acct) if self.db_dir else ''
             if not hit:
                 G.log('')
-                G.log('✗ 找不到微信账号 %r。' % self.acct)
-                G.log('  这台机器上现有账号：%s' % ('、'.join(self.acct_dirs) or '（一个都没有）'))
+                G.log('✗ 找不到微信账号 %s。' % G.safe_id(self.acct))
+                G.log('  这台机器上现有账号：%s' % ('、'.join(G.safe_id(x) for x in self.acct_dirs) or '（一个都没有）'))
                 G.log('  去启动器「微信桥接」页点一下账号卡，或把 config.json 的')
                 G.log('  wechat.account 改成上面某个名字（目录名 / wxid / 昵称都行，留空=自动选）。')
                 G.log('  这里直接停下，不会偷偷换成别的号。')
                 return 2
             if hit != self.acct:
-                G.log('配置账号 %r → 账号目录 %s' % (self.acct, hit))
+                G.log('配置账号 %s → 账号目录 %s' % (G.safe_id(self.acct), G.safe_id(hit)))
             self.acct = hit
-            G.log('指定账号：', self.acct, '（网页设置 / config.json → wechat.account）')
+            G.log('指定账号：', G.safe_id(self.acct), '（启动器设置 / config.json → wechat.account）')
         elif len(self.acct_dirs) > 1:
-            G.log('⚠️ 这台机器有 %d 个微信账号：%s' % (len(self.acct_dirs), '、'.join(self.acct_dirs)))
+            G.log('⚠️ 这台机器有 %d 个微信账号：%s' % (len(self.acct_dirs), '、'.join(G.safe_id(x) for x in self.acct_dirs)))
             G.log('   没指定账号 → 按「最近活跃」自动选，可能选到大号。')
             G.log('   去启动器「微信桥接」页点一下账号卡（推荐：只选小号）。')
         G.log('打开微信数据库（这一步偶尔会卡，最多等 90 秒）…')
@@ -223,10 +268,10 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
             return 2
         if self.acct and self.db.account != self.acct:
             G.log('')
-            G.log('✗ 账号被库自己换掉了：要的是 %s，实际打开的是 %s。' % (self.acct, self.db.account))
-            G.log('  多半是微信当前登录的是另一个号，取到的密钥解不开 %s 的库。' % self.acct)
+            G.log('✗ 账号被库自己换掉了：要的是 %s，实际打开的是 %s。' % (G.safe_id(self.acct), G.safe_id(self.db.account)))
+            G.log('  多半是微信当前登录的是另一个号，取到的密钥解不开 %s 的库。' % G.safe_id(self.acct))
             G.log('  请确认微信现在登录的就是小号，再在启动器里点「重启桥接」。')
-            G.log('  （这里直接停下，绝不会用 %s 继续跑。）' % self.db.account)
+            G.log('  （这里直接停下，绝不会用 %s 继续跑。）' % G.safe_id(self.db.account))
             return 2
         self._media_box = {'downloader': None}
         self._media_lock = G.threading.Lock()
@@ -235,13 +280,13 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
         try:
             info = self.db.get_self_info() or {}
             self._self_nick = str(info.get('nick_name') or info.get('remark') or '').strip()
-            G.log('当前登录账号：', self._self_nick or self.me)
+            G.log('当前登录账号：', G.safe_name(self._self_nick) if self._self_nick else G.safe_id(self.me))
         except Exception:
-            G.log('当前登录账号 wxid：', self.me)
-        G.log('账号目录：', self.db.account, '（网页/config 指定）' if self.acct else '（自动选：最近活跃）')
+            G.log('当前登录账号 wxid：', G.safe_id(self.me))
+        G.log('账号目录：', G.safe_id(self.db.account), '（启动器/config 指定）' if self.acct else '（自动选：最近活跃）')
         if len(self.acct_dirs) > 1:
-            G.log('（这台机器有 %d 个账号目录：%s）' % (len(self.acct_dirs), '、'.join(self.acct_dirs)))
-        G.log('数据库目录：', self.db.db_dir)
+            G.log('（这台机器有 %d 个账号目录：%s）' % (len(self.acct_dirs), '、'.join(G.safe_id(x) for x in self.acct_dirs)))
+        G.log('数据库目录：', G.safe_path(self.db.db_dir))
         G.threading.Thread(target=self._heal_accounts_cache, daemon=True, name='accounts-cache').start()
         self.sessions = {}
         try:
@@ -251,6 +296,7 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
             G.log_warn('读取会话列表失败：', e)
         self.name_cache = {}
         self.alias_cache = {}
+        self._mention_cache = None
         self.open_cache = {}
         self.gui = None
         self.gui_lock = G.threading.Lock()
@@ -293,6 +339,45 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
         G.threading.Thread(target=self.listener_watch, daemon=True).start()
         G.threading.Thread(target=self.contacts_sync_once, daemon=True).start()
         G.REMINDER_RUNNER = self.start_reminder_watch()
+        moments_reader = None
+        try:
+            from moments import MomentsReader
+
+            def moments_interact(action, query):
+                from moments_actions import perform
+                from wechatauto import WeChat
+                with self.send_lock:
+                    # game_running 已随「打游戏就休息」一起删除（见 tests/scripts.test.js），
+                    # 这里再调它就是 NameError；全屏 / 账号闸仍然照拦。
+                    if self.foreground_is_fullscreen() or (not self.account_send_allowed('朋友圈')):
+                        return False
+                    with self.gui_lock:
+                        if self.gui is None:
+                            return False
+                        self.bind_gui_window(self.gui)
+                        return perform(WeChat(gui=self.gui, db=self.db).Moment, action, query, log=G.log)
+            def moments_publish(query, gate):
+                from moments_worker import publish_isolated
+                # 发表也属于发送临界区，心跳不能在菜单/编辑器打开时重建 UIA。
+                with self.send_lock, G._SendStateScope(budget=110):
+                    if query.get('manual') is not True and self.foreground_is_fullscreen():
+                        return 'failed', 'fullscreen_blocked'
+                    if not self.account_send_allowed('朋友圈发表') or not self.ACCOUNT.get('verified'):
+                        return 'failed', 'account_not_verified'
+                    if not self.wechat_window_alive():
+                        return 'failed', 'window_unavailable'
+                    hwnd = int(self.ACCOUNT.get('hwnd') or 0)
+                    def allowed():
+                        return (self.ACCOUNT.get('verified') and self.ACCOUNT.get('hwnd') == hwnd
+                                and self.wechat_window_alive() and gate())
+                    with self.gui_lock:
+                        if not allowed():
+                            return 'failed', 'job_cancelled'
+                        return publish_isolated(self, query, allowed, G.log)
+
+            moments_reader = MomentsReader(self.db, G.LOCAL_HTTP, self.bot_url.rsplit('/webhook', 1)[0], {'x-bot-token': self.token, 'x-whale-bridge': '1'}, G.log, interact=moments_interact, publish=moments_publish).start()
+        except Exception as exc:
+            G.log('朋友圈读取通道未启动 type=%s' % type(exc).__name__)
         G.log('已启动。鲸鲸地址：', self.bot_url)
         try:
             import json as _json, datetime as _dt
@@ -305,6 +390,8 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
                 G.time.sleep(1)
         except KeyboardInterrupt:
             G.log('正在退出…')
+            if moments_reader is not None:
+                moments_reader.stop()
             if G.REMINDER_RUNNER is not None:
                 try:
                     G.REMINDER_RUNNER.stop()

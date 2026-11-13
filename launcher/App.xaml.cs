@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Threading;
 using System.Threading;
@@ -24,6 +25,18 @@ namespace WhaleLauncher
                 finally { Shutdown(code); }
                 return;
             }
+            // 开发用：离屏渲染一张主窗口截图，调深浅色 / 背景图时不用真开窗口。
+            if (e.Args.Length >= 2 && e.Args[0] == "--render-preview")
+            {
+                ShutdownMode = ShutdownMode.OnExplicitShutdown;
+                var scale = 1.0;
+                if (e.Args.Length >= 3) double.TryParse(e.Args[2], out scale);
+                if (scale <= 0) scale = 1;
+                var nav = -1;
+                if (e.Args.Length >= 4) int.TryParse(e.Args[3], out nav);
+                _ = PreviewRenderer.RunAsync(e.Args[1], scale, nav);
+                return;
+            }
             // 自更新后重启会带 --replace <pid>：等旧实例真的退出，再去抢单实例锁
             WaitForReplacedInstance();
             CleanupOldExes();
@@ -34,7 +47,7 @@ namespace WhaleLauncher
             catch (AbandonedMutexException) { _ownsInstance = true; }
             if (!_ownsInstance)
             {
-                MessageBox.Show("鲸鲸已经在运行，请切回已有窗口。", "鲸鲸");
+                AppDialog.Show(null, "鲸鲸已经在运行，请切回已有窗口。", "鲸鲸", danger: true);
                 Shutdown();
                 return;
             }
@@ -98,11 +111,30 @@ namespace WhaleLauncher
                 Directory.CreateDirectory(dir);
                 var sb = new StringBuilder();
                 sb.AppendLine("==== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  [" + where + "] ====");
-                sb.AppendLine(ex?.ToString() ?? "（没有异常对象）");
+                // 异常正文可能带 wxid/账号路径/手机号；崩溃日志也会被诊断包带走，先打码。
+                sb.AppendLine(MaskSensitive(ex?.ToString() ?? "（没有异常对象）"));
                 sb.AppendLine();
                 File.AppendAllText(Path.Combine(dir, "crash.log"), sb.ToString(), Encoding.UTF8);
             }
             catch { }
+        }
+
+        private static string MaskSensitive(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            try
+            {
+                var s = Regex.Replace(text, @"\bwxid_[A-Za-z0-9_\-]{4,}", "wxid_***");
+                s = Regex.Replace(s, @"\b\d{9,}@chatroom\b", "***@chatroom");
+                s = Regex.Replace(s, @"(?<!\d)1[3-9]\d{9}(?!\d)", "1**********");
+                s = Regex.Replace(s, @"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "***@***");
+                s = Regex.Replace(s, @"([A-Za-z]:\\Users\\)[^\\\s""']+", "$1***", RegexOptions.IgnoreCase);
+                s = Regex.Replace(s, @"(Bearer\s+)[A-Za-z0-9._\-]{12,}", "$1***");
+                s = Regex.Replace(s, @"([?&](?:token|key|secret|signature|password|api_key)=)[^&\s]+", "$1***", RegexOptions.IgnoreCase);
+                s = Regex.Replace(s, @"\b(?:sk|oc_sk|ak|ghp|xox[baprs]|brz)[-_][A-Za-z0-9_\-]{8,}", "***");
+                return s;
+            }
+            catch { return text; }
         }
     }
 }

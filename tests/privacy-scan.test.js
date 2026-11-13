@@ -60,6 +60,16 @@ test('群号 / 手机号 / 邮箱 / 密钥 / JWT 会命中，示例值不会', (
   assert.ok(rulesOf(scanText('token ' + jwt)).includes('JWT'));
 });
 
+test('作者公开的提交邮箱不算泄露，相似地址照样报', () => {
+  // 这两个地址写在 LICENSE / docs/NOTICE.md 里做署名，作者本人同意公开
+  assert.deepEqual(scanText('署名 ' + 'chrisgao0312' + '@' + 'qq.com'), []);
+  assert.deepEqual(scanText('署名 ' + '2117286908' + '@' + 'qq.com'), []);
+
+  // 白名单必须是精确地址：只差一位、同域名的仍要报，否则等于按域名放行
+  assert.ok(rulesOf(scanText('联系 ' + 'chrisgao0313' + '@' + 'qq.com')).includes('邮箱'));
+  assert.ok(rulesOf(scanText('联系 ' + '2117286909' + '@' + 'qq.com')).includes('邮箱'));
+});
+
 test('本机用户名路径会命中，别人的路径不会', () => {
   const user = process.env.USERNAME || 'nobody';
   assert.ok(rulesOf(scanText('C:\\Users\\' + user + '\\Documents\\x')).length > 0);
@@ -75,6 +85,20 @@ test('二进制里的调试路径与源码托管链接会被扫出来', () => {
 
   assert.deepEqual(scanBinaryBuffer(Buffer.from('plain binary, no paths')), []);
   for(const repo of ['whale_girl','whale_gril'])assert.deepEqual(scanBinaryBuffer(Buffer.from('https://raw.github'+'usercontent.com/Banan1cee/'+repo+'/main/release-manifest.json')),[]);
+});
+
+test('官方 Api 3 目录不误报，其他仓库和相似文件名仍检查', () => {
+  const catalogs = ['index-v3.json', 'index-personas.json'];
+  for (const catalog of catalogs) {
+    const official = 'https://raw.github' + 'usercontent.com/Banan1cee/whale-girl-plugins/main/' + catalog;
+    for (const encoding of ['utf8', 'utf16le']) {
+      assert.deepEqual(scanBinaryBuffer(Buffer.from(official + '\0', encoding)), []);
+      assert.deepEqual(scanBinaryBuffer(Buffer.from(official + '\u0d01下一', encoding)), []);
+      for (const other of [official + '.private', official + '/private', official + '?private=1', official.replace('/main/', '/secret/'), official.replace('Banan1cee', 'someone')]) {
+        assert.ok(rulesOf(scanBinaryBuffer(Buffer.from(other, encoding))).includes('源码托管链接（二进制）'));
+      }
+    }
+  }
 });
 
 test('scan() 会跳过 data/runtime/artifacts，但会扫 launcher/publish 的成品', () => {

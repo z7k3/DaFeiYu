@@ -105,6 +105,36 @@ test('顶栏有太阳/月亮开关，背景图有独立图层和模糊', () => {
   assert.ok(main.includes('<BlurEffect'), '背景图应该做模糊，避免抢文字');
 });
 
+test('背景模糊与透明度可调，玻璃面板 + 自动蒙版保证文字可读', () => {
+  const main = readLauncher('MainWindow.xaml');
+  const code = readLauncher('MainWindow.xaml.cs');
+  const settings = readLauncher('Views/SettingsPage.xaml.cs');
+
+  assert.ok(main.includes('x:Name="BackdropBlurEffect"'), '背景模糊效果要能被代码调半径');
+  assert.ok(code.includes('BackdropImage.Opacity = Appearance.BackdropOpacity'), '背景图透明度要接到设置');
+  assert.ok(code.includes('BackdropBlurEffect.Radius = Appearance.BackdropBlur'), '背景模糊要接到设置');
+
+  for (const member of ['SetBackdropBlur', 'SetBackdropFit', 'SetBackdropOpacity', 'SetSurfaceOpacity', 'BuildPalettes', 'ApplyPalette', 'ApplyTextPalette', 'ResolveTint', 'ApplyTextHalo', 'ApplyGlassSurfaces', 'SetPaletteColor', 'ResetPalette']) {
+    assert.ok(appearance.includes(member), 'Appearance.cs 缺少 ' + member);
+  }
+  assert.match(appearance, /backdropBlur\s*=\s*BackdropBlur/, '模糊度要写进 launcher-ui.json');
+  assert.match(appearance, /backdropOpacity\s*=\s*BackdropOpacity/, '透明度要写进 launcher-ui.json');
+  assert.match(appearance, /surfaceOpacity\s*=\s*SurfaceOpacity/, '面板不透明度要写进 launcher-ui.json');
+  assert.match(appearance, /backdropFit\s*=\s*BackdropFit/, '背景填充要写进 launcher-ui.json');
+  assert.match(appearance, /accentColor\s*=\s*AccentOverride/, '主题色要写进 launcher-ui.json');
+  // 莫奈取色：从背景图统计色相，而不是写死颜色
+  assert.ok(appearance.includes('TryGetMonet') && appearance.includes('Hsv'), '缺少莫奈取色');
+  // 卡片从 0 调到上限：默认只留一层淡玻璃，不再盖住背景图
+  assert.match(appearance, /\("CardBg", 0\.00, 0\.86\)/, '卡片没有做成可调透明');
+  // 文字自带反色描边，面板拉到 0 也能读
+  assert.ok(appXaml.includes('x:Key="TextHalo"'), 'App.xaml 缺少文字描边资源');
+  assert.match(appXaml, /TargetType="TextBlock"[\s\S]*?Effect" Value="\{DynamicResource TextHalo\}"/, 'TextBlock 没挂描边');
+
+  assert.ok(settings.includes('背景模糊') && settings.includes('背景透明度'), '设置页缺少背景滑块');
+  assert.ok(settings.includes('面板不透明度'), '设置页缺少面板不透明度滑块');
+  assert.ok(settings.includes('SetBackdropBlur') && settings.includes('SetBackdropOpacity') && settings.includes('SetSurfaceOpacity'), '滑块没接到 Appearance');
+});
+
 test('人设页左侧身份/说话方式子导航已移除，分区直接铺满', () => {
   const xaml = readLauncher('Views/PersonaPage.xaml');
   const code = readLauncher('Views/PersonaPage.xaml.cs');
@@ -165,11 +195,11 @@ test('「深度思考」开关在模型卡的聊天页里，默认关，读写 s
   const chatPanel = code.slice(chatStart, voiceStart);
   assert.ok(chatPanel.includes('"深度思考"'), '聊天页缺少深度思考开关');
   assert.ok(chatPanel.includes('思考 token 计入输出预算'), '要说明变慢 / 变贵');
-  // 不能再挂 config 的 deepseek.thinking：它会被网页保存的 settings.thinking 盖掉
+  // 不能再挂 config 的 deepseek.thinking：它会被启动器保存的 settings.thinking 盖掉
   assert.ok(!code.includes('Path = "deepseek.thinking"'), '不要再用 config 的 deepseek.thinking');
   assert.ok(!code.includes('思考（打开后会减慢说话速度）'), '旧语音页开关要删掉');
   // 读写都走 data/settings.json：保存时带 thinking，加载时回填
-  assert.ok(code.includes('\\"thinking\\":'), '保存请求要带 thinking');
+  assert.ok(code.includes('["thinking"]'), '保存请求要带 thinking');
   assert.ok(code.includes('TryGetProperty("thinking"'), '加载时要回填 thinking');
   // 默认必须是关：DEFAULT_CONFIG 里 thinking=false
   const config = read('src/infra/config.js');
@@ -185,7 +215,7 @@ test('诊断页内置 UIA 自检与数据维护，不用再开 bat', () => {
   assert.ok(code.includes('factory-reset.ps1'), '重置全部应该走 factory-reset.ps1');
   assert.match(code, /_sup\.StopAll\(\)/, '恢复记忆前必须先停内核');
   assert.ok(xaml.includes('uia-check.py') || code.includes('uia-check.py'), 'UIA 自检入口');
-  assert.equal((code.match(/AskInline\(/g) || []).length >= 2, true, '重置全部必须两次应用内确认');
+  assert.equal((code.match(/AppDialog\.Confirm\(/g) || []).length >= 2, true, '重置全部必须两次应用内确认');
   // 命令行工具要给启动器吐 JSON 列表
   const tool = readLauncher('../scripts/memory-tool.js');
   assert.match(tool, /--json/, 'memory-tool list 要支持 --json');
@@ -206,6 +236,68 @@ test('滚动条是自定义圆角滑块，页面/输入控件关掉默认焦点�
   assert.match(appXaml, /TargetType="CheckBox"[\s\S]*?FocusVisualStyle" Value="\{x:Null\}"/, 'CheckBox 还留着焦点虚线');
   assert.match(appXaml, /TargetType="TextBox"[\s\S]*?FocusVisualStyle" Value="\{x:Null\}"/, 'TextBox 还留着焦点虚线');
   assert.match(readLauncher('Views/SettingsPage.xaml'), /FocusVisualStyle="\{x:Null\}"/, '设置页 FocusVisualStyle 没关');
+});
+
+test('所有文本输入框共用一套 TextBox 模板，聚焦加粗边框不会裁字', () => {
+  const boxStart = appXaml.indexOf('<Style TargetType="TextBox">');
+  assert.ok(boxStart >= 0, '找不到全局 TextBox 样式');
+  const box = appXaml.slice(boxStart, appXaml.indexOf('</Style>', boxStart));
+  assert.match(box, /MinHeight" Value="(3[2-9]|[4-9]\d)"/, '输入框最小高度太小，行高会被裁');
+  assert.match(box, /Padding" Value="\d+,[4-9]"/, '输入框上下内边距不够，聚焦边框会削字');
+  assert.doesNotMatch(box, /PART_ContentHost[^>]*VerticalAlignment="\{TemplateBinding VerticalContentAlignment\}"/,
+    'PART_ContentHost 不能再绑 VerticalAlignment，否则内容会被压成一条并裁字');
+  const moments = readLauncher('Views/MomentsPage.xaml');
+  assert.doesNotMatch(moments, /<TextBox[^>]*Height="\d+"/, '朋友圈输入框还在写死高度，应交给全局样式');
+  assert.doesNotMatch(moments, /<TextBox[^>]*VerticalContentAlignment=/, '朋友圈输入框还在单独设垂直对齐');
+  const number = readLauncher('NumberField.cs');
+  const time = readLauncher('TimeField.cs');
+  assert.ok(!number.includes('VerticalContentAlignment ='), 'NumberField 不应再单独改垂直对齐');
+  assert.ok(!time.includes('VerticalContentAlignment ='), 'TimeField 不应再单独改垂直对齐');
+});
+
+test('时间输入统一走 TimeField：日记用 Clock，搭话用 Ranges，设置页能改全局时区', () => {
+  const field = readLauncher('TimeField.cs');
+  assert.ok(field.includes('TryNormalizeClock') && field.includes('TryNormalizeRanges'), 'TimeField 缺少统一解析入口');
+  assert.match(field, /24:00/, '时间段结束点应该支持 24:00');
+  assert.match(field, /Replace\('：', ':'\)/, '24:00 的全角冒号也应规范化');
+  const xaml = readLauncher('Views/ReminderPage.xaml');
+  assert.match(xaml, /<ui:TimeField[^>]*x:Name="TxtDiaryTime"[^>]*Mode="Clock"/, '日记时间没用 TimeField(Clock)');
+  assert.match(xaml, /<ui:TimeField[^>]*x:Name="TxtCareWindows"[^>]*Mode="Ranges"/, '搭话时间段没用 TimeField(Ranges)');
+  const code = readLauncher('Views/ReminderPage.xaml.cs');
+  assert.ok(code.includes('TxtDiaryTime.TryRead') && code.includes('TxtCareWindows.TryRead'), '保存时应该走 TimeField.TryRead');
+  const settings = readLauncher('Views/SettingsPage.xaml.cs');
+  assert.ok(settings.includes('Path = "env.timezone"'), '设置页缺少全局时区');
+});
+
+test('表情包「打开总目录」在离线/功能关闭时也能落到 data\\stickers，并用 explorer 参数打开', () => {
+  const code = readLauncher('Views/StickerPage.xaml.cs');
+  assert.match(code, /Path\.Combine\(_sup\.DataDir,\s*"stickers"\)/, '根目录要有本地兜底，不能只依赖内核');
+  assert.ok(code.includes('Arguments = "\\"" + target + "\\""'), '目录打开要用 explorer 的 Arguments 字符串');
+  assert.ok(code.includes('Arguments = "/select,\\"" + target + "\\""'), '定位单图要用 /select, 参数');
+  assert.doesNotMatch(code, /UseShellExecute\s*=\s*true\s*\};\s*psi\.ArgumentList/, 'UseShellExecute=true 不能配 ArgumentList');
+});
+
+test('主动搭话页有独立黑白名单入口，UIA 自检输出强制 UTF-8', () => {
+  const xaml = readLauncher('Views/ReminderPage.xaml');
+  const code = readLauncher('Views/ReminderPage.xaml.cs');
+  assert.match(xaml, /x:Name="BtnCarePolicy"[\s\S]*OnOpenCarePolicy/);
+  assert.match(xaml, /黑白名单/);
+  assert.match(code, /OnOpenCarePolicy[\s\S]*new ChatPolicyWindow/);
+  const diag = readLauncher('Views/DiagPage.xaml.cs');
+  assert.match(diag, /PYTHONIOENCODING/);
+  assert.match(diag, /PYTHONUTF8/);
+  const check = fs.readFileSync(path.join(root, 'scripts', 'tools', 'uia-check.py'), 'utf8');
+  assert.match(check, /reconfigure\(encoding="utf-8"/);
+});
+
+test('启动器不再使用系统 MessageBox，统一走应用内 AppDialog', () => {
+  const files = fs.readdirSync(path.join(root, 'launcher'), { recursive: true })
+    .filter((rel) => String(rel).endsWith('.cs'));
+  for (const rel of files) {
+    const text = fs.readFileSync(path.join(root, 'launcher', String(rel)), 'utf8');
+    assert.equal(text.includes('MessageBox.Show'), false, '还在用系统弹窗：launcher/' + rel);
+  }
+  assert.ok(fs.existsSync(path.join(root, 'launcher', 'AppDialog.cs')));
 });
 
 test('新版 exe 都在仓库里', () => {
