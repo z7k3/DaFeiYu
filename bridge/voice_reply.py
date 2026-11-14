@@ -11,6 +11,13 @@ from contextlib import ExitStack, contextmanager
 
 _health_lock = threading.Lock()
 _health = {}  # Per installation, in memory only. Never stores text or credentials.
+# 两类冷却必须分开（2026-11-14 实见：合成 HTTP=200 成功、语音没落进微信 →
+# note_failure 被当成「接口连续异常」拦了 30 分钟，连「发语音」这种明确请求
+# 都只回文字——接口明明是好的，坏的是投递通道，而且明确请求值得再试）。
+# _api_until：TTS 接口连续合成失败（网络/HTTP），冷却期间一切语音回退文字。
+# _delivery_until：上次语音没送达（DB 里没有新语音），冷却期间只拦概率抽签，
+# 明确请求照样尝试——用户点名要语音时，白等一次合成也比一直回文字强。
+_delivery_until = {}
 
 def synth_timeout(config):
     try:
@@ -25,6 +32,19 @@ def _health_update(root, failed):
         failures = failures + 1 if failed else 0
         _health[root] = (failures, time.monotonic() + 300 if failures >= 2 else 0)
 
+def cooldown_remaining(root, explicit=False):
+    """语音通道要不要回退文字：API 冷却拦一切；投递冷却只拦概率抽签。
+
+    返回 (要冷却吗, 剩余秒, 原因码)。抽成独立函数供测试与调用方共用。"""
+    with _health_lock:
+        api_left = _health.get(root, (0, 0))[1] - time.monotonic()
+        delivery_left = _delivery_until.get(root, 0) - time.monotonic()
+    if api_left > 0:
+        return True, api_left, "api"
+    if delivery_left > 0 and not explicit:
+        return True, delivery_left, "delivery"
+    return False, 0.0, ""
+
 def note_failure(root):
     """一次「确认没送出去」的语音尝试 → 立刻进 5 分钟冷却。
 
@@ -33,9 +53,11 @@ def note_failure(root):
     直接走文字，不再每条都白等一次 TTS 合成（实测 10~17 秒）。
     """
     with _health_lock:
-        # 声卡不可用这类本地故障不会 5 分钟自愈；冷却久一点，别让 25% 的回复
-        # 每条都先白等一次 TTS 合成（实测 10~17 秒）再回落文字。
-        _health[root] = (2, time.monotonic() + 1800)
+        # 声卡不可用这类本地故障不会 5 分钟自愈；冷却久一点，别让概率抽中的
+        # 回复每条都先白等一次 TTS 合成（实测 10~17 秒）再回落文字。
+        # 注意：这里只拦概率抽签；「发语音」这类明确请求不受影响（见
+        # cooldown_remaining），接口本身没坏就不该替用户放弃。
+        _delivery_until[root] = time.monotonic() + 1800
 
 
 @contextmanager
@@ -97,7 +119,7 @@ def choose(config, incoming, is_group, rng, log=None):
     selected = rng() < chance / 100
     return decision(selected, 'probability_hit' if selected else 'probability_miss')
 
-def deliver(root, text, hwnd, prepare, log, allow_foreground=None, cancelled=None, outcome=None, send_lock=None):
+def deliver(root, text, hwnd, prepare, log, allow_foreground=None, cancelled=None, outcome=None, send_lock=None, explicit=False):
     """Synthesize first; only touch WeChat once the worker reports ready.
 
     Return True once recording may have begun, including uncertain results. This
@@ -111,12 +133,16 @@ def deliver(root, text, hwnd, prepare, log, allow_foreground=None, cancelled=Non
         if outcome is not None:
             outcome.update(Status="failed", Error="语音发送未启用或已取消")
         return False
-    with _health_lock:
-        remaining = _health.get(root, (0, 0))[1] - time.monotonic()
-    if remaining > 0:
-        log("自动语音：接口连续异常，冷却中，回退文字；剩余 %.0fs" % remaining)
+    blocked, remaining, why = cooldown_remaining(root, explicit=explicit)
+    if blocked:
+        if why == "api":
+            log("自动语音：TTS 接口连续异常，冷却中，回退文字；剩余 %.0fs" % remaining)
+            err = "语音接口连续异常，暂时回退文字，稍后自动再试"
+        else:
+            log("自动语音：上次语音没送达，概率抽签冷却中；剩余 %.0fs（明确请求不受影响）" % remaining)
+            err = "上次语音没送达，暂时不主动发语音"
         if outcome is not None:
-            outcome.update(Status="failed", Error="语音接口连续异常，暂时回退文字，5 分钟后自动再试")
+            outcome.update(Status="failed", Error=err)
         return False
     directory = os.path.join(root, "data", "voice-send-jobs")
     os.makedirs(directory, exist_ok=True)

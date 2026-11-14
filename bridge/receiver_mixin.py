@@ -679,7 +679,9 @@ class ReceiverMixin:
                 spoken = '\n'.join((line.strip() for line in bubbles if line.strip()))
                 voice_outcome = {}
                 voice_started = G.time.time()
-                if self.send_voice_reply(spoken, target, username, outcome=voice_outcome):
+                # 明确请求绕过「投递未确认」冷却（接口没坏就不替用户放弃语音）
+                voice_explicit = G.voice_reply.requested(content)
+                if self.send_voice_reply(spoken, target, username, outcome=voice_outcome, explicit=voice_explicit):
                     voice_status = str(voice_outcome.get('Status') or '')
                     # sent_unconfirmed = worker 已播放并确认录音，可信地"可能已发出"。
                     # uncertain = worker 自己也只是"可能"（声卡不可用、播放中断都走这条）。

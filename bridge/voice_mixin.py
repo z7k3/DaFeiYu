@@ -42,7 +42,7 @@ class VoiceMixin:
                 if current not in keys:
                     return ''
                 return current
-        return G.voice_reply.deliver(G.ROOT, text, hwnd, prepare, G.log, cancelled=cancelled, outcome=outcome, send_lock=self.send_lock)
+        return G.voice_reply.deliver(G.ROOT, text, hwnd, prepare, G.log, cancelled=cancelled, outcome=outcome, send_lock=self.send_lock, explicit=explicit)
 
     def voice_test_loop(self):
         while True:
