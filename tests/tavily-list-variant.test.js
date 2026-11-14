@@ -25,3 +25,21 @@ test('名单类查询发第二轮「完整名单」变体并带回汇总页', as
   assert.ok(tavCalls >= 1, '要有一轮完整名单变体查询');
   assert.ok(value.items.some(x => x.url === 'https://e.test/full20'), '汇总页要进证据');
 });
+
+test('首轮结果数量充足（6 条新闻页）也要发完整名单变体', async () => {
+  const bodies = [];
+  const opts = { timeoutMs: 8000, tavilyApiKey: 'thb-test', tavilyMaxResults: 6,
+    _post: async (url, key, body) => {
+      bodies.push(body.query);
+      return String(body.query).includes('完整名单')
+        ? { code: 0, data: { data: { results: [
+            { title: '完整名单汇总页', url: 'https://e.test/all20', content: '1 ZywOo 2 donk …… 20 人齐全' }] } } }
+        : { code: 0, data: { data: { results: [
+            { title: '颁奖前三新闻', url: 'https://e.test/news' + bodies.length, content: 'ZywOo donk ropz 获得年度前三' }] } } };
+    } };
+  const value = await web.searchResult('去年CS2的top20都是谁', opts);
+  const firstQuery = bodies[0];
+  assert.match(firstQuery, /top20|名单|榜单|排名|排名/, '首轮就是名单类查询');
+  assert.ok(bodies.some(q => q.includes('完整名单')), '数量充足也要发变体——新闻页不含完整名单');
+  assert.ok(value.items.some(x => x.url === 'https://e.test/all20'), '汇总页要进证据');
+});

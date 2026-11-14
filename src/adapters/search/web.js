@@ -70,11 +70,11 @@ async function searchResult(query, opts = {}) {
   const tavilyOn = Boolean(String(opts.tavilyApiKey || '').trim()) && !site;
   if (tavilyOn) {
     await ask('tavily', body, true);
-    // 名单/榜单类查询补一轮「完整名单」变体：单轮结果常是颁奖/前三的新闻页，
-    // 完整名单在汇总页或后续报道里（实见 HLTV top20：单轮只有前三的报道，
-    // 20 人名单的汇总页要换关键词才搜得到）。URL 去重挡住重复条目。
-    if (!site && /(名单|榜单|排行|排名|top\s*\d)/i.test(body)
-        && valid().length < 5 && budget() > 800) {
+    // 名单/榜单类查询无条件补一轮「完整名单」变体：单轮结果常是颁奖/前三的
+    // 新闻页——它们能通过全部过滤器（数量够、相关、不旧），但就是不含完整名单
+    // （2026-11-14 20:43 实见：6 条全过筛，她仍只报出前三）。数量不能当完整性
+    // 信号，所以这里不做条数门槛；URL 去重挡住重复条目，预算封顶防挂死。
+    if (!site && /(名单|榜单|排行|排名|top\s*\d)/i.test(body) && budget() > 800) {
       await ask('tavily', body + ' 完整名单', true);
     }
   }
