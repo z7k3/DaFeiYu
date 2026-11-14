@@ -77,6 +77,7 @@ function relevanceScore(query, item) {
   const tokens = queryTokens(query);
   if (!tokens.length) return 1;
   const hits = tokens.filter(t => hay.includes(t) || (ALIASES[t] || []).some(a => hay.includes(a)));
+    const coverage = tokens.length ? hits / tokens.length : 1;
   if (!hits.length) return 0;
   // 有明确英文实体时，不能只靠“价格/更新”等泛词留下另一种产品。
   const entities = tokens.filter(t => /^[a-z]/.test(t) && !['pro', 'max', 'plus', 'mini', 'air'].includes(t));
@@ -96,18 +97,37 @@ function relevanceScore(query, item) {
 
 function keepRelevant(query, results) {
   const tokens = queryTokens(query);
+  const qYears = String(query).match(/(?<!\d)20\d{2}(?!\d)/g) || [];
   const scored = results.map((item, index) => {
     const hay = ((item.title || '') + ' ' + (item.snippet || '')).toLowerCase();
+    const raw = relevanceScore(query, item);
+    const trusted = item.provider === 'tavily';
+    if (trusted) {
+      // 硬规则对 tavily 也生效：年份错位/型号冲突的资料直接出局。
+      const hayYears = hay.match(/(?<!\d)20\d{2}(?!\d)/g) || [];
+      if (qYears.length && hayYears.length && !qYears.some(y => hayYears.includes(y))) {
+        return { item, index, score: 0, trusted: true, coverage: 0 };
+      }
+      const models = modelNames(query);
+      const found = modelNames(hay);
+      if (models.length && !models.every(x => found.includes(x))) {
+        return { item, index, score: 0, trusted: true, coverage: 0 };
+      }
+      // 跨语言最佳证据：中文 bigram 分母压分没关系——结构化源自身带语义评分，
+      // 给保底分并排在抓取碎片之前（实见 CS2 top20：tavily 6 条只活 1 条）。
+      return { item, index, score: Math.max(raw, 1) + 10, trusted: true, coverage: 1 };
+    }
     const hits = tokens.filter(t => hay.includes(t) || (ALIASES[t] || []).some(a => hay.includes(a))).length;
-    return { item, index, score: relevanceScore(query, item), coverage: tokens.length ? hits / tokens.length : 1 };
+    const coverage = tokens.length ? hits / tokens.length : 1;
+    return { item, index, score: raw, coverage, trusted: false };
   });
-  const best = scored.reduce((m, x) => Math.max(m, x.coverage), 0);
-  // 覆盖率相对阈值：池子里有高覆盖答案时，只擦到一两个泛词的搭便车条目不该混进资料
-  // （它们正是「证据有了但全是无关站」的来源）。但阈值永远不超过池内最佳值——
-  // 池子整体都弱时保留弱证据（原神官网只命中 2/3 也比 no_results 强），宁可让
-  // persona 层说明证据不足，也不能把「查到了」变成「没查到」。
+  const plain = scored.filter(x => !x.trusted);
+  const best = plain.reduce((m, x) => Math.max(m, x.coverage), 0);
+  // 覆盖率相对阈值只作用于抓取源：池子里有高覆盖答案时，只擦到一两个泛词的
+  // 搭便车条目不该混进资料。但阈值永远不超过池内最佳值——池子整体都弱时
+  // 保留弱证据，宁可让 persona 说明证据不足，也不能把「查到了」变成「没查到」。
   const bar = best > 0 ? Math.min(Math.max(0.34, best * 0.6), best) : 0;
-  return scored.filter(x => x.score > 0 && x.coverage >= bar)
+  return scored.filter(x => x.score > 0 && (x.trusted || x.coverage >= bar))
     .sort((a, b) => b.score - a.score || a.index - b.index).map(x => x.item);
 }
 
