@@ -66,7 +66,16 @@ async function searchResult(query, opts = {}) {
   // 没有 bing/360 的反爬垃圾问题；拿到 ≥2 条有效结果就直接跳过本地引擎——
   // 省时间，也避免无谓地去碰会间歇性返回广告页的 cn.bing.com/so.com。
   const tavilyOn = Boolean(String(opts.tavilyApiKey || '').trim()) && !site;
-  if (tavilyOn) await ask('tavily', body, true);
+  if (tavilyOn) {
+    await ask('tavily', body, true);
+    // 名单/榜单类查询补一轮「完整名单」变体：单轮结果常是颁奖/前三的新闻页，
+    // 完整名单在汇总页或后续报道里（实见 HLTV top20：单轮只有前三的报道，
+    // 20 人名单的汇总页要换关键词才搜得到）。URL 去重挡住重复条目。
+    if (!site && /(名单|榜单|排行|排名|top\s*\d)/i.test(body)
+        && valid().length < 5 && budget() > 800) {
+      await ask('tavily', body + ' 完整名单', true);
+    }
+  }
   // 首轮双源并行：cn.bing.com 和 so.com 都会对无 Cookie 的程序化抓取间歇性返回
   // 广告/默认页（2026-11-14 实测：搜「孤勇者歌词」bing 给出战网/企业微信/金蝶官网，
   // 搜「小米su7」给出帝国时代秘籍页；同一查询换次请求又正常）。串行单源一旦中招，
