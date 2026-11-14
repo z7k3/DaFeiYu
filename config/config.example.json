@@ -80,7 +80,8 @@
     "silentMinutes": 10,
     "maxRepliesPerMinute": 15,
     "muteDefaultMinutes": 30,
-    "addressShadow": false
+    "addressShadow": false,
+    "splitWaitSec": 8
   },
   "memory": {
     "_说明": "记忆规模：最多记几个会话、每个会话多少条消息、每人多少条笔记。dialogueBudget=对话预算（不含 system prompt），默认 5500 = 记忆 900 + 摘要 900 + 原文 3200 + 预留 500，可在启动器「高级模式 → 高级」里调；maxSessions 等旧键运行时已忽略",
@@ -110,7 +111,7 @@
     "allowOthers": false
   },
   "wechat": {
-    "_说明": "微信桥接（examples/wechatauto_bridge.py）的参数。桥接是独立进程，backgroundSend=不抢前台直接发送（默认 true，实测微信最小化/被遮挡也能发，电脑可照常用；设 false 则每次先把微信拉到前台）。改完这里要在启动器「微信桥接」页点「重启桥接」才生效。account=固定用哪个微信号（微信双开/多账号时一定要选，填账号目录名 / wxid / 昵称都行；留空=自动选「最近活跃」，可能选到另一个号）——一般不用手填，在启动器「微信桥接」页点一下账号卡就行；accountGuard=认不出哪个窗口是所选账号时宁可不发（默认 true）；windowHwnd=手动钉微信主窗句柄（调试用，0=自动）；staleAfterSec=多久没新消息就当她去忙了（3.9 起没有游戏休息/离开回来/排队补发的开关了）；ignoreSenders=这些会话永不回复；quoteReply=是否引用原消息回复；dbDir=微信文件保存位置（留空会自动找：先看正在运行的微信打开了哪些文件，再扫各个盘根目录；找不到时把微信「设置→文件管理」里的路径填这里）；bgSend=零焦点发送通道（默认开：用窗口消息打字+点按钮，全程不抢前台；失败才退回前面的通道）；pipelineWorkers=同时处理几个会话（默认 4；同一会话永远串行，改 1 = 全部串行）；pipelineQueueLimit=单个会话最多积压几条（超出丢最早的）",
+    "_说明": "微信桥接（examples/wechatauto_bridge.py）的参数。桥接是独立进程，backgroundSend=不抢前台直接发送（默认 true，实测微信最小化/被遮挡也能发，电脑可照常用；设 false 则每次先把微信拉到前台）。splitWaitSec=断句等待秒数：对方消息像「半句话」时先等这么多秒看有没有下半句（0~3 可让短问句秒回，但连发的两截会被分开回答）。改完这里要在启动器「微信桥接」页点「重启桥接」才生效。account=固定用哪个微信号（微信双开/多账号时一定要选，填账号目录名 / wxid / 昵称都行；留空=自动选「最近活跃」，可能选到另一个号）——一般不用手填，在启动器「微信桥接」页点一下账号卡就行；accountGuard=认不出哪个窗口是所选账号时宁可不发（默认 true）；windowHwnd=手动钉微信主窗句柄（调试用，0=自动）；staleAfterSec=多久没新消息就当她去忙了（3.9 起没有游戏休息/离开回来/排队补发的开关了）；ignoreSenders=这些会话永不回复；quoteReply=是否引用原消息回复；dbDir=微信文件保存位置（留空会自动找：先看正在运行的微信打开了哪些文件，再扫各个盘根目录；找不到时把微信「设置→文件管理」里的路径填这里）；bgSend=零焦点发送通道（默认开：用窗口消息打字+点按钮，全程不抢前台；失败才退回前面的通道）；pipelineWorkers=同时处理几个会话（默认 4；同一会话永远串行，改 1 = 全部串行）；pipelineQueueLimit=单个会话最多积压几条（超出丢最早的）",
     "dbDir": "",
     "account": "",
     "accountGuard": true,

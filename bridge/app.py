@@ -325,7 +325,14 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
             return 2
         G.log('开始监听新消息…（Ctrl+C 退出）')
         self.pipeline = G.MessagePipeline(workers=G.PIPELINE_WORKERS, per_chat_limit=G.PIPELINE_QUEUE_LIMIT, log=G.log)
+        # 断句等待秒数可配置（wechat.splitWaitSec，默认 8）：主人消息习惯一条条
+        # 短句发时，这个等待是每轮回复的最大固定延迟。
+        try:
+            _split_wait = float((G.read_config().get('wechat') or {}).get('splitWaitSec') or 8.0)
+        except Exception:
+            _split_wait = 8.0
         self.batches = G.MessageBatches(limit=max(4, G.PIPELINE_QUEUE_LIMIT * 2), log=G.log,
+                                        incomplete_wait=max(0.0, _split_wait),
                                         flush_due=self.submit_flush)
         G.log('消息调度：%d 个 worker（同一会话串行、跨会话并发，连发的几条合并成一次）' % G.PIPELINE_WORKERS)
         G.threading.Thread(target=self.sticker_test_loop, daemon=True).start()
