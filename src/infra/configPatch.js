@@ -34,6 +34,7 @@ const SECRET_PATHS = new Set([
   'deepseek.apiKey',
   'vision.apiKey',
   'voice.apiKey',
+  'websearch.tavilyApiKey',
   'gateway.wechat.inboundToken',
   'admin.spell',
 ]);

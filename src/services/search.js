@@ -192,6 +192,7 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
     if (!active()) throw searchError(controller.signal.aborted ? 'aborted' : 'deadline_exceeded');
     if (policy.DOMAINS[intent.site]) q = q.replace(/\bsite:[a-z0-9.-]+/gi, '').trim() + ' site:' + policy.DOMAINS[intent.site];
     const value = await call('web', () => providers.searchResult(q, { ...options(), limit: 4,
+      tavilyApiKey: config.tavilyApiKey, tavilyBaseUrl: config.tavilyBaseUrl, tavilyMaxResults: config.tavilyMaxResults,
       maxAgeDays: effectiveMaxAgeDays(`${text} ${q}`, intent.fresh, intent.timeRange) }));
     // deadline 先到时 race 会整体 reject——已经拿到的结果不能跟着丢，先留在这里。
     if (value && value.items && value.items.length) partial = value;

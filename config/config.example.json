@@ -156,6 +156,10 @@
   "websearch": {
     "_说明": "问天气/新闻等实时问题时联网现搜。city 填你所在的城市（比如「上海」），问她天气时才准；留空就按她收到的原话搜（可能搜到别的城市）。enabled=false 关闭所有联网",
     "enabled": true,
+    "tavilyApiKey": "",
+    "tavilyBaseUrl": "https://tavily.sharyuke.com",
+    "tavilyMaxResults": 6,
+    "_tavily说明": "Tavily 兼容搜索源：填了 Key 就作为首选检索源（结构化结果+全文+真实发布时间，无反爬问题），bing/360 退为兜底。支持官方 api.tavily.com 的 tvly- Key，或 tavily.sharyuke.com 这类 Hub 网关的 Key。留空=不启用",
     "city": "",
     "timeoutMs": 8000
   },

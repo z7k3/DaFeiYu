@@ -3,6 +3,7 @@
 const bing = require('./bing');
 const so360 = require('./so360');
 const baike = require('./baike');
+const tavily = require('./tavily');
 const { remaining, report, errorInfo } = require('./transport');
 const quality = require('../../core/search/quality');
 const { result } = require('../../core/search/result');
@@ -28,7 +29,8 @@ async function searchResult(query, opts = {}) {
     // 首源最多占大部分预算，给备用源留出机会；极短预算不再切成无意义的小请求。
     const timeoutMs = reserve && left > 100 ? Math.floor(left * 0.65) : left;
     try {
-      const parsed = await ({ bing, so360, baike }[provider]).search(term, { ...opts, deadline, timeoutMs });
+      const source = provider === 'tavily' ? tavily : { bing, so360, baike }[provider];
+    const parsed = await source.search(term, { ...opts, deadline, timeoutMs });
       const scoped = site ? parsed.filter(item => {
         const host = new URL(item.url).hostname.toLowerCase();
         return host === site.toLowerCase() || host.endsWith('.' + site.toLowerCase());
@@ -56,11 +58,19 @@ async function searchResult(query, opts = {}) {
   // 收录差且易被相关性过滤器整页拒掉；词条不存在时 baike 返回空数组，不影响
   // 后面的 bing/360 主检索。限定 site: 的查询跳过（站点过滤会把百科结果全滤掉）。
   if (!site && baike.MEME_RE.test(body)) await ask('baike', body, true);
+  // Tavily 首选源：配置了 Key 才排班。结构化 JSON + 全文 + 真实发布时间，
+  // 没有 bing/360 的反爬垃圾问题；拿到 ≥2 条有效结果就直接跳过本地引擎——
+  // 省时间，也避免无谓地去碰会间歇性返回广告页的 cn.bing.com/so.com。
+  const tavilyOn = Boolean(String(opts.tavilyApiKey || '').trim()) && !site;
+  if (tavilyOn) await ask('tavily', body, true);
   // 首轮双源并行：cn.bing.com 和 so.com 都会对无 Cookie 的程序化抓取间歇性返回
   // 广告/默认页（2026-11-14 实测：搜「孤勇者歌词」bing 给出战网/企业微信/金蝶官网，
   // 搜「小米su7」给出帝国时代秘籍页；同一查询换次请求又正常）。串行单源一旦中招，
   // 整轮只剩备用词苦撑；并行合并让两家互为冗余，垃圾由相关性过滤负责淘汰。
-  await Promise.all([ask('bing', q, true), ask('so360', q, true)]);
+  // Tavily 已给足（≥2 条有效）时跳过本轮——省时间，也少暴露一次抓取指纹。
+  if (!(tavilyOn && valid().length >= 2)) {
+    await Promise.all([ask('bing', q, true), ask('so360', q, true)]);
+  }
   const named = quality.modelNames(body).length || /\b(?:macbook|ipad|watch|airpods)\b/i.test(body);
   if (!site && !named && /(苹果|iphone|mac)/i.test(body) && /(最新|机器|机型|型号|出到|几代|发布)/.test(body)) {
     const product = /(电脑|笔记本|mac)/i.test(body) ? 'Mac 机型' : /手机|iphone/i.test(body) ? 'iPhone 机型' : '苹果 产品';
@@ -75,7 +85,7 @@ async function searchResult(query, opts = {}) {
       if (valid().length >= 2) break;
     }
   }
-  if (valid().length < 2) await ask('so360', q);   // 首轮已并行问过；这里只在仍不足时再试一次（URL 去重挡住重复条目）
+  if (valid().length < 2 && !(tavilyOn && valid().length >= 1)) await ask('so360', q);   // 首轮已并行问过；这里只在仍不足时再试一次（URL 去重挡住重复条目）
   // 通用兜底：bing/360 都没给够时，专名类查询往往在百度百科有词条（人物/作品/地名/产品/梗）。
   // baike.search 自带清洗（去问句骨架），词条不存在返回空数组，不产生噪音。
   // 只有「一条都没捞到」才补查百度百科：有 1 条已可用时不再多打一次外网请求
