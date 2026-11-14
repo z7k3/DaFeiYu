@@ -337,6 +337,11 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
         G.log('消息调度：%d 个 worker（同一会话串行、跨会话并发，连发的几条合并成一次）' % G.PIPELINE_WORKERS)
         G.threading.Thread(target=self.sticker_test_loop, daemon=True).start()
         G.threading.Thread(target=self.voice_test_loop, daemon=True, name='voice-send-test').start()
+        # 启动自愈：收拾上次被强杀遗留的屏幕外窗口与微信置顶（见 bg_sender.self_heal_windows）
+        try:
+            G.bg_sender.self_heal_windows(G.log)
+        except Exception:
+            pass
         self.listener = Listener(self.db, interval=0.4)
         self.listener.add_all(self.on_message)
         self.listener.start()

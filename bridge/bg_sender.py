@@ -2056,6 +2056,56 @@ def probe(hwnd=0, log=print, with_send=None, unhide=True):
     return result
 
 
+def self_heal_windows(log=None):
+    """启动自愈：收拾上次进程被强杀留下的窗口副作用。
+
+    atexit 只在正常退出时跑；桥接被强杀/崩溃时，park_window 挪到屏幕外的窗口
+    与 bring_to_front 设置的置顶都会残留（2026-11-14 实见：鲸鲸微信置顶压住
+    主人微信、资源管理器等窗口被停靠后回不来）。桥接以管理员运行，启动时
+    有权限收拾；只动两类确凿的遗留：
+    1. 整窗停在停靠坐标（x/y ≤ -20000）且宽度 ≥100 的可见窗口 → 拉回屏幕内；
+    2. 微信主窗（mmui::）残留的 TOPMOST → 摘除（用户自己置顶的聊天窗是
+       独立的聊天窗类名，不受影响）。
+    """
+    moved = cleared = 0
+    try:
+        import win32gui
+        import win32con
+        def _cb(h, _l):
+            nonlocal moved, cleared
+            if not win32gui.IsWindowVisible(h):
+                return True
+            try:
+                l, t, r, b = win32gui.GetWindowRect(h)
+            except Exception:
+                return True
+            if l <= -20000 and t <= -20000 and (r - l) >= 100:
+                n = moved
+                try:
+                    win32gui.SetWindowPos(h, 0, 140 + (n % 8) * 70, 120 + (n % 8) * 50, 0, 0,
+                                          win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+                    moved += 1
+                except Exception:
+                    pass
+                return True
+            try:
+                cls = win32gui.GetClassName(h)
+            except Exception:
+                return True
+            if cls.startswith('mmui::') and (win32gui.GetWindowLong(h, -20) & 0x8):
+                try:
+                    win32gui.SetWindowPos(h, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                                          win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+                    cleared += 1
+                except Exception:
+                    pass
+            return True
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        return
+    if log and (moved or cleared):
+        log('窗口自愈：拉回屏幕外遗留 %d 个，摘除微信主窗置顶 %d 个' % (moved, cleared))
+
 def shutdown():
     """进程退出时还原 `SPI_SETSCREENREADER`，并把挪到屏幕外的微信窗口放回去。"""
     _ScreenReader.restore()
