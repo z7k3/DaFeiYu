@@ -17,7 +17,7 @@ const links = require('../adapters/links');
 const ORIGINAL_TEXT_RE = /(歌词|副歌|台词|原文|全文|诗文|攻略|步骤|教程|说明书|玩法|怎么玩|怎么弄|怎么做|名单|榜单|排行|排名|top\s*\d+)/i;
 
 /** 单轮搜索的唯一入口；只返回证据，不读写会话存储或决定聊天回复。 */
-async function search({ text = '', history = [], llm, config = {}, now = new Date(), timeZone = '', signal, trace } = {}, deps = {}) {
+async function search({ text = '', history = [], llm, config = {}, now = new Date(), timeZone = '', signal, trace, force = false } = {}, deps = {}) {
   const providers = deps.providers || web;
   // 抓正文默认走真实 links 适配器；测试注入 deps.describeLink 以免出网。
   const describeLink = deps.describeLink || links.describeLink;
@@ -70,8 +70,8 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
   };
   const run = async () => {
     const gate = policy.gate(text, config.semanticRoute);
-    let route = { failed: true, need: false };
-    if (gate.route && active()) {
+    let route = force ? { failed: false, need: true, query: text } : { failed: true, need: false };
+    if (!force && gate.route && active()) {
       const routeStarted = Date.now();
       try {
         route = await routeSearch(llm, text, { ...options(), now, timeZone,

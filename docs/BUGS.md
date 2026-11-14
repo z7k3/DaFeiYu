@@ -5,6 +5,24 @@
 
 | # | 现象 | 根因 | 修复 | 版本 | 回归测试 |
 | --- | --- | --- | --- | --- | --- |
+| 102 | 主动搭话状态或账号缓存写入失败损坏旧件，固定临时名可能冲突 | 直接打开目标写入或复用同一临时文件 | 使用同目录唯一临时文件并原子替换，失败保留旧件且只清理本次临时文件；保留调用方 best-effort 与独占标记协议 | 4.1.3 | `tests/test_refactor_t13_atomic_json.py` |
+| 101 | 桥接日志节流键长期增长，并发首错与折叠计数不一致 | 多套无界字典使用不同时间窗口 | 共享容量、TTL 和并发抑制，保留首错、折叠计数及旧入口 None 返回 | 4.1.3 | `tests/test_refactor_t13_runtime.py` |
+| 100 | 缺省 token 或坏配置触发误重启，热改线程池参数后记录与实际不符 | 启动、重载和监视器各自读取并使用不同默认值 | 共用有效配置快照，坏 JSON 保留旧值并允许同 mtime 重读；需重启参数在安全重启前保留实际运行值 | 4.1.3 | `tests/test_refactor_t13_runtime.py` |
+| 99 | 提醒丢群 @、空目标仍发送，HTTP 或业务失败混同无任务及成功回执 | 生产提醒接线与受测工厂重复，工厂不匹配实际 get/post 客户端 | 真实装配委托统一适配器并校验目标和响应，保留插件授权、语音取消及关闭生命周期；未知结果不自动重试 | 4.1.3 | `tests/test_engine_reminder_wiring.py`、`tests/test_reminder_watch.py`、`tests/bridge-reminder-wiring.test.js` |
+| 98 | Python 同名测试被覆盖，桥接配置与目录回归在 CI 有可用解释器时仍被跳过 | 重复方法名只收集最后一个用例，测试只检查固定便携解释器路径 | 审计同名声明并保留两份原测试体，验证实际可用解释器；桥接回归使用隔离副本并禁止真实进程、磁盘和用户配置探测 | 4.1.3 | `tests/refactor-t23-python-audit.test.js`、`tests/refactor-t23-python-entry.test.js`、`tests/bridge-globals.test.js`、`tests/db-dir.test.js` |
+| 97 | 隐私扫描未读取文件或目录时仍可能报告干净 | 扫描计数与读取成功脱钩，读取异常未作为不完整结果传播 | 区分已读、主动排除和读取错误，严格 API 与命令行拒绝不完整结果；发布自检调用者的严格结果接线另行完成 | 4.1.3 | `tests/refactor-t23-privacy-scan.test.js`、`tests/privacy-scan.test.js` |
+| 96 | 本地与 CI 任务不一致，早先失败被后续成功覆盖，C# 静态文本被误记为执行证据 | 测试入口与退出码分别维护，库存未严格区分编译入口、调用声明和实际执行 | 共用有序任务清单并保留每个失败，校验嵌套项目的真实选中入口；静态声明明确不代表 case 已执行 | 4.1.3 | `tests/refactor-t23-test-tasks.test.js`、`tests/refactor-t23-inventory.test.js`、`tests/ci-test-order.test.js` |
+| 95 | 保存部分朋友圈设置时覆盖未提交字段，在线请求可能被严格校验拒绝，离线保存可能启动定位探测 | 调用者使用默认值或显式 undefined 补齐缺省字段，离线命令复用了在线副作用入口 | 在线与离线只保存本次提交字段，保留现有设置与显式零值；在线开启仍需确认并绑定实时账号，离线保存不启动定位探测 | 4.1.3 | `tests/refactor-t03-config-values.test.js`、`tests/refactor-t03-moments-caller.test.js`、`tests/launcher-offline-config.test.js` |
+| 94 | 合法开关写法被错存为关闭，空白数值变成零，留空密钥或嵌套功能更新覆盖原值 | 配置校验、两种补丁写入及离线命令使用不同转换和合并规则 | 共用严格布尔与数值解析，非法值整批拒绝，保留显式零值和留空密钥；按注册路径合并功能开关并拒绝非对象根及原型路径 | 4.1.3 | `tests/refactor-t03-config-values.test.js`、`tests/config-schema.test.js`、`tests/config-flag-compat.test.js` |
+| 93 | 记忆恢复复制归档失败后仍可能删除原数据，写入或交换中断可能留下部分恢复 | 归档复制异常被吞，恢复直接改写原目录；启动未先处理未完成事务 | 先完整准备并校验新树，再保留原副本执行交换；失败回滚，中断后在配置读取与 Store 构造前恢复，无法安全恢复时中止启动 | 4.1.3 | `tests/refactor-t08-restore.test.js`、`tests/refactor-t08-startup-recovery.test.js`、`tests/memory-backup.test.js` |
+| 92 | 停用消息插件后保存设置会重新生成启用授权 | 设置保存与初次启用共用写授权路径，未核对当前启用状态与源码哈希 | 保存仅修改配置；已有有效授权时才同步设置，首次启用和完整系统权限须单独确认；更新保留数据但撤回旧授权 | 4.1.2 | `tests/plugin-market/Program.cs`、`tests/javascript-plugins.test.js` |
+| 91 | 后台发送的多个失败状态都显示“草稿或正文校验失败”，无法判断是否已尝试发送 | 发送前已有草稿、输入中断和点击发送后残留被合并成一条提示 | 分别显示处理阶段并记录稳定原因码，保持草稿保护和禁止盲目重发 | 4.1.1 | `tests/test_bg_live_encoding.py` |
+| 90 | 文字发送失败后表情包仍占队列，后续请求一直在途直到超时 | 桥接只在日志中说已取消，没有结束服务端 reserved 任务 | 带桥接 token、代次和精确会话取消尚未领取的预留任务，取消幂等，sending 任务不受影响；语音替代回复也释放未用表情包 | 4.1.1 | `tests/test_reply_sticker_cancel.py`、`tests/sticker-service.test.js` |
+| 89 | 群聊能收到消息却提示只有内部 ID，无法发送；空别名一直不恢复 | 群名查询忽略本地备注，错误使用最后发言者作为群名，空别名查询被永久缓存 | 读取精确群联系人的备注并保留群名兼容查询，不再使用成员身份代替群身份，空查询允许重试 | 4.1.1 | `tests/test_group_send_resolution.py` |
+| 88 | 文字能发，表情包却报窗口绑定错误；未确认发送后即使输入框清空也一直被隔离 | 随包 UIA 构造器只设置公开 hwnd，发送和恢复护栏却只读取私有 _pinned_hwnd；测试伪造了私有字段而遗漏真实驱动形态 | 统一兼容公开及旧私有绑定，有冲突或公开字段未绑定仍拒绝；保留实时账号、根窗口、会话和草稿核验，不自动重发旧任务 | 4.1.1 | `tests/test_sticker_transport.py` |
+| 87 | 旧配置缺字段时，新消息因数据库延迟约 13 秒而被全部跳过 | 桥接过期阈值默认为 4 秒，与内核和模板的 120 秒不一致 | 启动和热加载缺省值统一为 120 秒，保留显式阈值，旧历史仍跳过 | 4.1.1 | `tests/test_bridge_startup_ready.py` |
+| 86 | 内核和桥接已在后台运行，启动器仍显示未启动，点击启动时端口冲突 | 状态探测只识别本启动器创建的子进程 | 通过本地健康接口识别现有内核并读取微信状态，启动前检查端口上的实例 | 4.1.1 | `tests/launcher/Checks` |
+| 85 | 桥接意外退出，崩溃栈位于 Python 线程转储逻辑 | `faulthandler` 定时转储并发遍历其他线程，遇到已释放的帧会触发原生异常 | 移除定时转储，故障只记录当前线程，实际超时时由 Python 线程同步记录诊断 | 4.1.1 | `tests/bridge-crash.test.js` |
 | 84 | 多开时消息偶尔从另一个号发出去；UIA 已选中窗口却一直“树是空壳”；网关有时重复发气泡 | 账号目录用前缀匹配、自动选号跳过 `windowHwnd` 归属校验、`pick_account_window` 无锁；UIA 读写用了两个不同的 kernel32 句柄；`sendBubbles` 第一条带完整 `bubbles` 后又逐条重发 | 账号只认全等或哈希后相等，`windowHwnd` 必须有数据库归属证据，择窗加 `account_lock`，未确认账号不再按标题兜底；UIA 统一 kernel32 + HANDLE 并记录读写失败；网关每条请求只带当前气泡，补 `accountWxid`；faulthandler 不重复 dump | 4.1.0 | `tests/bridge-adaptive-encoding.test.js`、`tests/wechat-account.test.js`、`tests/core-modules.test.js` |
 | 83 | 被静音后仍会续接话窗口；系统通知在磁盘里留下空会话；群聊长历史被二次裁剪后凭空消失；`maxMessages` 配置不生效 | 静音副作用写在闸门之前；`checkpoint` 对未知 key 也 `ensureChat`；context 二次裁剪只删 entries 不重建 summary；`pruneRaw` 固定用常量 | 静音消息在 trigger 直接返回，不写状态；`checkpoint` 只处理已存在会话；二次裁剪循环重算摘要；`maxMessages` 接入 `ChatStore.pruneRaw`，`archiveCount` 真统计 | 4.1.0 | `tests/core-modules.test.js`、`tests/memory-budget-plan.test.js`、`tests/context.test.js` |
 | 82 | 朋友圈卡在相机菜单、选图窗口或绿色发表按钮前 | 菜单小字漏识别，文件控件类型/层级与固定假设不符，自绘按钮 Invoke 可返回成功但无实际动作；原生 UIA 失败会影响整个桥接 | 独立子进程执行、内存 OCR、原生控件绑定 UIA、文案/预览核验后单次真实点击；未知结果不重发，保留额度和去重游标；补齐手动发表与三类配图 | 4.1.0 | `tests/test_moments_publish.py`、`tests/test_moments_worker.py`、`tests/test_moments_ocr.py`、`tests/moments.test.js` |
@@ -96,4 +114,11 @@
 2. **定位到最底层**：现象 → 直接原因 → 根因（哪个判断/哪行代码/哪个环境假设）。
 3. **一处修复**：同类判断只保留一份实现（主人判定、mime 判定、ffmpeg 查找都是这么收的）。
 4. **补回归测试**：`tests/` 里要有能在修复前失败、修复后通过的用例。
+   台账这一列只写 CI 真的会执行的入口，自检会拿 `.github/workflows/` 反查，写错就红：
+   - JS：`tests/xxx.test.js`（`npm test` 只跑 `tests/` 浅一层，别放子目录）
+   - Python：`tests/test_xxx.py`（`unittest discover -s tests -p 'test_*.py'`）
+   - C#：`tests/voice-send/VoiceSendChecks.csproj` 这类**项目文件**，或直接写它所在目录
+     （如 `tests/launcher/Checks`，自检会归约到目录里 CI 执行的 csproj）
+   - 出包类：写 `scripts/release-check.js` 这类真的在 CI 里跑的自检脚本；一个 bug 一行，
+     别写「启动器构建」这种没法验证的说法
 5. **写进这里**：一行一个问题，别让下一个人重踩。

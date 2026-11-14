@@ -11,6 +11,7 @@
  */
 
 const { getByPath } = require('./objpath');
+const { parseBoolean } = require('./configValues');
 
 const REGISTRY = [
   {
@@ -20,6 +21,12 @@ const REGISTRY = [
     desc: '默认关闭。开启后可按傲娇、炸毛、其他三类上传表情包；关闭立即取消未发送任务，不挑图、不带回包字段、不轮询，管理接口停用。实验发送只在已打开的目标微信会话前台校验通过时进行，不自动切会话。',
     default: false,
     experimental: true,
+  },
+  {
+    key: 'javascriptPlugins', path: 'features.javascriptPlugins',
+    label: 'JavaScript 插件（实验性，完整系统权限）',
+    desc: '默认关闭。开启后仍须逐个确认插件权限。JavaScript 可访问网络、文件、系统命令及全部主程序 API，只启用信任的作者。关闭会停止受管理的插件进程并取消尚未执行的插件发送任务。',
+    default: false, experimental: true,
   },
   {
     key: 'envContext',
@@ -130,9 +137,9 @@ function toBool(value, fallback = false) {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'number') return value !== 0;
   const s = String(value).trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on', '开'].includes(s)) return true;
-  if (['0', 'false', 'no', 'off', '关', ''].includes(s)) return false;
-  return fallback;
+  if (!s) return false;
+  const parsed = parseBoolean(s);
+  return parsed === undefined ? fallback : parsed;
 }
 
 function isOn(config, key) {

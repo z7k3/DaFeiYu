@@ -15,6 +15,7 @@ const configSchema = require('./infra/configSchema');
 const { describeError } = require('./infra/errors');
 const { Store } = require('./memory/store');
 const memoryBackup = require('./memory/backup');
+const { recoverRestore } = require('./memory/backupRestore');
 const mediaCache = require('./adapters/mediaCache');
 const { DeepSeekClient } = require('./llm/client');
 const { Bot } = require('./pipeline/chat');
@@ -33,11 +34,14 @@ const { ReminderService } = require('./services/reminderService');
 const { DiaryService } = require('./services/diary');
 const { DigestService } = require('./services/digest');
 const locationProbe = require('./services/location');
+const { PluginHost } = require('./services/pluginHost');
 
 const VERSION = require('../package.json').version;
 
 function createRuntime({ root = path.resolve(__dirname, '..'), env = process.env, loggerLevel } = {}) {
   const probeT0 = probe.now();   // 探针：createRuntime 整体耗时（listen 之前的关键路径）
+  // 恢复中断事务必须早于配置读取和 Store 建目录；失败沿用构造失败语义，不能带着替代空树继续启动。
+  recoverRestore(path.join(root, 'data'));
   ensureConfigFile(root);
   const config = loadConfig({ root, env });
   // 称呼只认一个真源：config.json 的 persona.ownerName。
@@ -228,6 +232,11 @@ function createRuntime({ root = path.resolve(__dirname, '..'), env = process.env
     logger.warn('记忆启动恢复失败（不影响聊天）：' + describeError(err));
   }
   runtime.gateways = createGateways({ config, bot: runtime.bot, logger: child('gateway') });
+  runtime.pluginHost = new PluginHost(runtime);
+  runtime.bot.javascriptPlugins.hostCall = (...args) => runtime.pluginHost.call(...args);
+  const pluginAllowed = item => runtime.bot.javascriptPlugins.isApproved(item.pluginId, item.pluginHash);
+  runtime.reminders.pluginAllowed = pluginAllowed;
+  runtime.stickerService.pluginAllowed = pluginAllowed;
   watchConfigFile(runtime);
   // 探针：createRuntime 结束 = server.js 可以 listen 的时刻，这条就是「启动被堵了多久」
   probe.emit(logger, 'info', `createRuntime 耗时=${probe.ms(probe.now() - probeT0)}ms（listen 之前）`);

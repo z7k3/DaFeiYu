@@ -688,6 +688,10 @@ class ReceiverMixin:
                     # 现在只有 uncertain 需要拿微信数据库里的新语音消息当证据；
                     # 其它 True（含 worker 没给状态的极端情况）沿用原契约，直接算已处理。
                     if voice_status != 'uncertain' or self.voice_message_landed(username, voice_started):
+                        # 4.1.1：语音已处理整条回复 → 立即取消同代次尚未领取的预留表情包，
+                        # 释放后续请求（已领取任务保持原状态，不误报取消或重复发送）。
+                        if isinstance(data.get('sticker'), dict):
+                            self.cancel_reply_sticker(data['sticker'], username)
                         G.log('[delivery] stage=voice result=handled textFallback=false stickerFallback=false '
                               'reason=voice_confirmed status=%s' % (voice_status or '-'))
                         return
@@ -702,6 +706,7 @@ class ReceiverMixin:
                         pass
                 else:
                     G.log('[voice] stage=delivery result=text_fallback reason=prepare_or_synthesis_failed')
+
             for line in bubbles:
                 if not line:
                     continue
@@ -722,6 +727,8 @@ class ReceiverMixin:
                                     and data.get('commandType') != 'admin_spell'
                                     and self.is_latest_message(username, msg))
                 if not self.send_text(line, target, username, quote_latest=quote_latest):
+                    if isinstance(data.get('sticker'), dict):
+                        self.cancel_reply_sticker(data['sticker'], username)
                     G.log('[delivery] stage=text result=failed reason=send_failed remainingBubbles=cancelled stickers=cancelled')
                     return
                 first = False

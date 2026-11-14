@@ -12,6 +12,9 @@ on:
       - 'website/**'
       - '.github/workflows/pages.yml'
       - 'scripts/render-website-releases.js'
+      - 'scripts/build-website.js'
+      - 'scripts/fetch-website-data.js'
+      - 'scripts/wait-pages-artifact.js'
   release:
     types: [published, edited, unpublished, deleted]
   schedule:
@@ -39,6 +42,14 @@ jobs:
 
   deploy:
     if: github.event_name != 'release' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
+    env:
+      # 重跑使用独立名称，避免同一次 run 的旧产物参与本次部署。
+      PAGES_ARTIFACT_NAME: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
     concurrency:
       group: pages
       cancel-in-progress: false
@@ -53,20 +64,30 @@ jobs:
         with:
           node-version: 24
 
-      - name: 从正式 Release 生成官网版本区
+      - name: 获取完整发行历史与插件目录快照
         run: |
-          gh api "repos/$GH_REPO/releases/latest" > "$RUNNER_TEMP/latest-release.json"
-          gh api "repos/$GH_REPO/releases?per_page=20" > "$RUNNER_TEMP/recent-releases.json"
-          node scripts/render-website-releases.js "$RUNNER_TEMP/latest-release.json" "$RUNNER_TEMP/recent-releases.json" "$RUNNER_TEMP/site"
+          node scripts/fetch-website-data.js "$RUNNER_TEMP/website-data.json"
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+
+      - name: 校验并生成官网所有页面
+        run: |
+          node tests/website-hub.test.js
+          node scripts/build-website.js "$RUNNER_TEMP/website-data.json" "$RUNNER_TEMP/site"
 
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
         with:
+          name: ${{ env.PAGES_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/site
+
+      - name: 等待 Pages 产物可见
+        run: node scripts/wait-pages-artifact.js
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          artifact_name: ${{ env.PAGES_ARTIFACT_NAME }}
