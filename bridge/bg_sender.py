@@ -1245,6 +1245,17 @@ def park_window(hwnd, log=None):
             return False
         import win32gui
         import win32con
+        # 防呆：只停靠确认属于微信主窗类名的窗口。窗口句柄会被系统回收后
+        # 重分配给别的应用——错停用户的窗口不仅挡人，进程重启后还会变成
+        # 没人认领的孤儿（2026-11-14 桌面审计发现 5 个无关应用窗口停在
+        # 停靠坐标的疑似来源）。类名不对就跳过停靠，静默发送照常。
+        try:
+            if win32gui.GetClassName(hwnd) != 'mmui::MainWindow':
+                if log:
+                    log('后台通道：目标窗口类名不是微信主窗，跳过屏幕外停靠（防错停）')
+                return False
+        except Exception:
+            pass
         rect = win32gui.GetWindowRect(hwnd)
         win32gui.SetWindowPos(hwnd, 0, _PARK_POS, _PARK_POS, 0, 0,
                               win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
