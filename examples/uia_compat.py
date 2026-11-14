@@ -763,6 +763,11 @@ def apply(verbose: bool = True) -> bool:
     cls._session_list = _session_list
     cls._session_rows_of = _session_rows_of
     cls.ensure_chat_page = ensure_chat_page
+    # 上游 4.1.3 漏挂：ensure_chat_page 里调 self._chat_page_visible()，但装配清单
+    # 没有这一行——页面归位一走过早退分支就 AttributeError，发送流程退化成
+    # 「搜索框回退→反复前台重试」风暴（2026-11-14 14:09 实见：语音后窗口状态变差，
+    # ensure_chat_page 崩溃 → open_chat 循环 → 抢前台数分钟、消息发不出）。
+    cls._chat_page_visible = _chat_page_visible
     # 方便单独测「这句话该点哪一行」，不碰任何窗口
     cls._row_score = staticmethod(_row_score)
     cls._name_tokens = staticmethod(_name_tokens)
