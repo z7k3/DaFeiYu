@@ -5,6 +5,7 @@
 回复（用户看到"发语音后她甚至没回"）。部署同步正常也会犯这种错，
 因为两个文件分属不同 mixin，普通导入测试不覆盖调用点参数。"""
 import ast
+import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
