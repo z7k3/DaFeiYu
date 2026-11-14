@@ -576,6 +576,14 @@ class SenderMixin:
                 uia_available = self.gui._get_uia() is not None
             except Exception:
                 uia_available = False
+            # UIA 通道也要把「准备打入输入框的正文」记进残留库：风暴期间 UIA 打了字
+            # 却没发出去时，这些文字会留在输入框（微信草稿跨重启恢复）挡后续发送。
+            # 只有 bg 通道记录的话，UIA 通道的残留会变成认不出来的「用户草稿」
+            # （2026-11-14 14:09~14:12 实见：UIA 打的草稿 55 分钟后仍挡着每条回复）。
+            try:
+                G.bg_sender._remember_attempt(int(self.ACCOUNT.get('hwnd') or 0), text)
+            except Exception:
+                pass
             for attempt in (1, 2):
                 if _bg_chat_missing and self.open_chat_fail.get(_open_key, 0) >= 2:
                     G.log('UIA 通道：%s 连续打不开会话，跳过第 %d 次尝试' % (chat_display_name, attempt))
