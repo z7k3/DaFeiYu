@@ -231,3 +231,11 @@ test('有联网资料时：资料里没有的名单/名次不许拿记忆顶上'
   assert.match(tail, /不要拿记忆里的那份顶上/);
   assert.match(tail, /脑子里能报出/, '实见的「脑子里能报出个大概」要被明确禁止');
 });
+
+
+test('对方要名单时：有资料就完整列出，不受平时短句限制', () => {
+  const tail = persona.buildTurnState({ config: config(), now: NOW,
+    msg: groupMsg({ webText: '【HLTV 2025 top20】1 m0NESY 2 donk 3 ZywOo…' }) });
+  assert.match(tail, /完整内容直接列出来/);
+  assert.match(tail, /别因为平时句子短就只给前几名/);
+});

@@ -12,11 +12,15 @@ const links = require('../adapters/links');
 
 // 原文类查询：要的是「内容本身」（歌词/台词/攻略/步骤…），搜索摘要往往只剩
 // 歌名页/目录页，必须把结果页正文抓回来才算拿到东西。见 run() 里的补正文步骤。
-const ORIGINAL_TEXT_RE = /(歌词|副歌|台词|原文|全文|诗文|攻略|步骤|教程|说明书|玩法|怎么玩|怎么弄|怎么做)/;
+// 名单/榜单同理：用户要的是完整清单，搜索摘要通常只有前几名（实测 HLTV top20
+// 的摘要只给前三），不抓结果页正文就只能报半截名单。
+const ORIGINAL_TEXT_RE = /(歌词|副歌|台词|原文|全文|诗文|攻略|步骤|教程|说明书|玩法|怎么玩|怎么弄|怎么做|名单|榜单|排行|排名|top\s*\d+)/i;
 
 /** 单轮搜索的唯一入口；只返回证据，不读写会话存储或决定聊天回复。 */
 async function search({ text = '', history = [], llm, config = {}, now = new Date(), timeZone = '', signal, trace } = {}, deps = {}) {
   const providers = deps.providers || web;
+  // 抓正文默认走真实 links 适配器；测试注入 deps.describeLink 以免出网。
+  const describeLink = deps.describeLink || links.describeLink;
   const places = deps.places || weather;
   const routeSearch = deps.route || router.route;
   const started = Date.now();
@@ -193,7 +197,7 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
     if (value.status === 'ok' && value.items?.length && ORIGINAL_TEXT_RE.test(text + ' ' + q) && active()) {
       const candidates = value.items.filter(it => it.provider !== 'baike' && it.provider !== 'page').slice(0, 2);
       for (const top of candidates) {
-        const page = await locate('page-reader', () => links.describeLink(top.url,
+        const page = await locate('page-reader', () => describeLink(top.url,
           { timeoutMs: Math.max(0, Math.min(6000, Math.floor(options().timeoutMs * 0.6))) }));
         // 三道闸：站点失效提示 → 死链；正文不含查询关键词 → JS 渲染页抓到的页脚垃圾；
         // 都过不了就不收，宁可只有摘要列表也不往资料里塞噪音。

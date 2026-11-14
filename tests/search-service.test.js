@@ -180,3 +180,26 @@ test('路由给的检索词仍带相对时间时兜底锚定年份', async () =>
   assert.match(f.calls[0].args[0], /2025年/);
   assert.doesNotMatch(f.calls[0].args[0], /去年/);
 });
+
+
+test('名单类查询抓结果页正文，把完整名单带进资料；闲聊不抓', async () => {
+  // 用户标准：「CS去年top20名单」就该直接拿到完整名单。搜索摘要只有前几名，
+  // 不抓正文她最多报半截——所以名单/榜单/top N 必须触发正文抓取。
+  const pages = [];
+  const f = fixture({ need: true, query: 'CS 2025年 top20 名单', kind: 'web' });
+  f.deps.describeLink = async (url) => {
+    pages.push(url);
+    return { ok: true, title: 'HLTV 2025年度top20', url,
+      article: 'CS 2025年 top20 名单完整版：1 m0NESY 2 donk 3 ZywOo …… 共20位选手与所属战队逐一盘点。' };
+  };
+  const value = await f.run('你知道CS 2025年的top20名单吗');
+  assert.equal(pages.length, 1, '名单类要抓结果页正文');
+  assert.equal(value.items[0].provider, 'page');
+  assert.match(value.items[0].snippet, /m0NESY/);
+
+  const idle = [];
+  const f2 = fixture({ need: true, query: '测试检索', kind: 'web' });
+  f2.deps.describeLink = async (url) => { idle.push(url); return { ok: true, title: 't', url, article: '正文'.repeat(60) }; };
+  await f2.run('随便聊聊今天怎么样');
+  assert.equal(idle.length, 0, '非原文/名单类不浪费预算抓正文');
+});
