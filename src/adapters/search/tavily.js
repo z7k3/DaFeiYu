@@ -57,6 +57,10 @@ async function search(query, opts = {}) {
   }, opts);
   const rows = extractResults(payload);
   const items = rows.map((row) => ({
+    // provider 必须在源头就带上：web.ask 的 keepRelevant 过滤发生在
+    // provider 字段统一附加之前，豁免逻辑靠它识别结构化源
+    // （2026-11-14 实见：漏了这个字段，豁免全部失效，6 条又只活 1 条）。
+    provider: 'tavily',
     title: String(row.title || '').trim(),
     url: String(row.url || ''),
     snippet: String(row.content || '').trim().slice(0, 1200),
