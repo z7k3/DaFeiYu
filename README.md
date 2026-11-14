@@ -1,3 +1,7 @@
+> **这是 [Banan1cee/whale_girl](https://github.com/Banan1cee/whale_girl) 的改进 fork（DaFeiYu）**
+> 在官方 4.1.3 基线上叠加：联网检索实测优化（双源并行抗反爬 / 时效统计强制检索 / 相关性过滤改造）、微信静默发送、语音送达证据核对、群聊判定仲裁器、RAG 知识库等。
+> 改进清单见 [docs/fork-overview.md](docs/fork-overview.md)，更新记录见 [docs/CHANGELOG.md](docs/CHANGELOG.md)（搜 `4.1.3-local`）。以下为原项目 README。
+
 [English](README.md) | [中文](docs/README.zh-CN.md)
 
 # 🐋 Whale Girl
