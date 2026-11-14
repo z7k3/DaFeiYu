@@ -8,7 +8,7 @@ param(
     [switch]$BackupData
 )
 $ErrorActionPreference = 'Stop'
-$Source = 'D:\WhaleGirl\source code\whale_girl-4.0.8.2\whale_girl-4.0.8.2'
+$Source = 'D:\WhaleGirl\source code\whale_girl-4.1.3\whale_girl-4.1.3'
 if ($PSScriptRoot) { $Source = Split-Path $PSScriptRoot -Parent }
 if (-not (Test-Path (Join-Path $Source 'server.js'))) { Write-Host '❌ 找不到源码根目录'; exit 1 }
 if (-not (Test-Path (Join-Path $App 'server.js'))) { Write-Host '❌ APP 目录不对（没有 server.js）'; exit 1 }
