@@ -151,6 +151,16 @@ test('格式化保留来源和获取时间，不把它们写成发布时间', ()
   assert.match(text, /获取时间：2026-11-06/);
 });
 
+test('格式化在总预算内保留 API 摘要和长来源正文尾部', () => {
+  const value = evidence('tavily');
+  value.answer = 'API_SUMMARY_START 已核实的摘要 API_SUMMARY_END';
+  value.items[0].rawContent = 'SOURCE_START ' + '来源正文。'.repeat(240) + ' SOURCE_END';
+  const text = formatResult(value, { maxChars: 3200 });
+  assert.match(text, /API_SUMMARY_END/);
+  assert.match(text, /SOURCE_END/);
+  assert.ok(text.length <= 3200);
+});
+
 test('路由北京时间与机器本地时区无关', () => {
   assert.match(systemFor(new Date('2026-11-06T20:30:00Z')), /2026-11-07 周六 04:30（北京时间）/);
 });

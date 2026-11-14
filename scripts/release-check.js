@@ -125,7 +125,8 @@ try {
   const latest = heads[0];
   const prev = heads[1];
   if (latest && prev && latest.raw === pkg.version) {
-    const latestBody = cl.slice(latest.at, prev.at);
+    const nextHeading = cl.indexOf('\n## ', latest.at + 1);
+    const latestBody = cl.slice(latest.at, nextHeading < 0 ? cl.length : nextHeading);
     const hasNew = /^###\s*新增/m.test(latestBody);
     if (latest.raw.split('.').length >= 4) {
       const sameBase = latest.maj === prev.maj && latest.min === prev.min && latest.pat === prev.pat;

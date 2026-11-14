@@ -141,6 +141,14 @@ test('版本号工具存在，且 release-check 会拦「重复/跳号/空条目
   assert.equal(pkg.scripts.bump, 'node scripts/bump-version.js');
 });
 
+test('release-check 只按当前版本段判断修复与新增，不吞入后续 local 记录', () => {
+  const check = spawnSync(process.execPath, [path.join(root, 'scripts', 'release-check.js')], {
+    cwd: root, encoding: 'utf8',
+  });
+  assert.equal(check.status, 0, check.stdout + check.stderr);
+  assert.match(check.stdout, /✓ 补丁版本只放修复 \/ 改进/);
+});
+
 /**
  * 出包前必须自动扫个人信息。
  * 3.3.0 出包时靠人工扫才发现三处泄漏：BUGS.md 写了真实用户目录、

@@ -40,6 +40,9 @@ function fixture(t, { answer = '{"need":false}', enabled = true, timeoutMs = 100
       return evidence(method);
     });
   }
+  for (const method of ['cnWeatherResult', 'wttrResult']) {
+    t.mock.method(places, method, async () => result([], { status: 'failed', reason: 'offline_fixture' }));
+  }
   const msg = (text) => ({ platform: 'web', chatId: 'search-test', chatType: 'private', senderId: 'user', senderName: '小海', text });
   return { bot, store, calls, routed, msg };
 }
@@ -70,6 +73,18 @@ test('site hint on a specific Bilibili question does not force a hot list', asyn
   assert.equal(f.calls[0].args[0], 'B站 三体动画 更新进度 site:bilibili.com');
   assert.match(decision.msg.webText, /TEST EVIDENCE/);
   assert.match(promptOf(decision), /TEST EVIDENCE/);
+});
+
+test('API 摘要和长来源正文尾部进入最终聊天提示词', async (t) => {
+  const f = fixture(t, { answer: '{"need":true,"query":"主题资料"}' });
+  const source = 'SOURCE_START ' + '有用正文。'.repeat(240) + ' SOURCE_END';
+  t.mock.method(web, 'searchResult', async () => result([
+    { title: '综合来源', snippet: '短摘要', rawContent: source, url: 'https://example.test/source', provider: 'tavily', score: 0.9 },
+  ], { answer: 'API_SUMMARY_START 摘要正文 API_SUMMARY_END' }));
+  const decision = await f.bot.decide(f.msg('请说明这个主题的主要事实'));
+  const prompt = promptOf(decision);
+  assert.match(prompt, /API_SUMMARY_END/);
+  assert.match(prompt, /SOURCE_END/);
 });
 
 test('Bilibili hot-list failure searches Bilibili, never substitutes Toutiao', async (t) => {

@@ -56,7 +56,7 @@ class ReplyStickerCancelTests(unittest.TestCase):
         # if send_voice_reply(...) 节点，outcome/started 的赋值在节点外，由 env 提供；
         # Status=sent_unconfirmed 走「已确认」路径 → 取消预留表情包后整条 return。
         self.env.update(send_voice_reply=Mock(return_value=True), spoken='test voice',
-                        voice_outcome={'Status': 'sent_unconfirmed'}, voice_started=1)
+                        voice_outcome={'Status': 'sent_unconfirmed'}, voice_started=1, voice_explicit=True)
         self.run_branch('voice')
         self.http.assert_called_once()
         self.env['send_text'].assert_not_called()

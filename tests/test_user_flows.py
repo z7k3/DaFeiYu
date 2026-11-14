@@ -45,7 +45,9 @@ class BridgeUserFlows(unittest.TestCase):
         clock.sleep = lambda *_: None
         http = types.SimpleNamespace(post=lambda *a, **k: response or Response({'ok': True, 'action': 'reply', 'reply': '回答', 'bubbles': ['回答'], 'sticker': {'id': 'test'}}))
         env = dict(time=clock, me='self', START_TS=100., SKIP_OLDER_THAN=10, STALE_AFTER=4.,
-            voice_reply=types.SimpleNamespace(settings=lambda *a: {}, choose=lambda *a, **k: False), ROOT='test', random=types.SimpleNamespace(random=lambda: .5),
+            voice_reply=types.SimpleNamespace(settings=lambda *a: {}, choose=lambda *a, **k: False,
+            # 本地 fork：explicit 语音请求识别（5454ce2）——voice 流程会调用 requested
+            requested=lambda *a, **k: False), ROOT='test', random=types.SimpleNamespace(random=lambda: .5),
             ONLY_CHATS=[], aliases=['鲸鲸'], _GROUP_SENDER_PREFIX_RE=re.compile(r'^wxid_x:\s*'),
             log=lambda *a: logs.append(a), log_throttled=lambda *a, **k: logs.append(a),
             db=types.SimpleNamespace(get_nickname=lambda s: '好友'), display_name=lambda s: '好友',

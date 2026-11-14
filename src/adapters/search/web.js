@@ -19,6 +19,7 @@ async function searchResult(query, opts = {}) {
   const attempts = [], all = [], staleItems = [];
   const seen = new Set();
   let deadlineExpired = false;
+  let answer = '';
   const budget = () => remaining({ ...opts, deadline });
   const valid = () => quality.splitFreshness(q, all, opts).items;
   const ask = async (provider, term, reserve = false) => {
@@ -26,23 +27,26 @@ async function searchResult(query, opts = {}) {
     if (site && !term.toLowerCase().includes('site:' + site.toLowerCase())) term += ' site:' + site;
     const start = Date.now();
     const left = budget();
-    // 首源最多占大部分预算，给备用源留出机会；极短预算不再切成无意义的小请求。
-    const timeoutMs = reserve && left > 100 ? Math.floor(left * 0.65) : left;
+    // 高级全文搜索约需 6 秒；保留少量余量供后续源补位，普通网页源仍按原预算切分。
+    const timeoutMs = reserve && left > 100
+      ? Math.floor(left * (provider === 'tavily' ? 0.95 : 0.65)) : left;
     try {
       const source = provider === 'tavily' ? tavily : { bing, so360, baike }[provider];
-    const parsed = await source.search(term, { ...opts, deadline, timeoutMs });
+      const response = await source.search(term, { ...opts, deadline, timeoutMs });
+      const parsed = Array.isArray(response) ? response : (Array.isArray(response?.items) ? response.items : []);
       const scoped = site ? parsed.filter(item => {
         const host = new URL(item.url).hostname.toLowerCase();
         return host === site.toLowerCase() || host.endsWith('.' + site.toLowerCase());
       }) : parsed;
       const relevant = quality.keepRelevant(body, scoped);
+      if (provider === 'tavily' && relevant.length) answer = String(response?.answer || '').trim();
       report(opts.trace, 'filter', { provider, parsed: parsed.length, relevant: relevant.length,
         rejected: parsed.length - relevant.length, reason: 'relevance_filter' });
       const fetchedAt = new Date().toISOString();
       for (const item of relevant) {
         if (seen.has(item.url)) continue;
         seen.add(item.url);
-        all.push({ ...item, provider, fetchedAt, publishedAt: null });
+        all.push({ ...item, provider, fetchedAt, publishedAt: item.publishedAt || null });
       }
       attempts.push({ provider, status: relevant.length ? 'ok' : 'empty', parsed: parsed.length,
         relevant: relevant.length, elapsedMs: Date.now() - start });
@@ -115,6 +119,7 @@ async function searchResult(query, opts = {}) {
   // 不能被百科补充源的空结果洗成 empty。
   const coreFailed = coreAttempts.length > 0 && coreAttempts.every(a => a.status === 'failed');
   return result(items, { attempts, staleItems, reason, elapsedMs: Date.now() - started,
+    ...(answer ? { answer } : {}),
     ...(!items.length && (coreFailed || ['aborted', 'deadline_exceeded'].includes(reason)) ? { status: 'failed' } : {}) });
 }
 

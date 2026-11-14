@@ -161,7 +161,7 @@
     "tavilyMaxResults": 6,
     "_tavily说明": "Tavily 兼容搜索源：填了 Key 就作为首选检索源（结构化结果+全文+真实发布时间，无反爬问题），bing/360 退为兜底。支持官方 api.tavily.com 的 tvly- Key，或 tavily.sharyuke.com 这类 Hub 网关的 Key。留空=不启用",
     "city": "",
-    "timeoutMs": 8000
+    "timeoutMs": 20000
   },
   "env": {
     "_说明": "提示词 <env> 块里的环境信息。location 手填可以精确到区（比如「厦门市思明区」）；留空就自动探测：优先 Windows 定位服务（不吃公网 IP，挂 VPN 也是本机位置，精度差时只报城市），拿不到才按出口 IP 猜（会写明「挂 VPN 可能不符」）。autoDetect=false 完全关掉探测，只用手填和 websearch.city。timezone 是全局唯一时区来源：留空=系统时区，日记时间、主动搭话时间段、提醒、朋友圈夜间判断、聊天时间戳和 <env> 都按它算。地点最多到区，不落盘",

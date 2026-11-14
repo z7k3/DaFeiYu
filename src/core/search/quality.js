@@ -115,7 +115,9 @@ function keepRelevant(query, results) {
       }
       // 跨语言最佳证据：中文 bigram 分母压分没关系——结构化源自身带语义评分，
       // 给保底分并排在抓取碎片之前（实见 CS2 top20：tavily 6 条只活 1 条）。
-      return { item, index, score: Math.max(raw, 1) + 10, trusted: true, coverage: 1 };
+      const providerScore = item.score == null || item.score === '' ? NaN : Number(item.score);
+      const score = Number.isFinite(providerScore) ? providerScore + 10 : Math.max(raw, 1) + 10;
+      return { item, index, score, trusted: true, coverage: 1 };
     }
     const hits = tokens.filter(t => hay.includes(t) || (ALIASES[t] || []).some(a => hay.includes(a))).length;
     const coverage = tokens.length ? hits / tokens.length : 1;

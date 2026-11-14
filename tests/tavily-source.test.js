@@ -3,18 +3,39 @@
 // Tavily 兼容源：解析、无 Key 缺席、以及「给了足量结果就不再打扰 bing/360」的编排。
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { search, extractResults } = require('../src/adapters/search/tavily');
+const { search, extractResults, extractAnswer } = require('../src/adapters/search/tavily');
 const web = require('../src/adapters/search/web');
 
-const HUB = { code: 0, data: { ok: true, data: { results: [
-  { title: 'Falcons 阵容', url: 'https://liquipedia.net/cs2/Falcons', content: 'CS2 Player Roster: m0NESY NiKo karrigan', published_date: null },
-  { title: 'Falcons 战队百科', url: 'https://baike.test/falcons', content: 'Falcons 是沙特电竞组织', published_date: '2026-10-01' },
-] } } };
+const HUB = { code: 0, data: { ok: true, data: {
+  answer: '已整理出可核实的队员资料。',
+  results: [
+    { title: 'Falcons 阵容', url: 'https://liquipedia.net/cs2/Falcons', content: 'CS2 Player Roster: m0NESY NiKo karrigan',
+      raw_content: '完整来源正文。'.repeat(100), score: 0.92, published_date: '2026-11-12' },
+    { title: 'Falcons 战队百科', url: 'https://baike.test/falcons', content: 'Falcons 是沙特电竞组织',
+      raw_content: '', score: 0.6, published_date: '2026-10-01' },
+  ],
+} } };
 
 test('网关双层包裹与官方顶层 results 两种结构都能解析', () => {
   assert.equal(extractResults(HUB).length, 2);
   assert.equal(extractResults({ results: [{ title: 't', url: 'u', content: 'c' }] }).length, 1);
   assert.deepEqual(extractResults({}), []);
+  assert.equal(extractAnswer(HUB), HUB.data.data.answer);
+  assert.equal(extractAnswer({ data: { answer: 'outer', data: { results: [] } } }), 'outer');
+});
+
+test('请求高级答案和正文，并保留摘要、原文、分数与发布时间', async () => {
+  let sent;
+  const response = await search('Falcons 阵容', {
+    timeoutMs: 1000, tavilyApiKey: 'thb-test', _post: async (_url, _key, body) => { sent = body; return HUB; },
+  });
+  assert.equal(sent.search_depth, 'advanced');
+  assert.equal(sent.include_answer, 'advanced');
+  assert.equal(sent.include_raw_content, 'text');
+  assert.equal(response.answer, HUB.data.data.answer);
+  assert.equal(response.items[0].rawContent, HUB.data.data.results[0].raw_content);
+  assert.equal(response.items[0].score, 0.92);
+  assert.equal(response.items[0].publishedAt, '2026-11-12');
 });
 
 test('未配置 Key：tavily 直接缺席不抛错', async () => {
@@ -30,6 +51,9 @@ test('tavily 给足 ≥2 条有效结果时，bing/360 整轮不再被调用', a
   const value = await web.searchResult('Falcons 队员名单', opts);
   assert.equal(value.status, 'ok');
   assert.equal(value.items[0].provider, 'tavily');
+  assert.equal(value.answer, HUB.data.data.answer);
+  assert.equal(value.items[0].rawContent, HUB.data.data.results[0].raw_content);
+  assert.equal(value.items[0].publishedAt, '2026-11-12');
   assert.ok(value.items.length >= 2, '至少 tavily 两条');
   assert.deepEqual(calls, [], 'bing/360 整轮跳过（连 http get 都不发）');
 });

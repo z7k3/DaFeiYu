@@ -43,6 +43,15 @@ function extractResults(payload) {
   return [];
 }
 
+function extractAnswer(payload) {
+  const candidates = [payload, payload && payload.data, payload && payload.data && payload.data.data];
+  for (const candidate of candidates) {
+    const answer = String(candidate && candidate.answer || '').trim();
+    if (answer) return answer;
+  }
+  return '';
+}
+
 async function search(query, opts = {}) {
   const started = Date.now();
   const key = String(opts.tavilyApiKey || '').trim();
@@ -52,8 +61,9 @@ async function search(query, opts = {}) {
   const payload = await post(base + '/api/proxy/search', key, {
     query: String(query || '').slice(0, 400),
     max_results: Math.max(3, Math.min(10, Number(opts.tavilyMaxResults) || 6)),
-    search_depth: 'basic',
-    include_answer: false,
+    search_depth: 'advanced',
+    include_answer: 'advanced',
+    include_raw_content: 'text',
   }, opts);
   const rows = extractResults(payload);
   const items = rows.map((row) => ({
@@ -63,14 +73,16 @@ async function search(query, opts = {}) {
     provider: 'tavily',
     title: String(row.title || '').trim(),
     url: String(row.url || ''),
-    snippet: String(row.content || '').trim().slice(0, 1200),
+    snippet: String(row.content || '').trim(),
+    rawContent: String(row.raw_content || '').trim(),
+    score: row.score == null || row.score === '' || !Number.isFinite(Number(row.score)) ? null : Number(row.score),
     publishedAt: row.published_date || null,
-  })).filter((it) => it.url && (it.title || it.snippet));
+  })).filter((it) => it.url && (it.title || it.snippet || it.rawContent));
   if (!items.length && payload && payload.code !== 0 && payload.message) {
     throw searchError('tavily_error', payload.code);
   }
   if (opts.trace) opts.trace('provider', { provider: 'tavily', status: items.length ? 'ok' : 'empty', selected: items.length, elapsedMs: Date.now() - started });
-  return items;
+  return { items, answer: extractAnswer(payload) };
 }
 
-module.exports = { search, extractResults, postJson };
+module.exports = { search, extractResults, extractAnswer, postJson };

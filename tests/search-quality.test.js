@@ -65,6 +65,16 @@ test('查询带年份时，通篇讲别的年份的资料不能当答案', () =>
   assert.deepEqual(quality.keepRelevant('CS 2025年 top20 名单', items).map(x => x.url), ['https://e.test/2025']);
 });
 
+test('结构化搜索结果保留服务商相关性排序', () => {
+  const items = [
+    { title: '专题文章', snippet: '主题相关的单条资料', url: 'https://e.test/article', provider: 'tavily', score: 0.51 },
+    { title: '综合资料', snippet: '覆盖用户问题的主要内容', url: 'https://e.test/overview', provider: 'tavily', score: 0.91 },
+  ];
+  assert.deepEqual(quality.keepRelevant('用户需要的主题资料', items).map(x => x.url), [
+    'https://e.test/overview', 'https://e.test/article',
+  ]);
+});
+
 test('「去年/最近」这类回看词也算时效敏感，过期资料不再无限放行', () => {
   assert.equal(quality.isTimeSensitive('CS去年的top20名单'), true);
   assert.equal(quality.isTimeSensitive('最近的比赛结果'), true);

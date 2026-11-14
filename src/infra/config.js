@@ -177,7 +177,7 @@ const DEFAULT_CONFIG = {
   // 联网：问天气/新闻这类实时问题时现搜。city 用来把「今天天气怎么样」补成「上海 天气」，
   // 搜到的结果准得多；留空就按对方原话搜（也能用，但经常搜到别的城市）。
   websearch: {
-    enabled: true, city: '', timeoutMs: 8000,
+    enabled: true, city: '', timeoutMs: 20000,
     // Tavily 兼容源（结构化 JSON + 全文 + 真实发布时间）：填了 Key 就作为首选源，
     // bing/360 退为免费兜底。官方 api.tavily.com 或 Hub 网关（如 tavily.sharyuke.com）都行。
     tavilyApiKey: '', tavilyBaseUrl: 'https://tavily.sharyuke.com', tavilyMaxResults: 6,

@@ -199,7 +199,9 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
     // 原文类查询：搜索摘要经常只剩「歌名页/目录页」（用户看到的「都是链接没正文」就是
     // 这个）。抓前两条非百科结果页的正文补进资料——复用读链接的 SSRF 防护和缓存；
     // 死链/失效页的「正文」是站点提示语，必须剔除，不然反而污染资料。
-    if (value.status === 'ok' && value.items?.length && ORIGINAL_TEXT_RE.test(text + ' ' + q) && active()) {
+    const hasProviderFullText = value.items?.some((item) => String(item.rawContent || '').trim());
+    if (value.status === 'ok' && value.items?.length && !hasProviderFullText
+        && ORIGINAL_TEXT_RE.test(text + ' ' + q) && active()) {
       const candidates = value.items.filter(it => it.provider !== 'baike' && it.provider !== 'page').slice(0, 2);
       for (const top of candidates) {
         const page = await locate('page-reader', () => describeLink(top.url,
