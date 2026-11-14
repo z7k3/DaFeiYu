@@ -5,7 +5,7 @@ import engine as G
 
 class VoiceMixin:
 
-    def send_voice_reply(self, text, who, username, cancelled=None, outcome=None):
+    def send_voice_reply(self, text, who, username, cancelled=None, outcome=None, explicit=False):
         if not self.group_is_alive(username) or not self.account_send_allowed('自动语音'):
             return False
         if not self.send_policy_allows(username, who):
