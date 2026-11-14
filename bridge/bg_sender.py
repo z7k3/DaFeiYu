@@ -905,6 +905,27 @@ def _reset_typed_composer(hwnd, chat, value, input_before):
             and not _draft_may_have_changed(hwnd, input_before))
 
 
+def _cleanup_probe_char(hwnd, chat, log=None):
+    """编码探测失败路径的兜底清理：测试字「鲸」留在输入框会挡住之后所有发送。
+
+    只清「恰好是测试字本身」的框——其他任何内容（可能是用户草稿）一律不动。
+    实见（2026-11-14）：桥接被强杀打断探测后，「鲸」残留输入框数小时，
+    每条回复都被 input_not_empty 拒掉。"""
+    try:
+        info = read_ui(hwnd)
+        if not _target_composer(info, chat):
+            return False
+        value = _composer_text(info.get("value"))
+        if not value or _is_blank(info.get("value")):
+            return True
+        if value == '鲸':
+            return _clear_composer(hwnd, info.get("edit"))
+        if log:
+            log("编码探测兜底：输入框内容不是测试字（len=%d），不动" % len(value))
+        return False
+    except Exception:
+        return False
+
 def _calibrate_char_mode(sender, chat, modes, log):
     """校验固定的汉字，绝不拿整条回复试编码，也不点击发送。"""
     for mode in modes:
@@ -921,9 +942,17 @@ def _calibrate_char_mode(sender, chat, modes, log):
                 sender.end_input()
             if not stable or not _reset_typed_composer(sender.hwnd, chat, info.get("value"), input_before):
                 log("后台通道：编码探测后无法确认输入框已空，停止发送")
+                # 兜底：测试字「鲸」绝不能留在框里（会挡住之后所有发送）；
+                # 只清恰好是「鲸」的框，用户草稿不动。
+                _cleanup_probe_char(sender.hwnd, chat, log)
                 return "", False
         except Exception as err:
             log("后台通道：编码探测中断（%s），停止发送" % type(err).__name__)
+            # 中断时测试字可能已经打进去了，同样兜底清理
+            try:
+                _cleanup_probe_char(sender.hwnd, chat, log)
+            except Exception:
+                pass
             return "", False
         if got == "鲸":
             log("后台通道：编码实测 → %s" % mode)
