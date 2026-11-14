@@ -844,11 +844,22 @@ class Bot {
     const pluginTrigger = await this.messagePlugins.run('chat.pre_reply', pluginInput);
     if (pluginTrigger.action === 'skip') return { action: 'ignore', reason: 'plugin_skip', key, msg, atMe };
     const triggerResult = this.computeTrigger({ msg, atMe, clean, isGroup, state, nowMs, isMaster, muted, botSpokeLast });
-    // 影子对比：新仲裁器 vs 现有 trigger 判定（只记日志，不改行为）。
-    this._addrShadow({ msg, clean, atMe, isGroup, state, nowMs, isMaster, botSpokeLast }, triggerResult);
+    // 影子对比：新仲裁器 vs 现有 trigger 判定。
+    const shadowVerdict = this._addrShadow({ msg, clean, atMe, isGroup, state, nowMs, isMaster, botSpokeLast }, triggerResult);
     if (pluginTrigger.action === 'wake' && !['silent', 'minute_cap', 'no_text'].includes(triggerResult.reason)) {
       triggerResult.wake = true;
       triggerResult.reason = 'plugin';
+    }
+    // 阶段 2（free_chat 先行）：抽签醒来但仲裁器明确说没人在跟她说话/在跟别人说话
+    // 时，否决这次醒来。影子模式收集的分歧里 free_chat 全部被判 unknown/no_signal
+    // （2026-11-14 班级群：抽签醒 → 连发一大串+语音，群友让她闭嘴）。
+    // 注意放在 plugin wake 之后：插件显式唤醒不受仲裁器约束。
+    if (shadowVerdict && triggerResult.wake && triggerResult.reason === 'free_chat'
+        && addressing.freeChatVeto(shadowVerdict)) {
+      this.logger && this.logger.info('[addr-arbiter] veto free_chat → addressee=' + shadowVerdict.addressee
+        + ' conf=' + shadowVerdict.confidence + ' reason=' + shadowVerdict.reason);
+      triggerResult.wake = false;
+      triggerResult.reason = 'arbiter_veto_free_chat';
     }
     // 群里被人骂了但没 @：只有「骂的是她」才唤醒她反击。
     // 以前这里只看「文本带脏字」+「她刚说过话/在接话窗口」就唤醒 —— 于是群里任何人
@@ -1335,7 +1346,7 @@ class Bot {
    * 日志只写原因码/置信度/长度，不写聊天正文。
    */
   _addrShadow(args, oldDecision) {
-    if (!this.config || !(this.config.group && this.config.group.addressShadow)) return;
+    if (!this.config || !(this.config.group && this.config.group.addressShadow)) return null;
     try {
       const msg = args.msg || {};
       const text = String((args.clean && args.clean.text) || msg.text || '');
@@ -1361,7 +1372,9 @@ class Bot {
       }
     } catch (err) {
       this.logger && this.logger.warn('[addr-shadow] 计算失败（不影响正常流程）：' + describeError(err));
+      return null;
     }
+    return verdict;
   }
 
   computeTrigger(args) {

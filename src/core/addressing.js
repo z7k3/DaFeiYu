@@ -169,4 +169,14 @@ function hasEngagedSet(state, senderId, nowMs) {
   return nowMs - ts <= win;
 }
 
+// free_chat 抽签的仲裁器否决：群里没 targeted 她还抽签醒来，是「调松乱插嘴」的
+// 最大来源（2026-11-14 班级群实见：30% 抽签醒 → 连发一大串+语音，社交代价极高）。
+// 只有仲裁器明确说「没信号/在跟别人说话」且置信度够时才否决；判定为 group（大家
+// 在聊她相关话题）时保留抽签——那本来就是 free_chat 的设计场景。
+function freeChatVeto(verdict) {
+  if (!verdict || typeof verdict !== 'object') return false;
+  if (verdict.addressee === 'her') return false;
+  if (!['unknown', 'other'].includes(verdict.addressee)) return false;
+  return Number(verdict.confidence) >= 0.5;
+}
 module.exports = { herNames, namedHerIn, isAddressed, filterSelfMentions, talkingToOthers, analyze, hasEngagedSet };
