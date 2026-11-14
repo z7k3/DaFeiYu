@@ -9,6 +9,11 @@ const GENERIC = new Set(['谁是', '是谁', '这个', '那个', '一个', '什�
   '所以', '因为', '这样', '那样', '知道', '觉得', '应该', '需要', '很多', '非常', '真的', '一直',
   '已经', '开始', '结束', '现在', '今天', '明天', '如何', '哪些']);
 const ALIASES = { 苹果: ['iphone', 'apple', 'mac', 'ipad'], iphone: ['苹果'], mac: ['macbook'] };
+// 时间词只表达「什么时候」，不承载「查什么」：它们既不能当必须命中的锚点
+// （实见「今晚南昌天气」→ 锚点「今晚南昌」把全部结果拒掉），也不能参与分词
+// （「原神最近有新活动」桥接出「神最/近有/有新」这种结果页永远不会有的大米词，
+// 把覆盖率分母撑大）。锚点计算和 queryTokens 都要先剥掉它们。
+const TOKEN_TIME_RE = /(今天|今日|今晚|今早|昨天|昨日|昨晚|前天|明天|明早|明晚|后天|现在|目前|当前|最近|近期|最新|刚刚|刚才|本周|这周|下周|上周|周末|早上|上午|中午|下午|晚上|夜里|凌晨|今年|去年|前年|大前年)/g;
 
 function expandBrand(text) {
   const s = String(text || '');
@@ -20,7 +25,9 @@ function expandBrand(text) {
 }
 
 function queryTokens(query) {
-  const text = expandBrand(String(query || '').replace(/\bsite:[a-z0-9.-]+/gi, '')).replace(STOP_WORDS, ' ');
+  // 单字虚词（有/和/跟/就…）也不参与分词：它们跨在词边界上会造出「有新」这类
+  // 结果页永远不会有的大米词，把覆盖率分母撑大（实测原神官网活动页被拖到 2/6）。
+  const text = expandBrand(String(query || '').replace(/\bsite:[a-z0-9.-]+/gi, '')).replace(STOP_WORDS, ' ').replace(TOKEN_TIME_RE, ' ').replace(/[有在和跟与就也都还又把被对向或而且]/g, ' ');
   const tokens = (text.match(/[a-z0-9][a-z0-9+.\-]{1,}/gi) || []).map(x => x.toLowerCase());
   for (const run of text.match(/[\u4e00-\u9fa5]{2,}/g) || []) {
     for (let i = 0; i + 1 < run.length; i++) tokens.push(run.slice(i, i + 2));
@@ -78,7 +85,8 @@ function relevanceScore(query, item) {
   // 长句暂不强行切实体，避免二字分词把自然问句误当成完整专名。
   const topics = cleanQuery(query).replace(/\bsite:[a-z0-9.-]+/gi, '')
     .replace(/B站|哔哩哔哩|微博|今日头条/gi, ' ')
-    .replace(/明天|后天|多少度|天气|气温|温度|预报|下雨|下雪|会不会|会|价格|报价|行情|热搜|热榜|新闻|更新|进度|发布|上市|机型|型号|机器|推荐|是什么|怎么样|副歌|歌词|原文|全文|攻略|台词|诗文|含义|出处|背景|步骤|教程|怎么玩|怎么弄|怎么做|完整|一段/g, ' ')
+    .replace(TOKEN_TIME_RE, ' ')
+    .replace(/明天|后天|多少度|天气|气温|温度|预报|下雨|下雪|会不会|会|价格|报价|售价|价位|行情|热搜|热榜|新闻|更新|进度|发布|上市|机型|型号|机器|推荐|是什么|怎么样|副歌|歌词|原文|全文|攻略|台词|诗文|含义|出处|背景|步骤|教程|怎么玩|怎么弄|怎么做|完整|一段/g, ' ')
     .match(/[\u4e00-\u9fa5]{2,}/g) || [];
   const anchors = topics.filter(x => x.length <= 4);
   if (!entities.length && anchors.length && !anchors.some(t => hay.includes(t) || (ALIASES[t] || []).some(a => hay.includes(a)))) return 0;
@@ -87,8 +95,20 @@ function relevanceScore(query, item) {
 }
 
 function keepRelevant(query, results) {
-  return results.map((item, index) => ({ item, index, score: relevanceScore(query, item) }))
-    .filter(x => x.score > 0).sort((a, b) => b.score - a.score || a.index - b.index).map(x => x.item);
+  const tokens = queryTokens(query);
+  const scored = results.map((item, index) => {
+    const hay = ((item.title || '') + ' ' + (item.snippet || '')).toLowerCase();
+    const hits = tokens.filter(t => hay.includes(t) || (ALIASES[t] || []).some(a => hay.includes(a))).length;
+    return { item, index, score: relevanceScore(query, item), coverage: tokens.length ? hits / tokens.length : 1 };
+  });
+  const best = scored.reduce((m, x) => Math.max(m, x.coverage), 0);
+  // 覆盖率相对阈值：池子里有高覆盖答案时，只擦到一两个泛词的搭便车条目不该混进资料
+  // （它们正是「证据有了但全是无关站」的来源）。但阈值永远不超过池内最佳值——
+  // 池子整体都弱时保留弱证据（原神官网只命中 2/3 也比 no_results 强），宁可让
+  // persona 层说明证据不足，也不能把「查到了」变成「没查到」。
+  const bar = best > 0 ? Math.min(Math.max(0.34, best * 0.6), best) : 0;
+  return scored.filter(x => x.score > 0 && x.coverage >= bar)
+    .sort((a, b) => b.score - a.score || a.index - b.index).map(x => x.item);
 }
 
 function parseSnippetAgeDays(snippet, nowMs = Date.now()) {

@@ -16,7 +16,10 @@ function gate(text, mode) {
   const fact = FACT.test(text) && !CHITCHAT.test(text.trim()) && !OPINION.test(text);
   // 统计事实和闲聊/观点互斥：问「你觉得谁最强」可以凭感觉答，问「谁拿了冠军」不行。
   const volatile = VOLATILE.test(text) && !CHITCHAT.test(text.trim()) && !OPINION.test(text);
-  return { fallback: keyword || fact, volatile, route: mode === true || (mode !== false && (keyword || fact || /[?？]|吗|呢|什么|怎么|多少|几[个号点]|谁|哪|为什么|如何|查|搜|最新|今天|现在|价格|天气/.test(text))) };
+  // 干嘛/干啥/咋/啥系口语疑问词必须放行：实见「马斯克最近在干嘛」没问号也没关键词，
+  // 连语义路由都没被咨询就直接 local_not_needed——用户眼里的「她在装死」。
+  const colloquial = /(干嘛|干啥|咋样|咋办|咋整|咋了|咋回事|啥时候|啥意思|啥情况)/.test(text);
+  return { fallback: keyword || fact, volatile, route: mode === true || (mode !== false && (keyword || fact || colloquial || /[?？]|吗|呢|什么|怎么|多少|几[个号点]|谁|哪|为什么|如何|查|搜|最新|今天|现在|价格|天气/.test(text))) };
 }
 
 function inferKind(text) {

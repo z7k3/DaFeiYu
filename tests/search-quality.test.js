@@ -69,3 +69,51 @@ test('「去年/最近」这类回看词也算时效敏感，过期资料不再�
   assert.equal(quality.isTimeSensitive('CS去年的top20名单'), true);
   assert.equal(quality.isTimeSensitive('最近的比赛结果'), true);
 });
+
+
+const policy = require('../src/core/search/policy');
+
+test('时间词不桥接分词：不产生结果页永远不会有的大米词', () => {
+  // 实测：原神官网活动页被「神最/近有/有新」这类跨词边界bigram拖到覆盖率 2/6。
+  const tokens = quality.queryTokens('原神最近有新活动');
+  assert.ok(!tokens.includes('神最') && !tokens.includes('近有') && !tokens.includes('有新'), JSON.stringify(tokens));
+  assert.ok(tokens.includes('原神') && tokens.includes('活动'));
+});
+
+test('时间词不作锚点：今晚南昌天气不再整批误杀', () => {
+  const items = [
+    { title: '南昌天气预报', snippet: '南昌今晚小雨，明日转多云', url: 'https://e.test/1' },
+    { title: '南昌市气象台', snippet: '南昌今天夜间有雨', url: 'https://e.test/2' },
+  ];
+  // 修复前：锚点「今晚南昌」两条全拒 → 用户听到「没查到」。
+  // 修复后：强证据保留；低覆盖的第二条被相对阈值淘汰属预期（池里有更好的）。
+  const kept = quality.keepRelevant('今晚南昌天气', items);
+  assert.ok(kept.length >= 1 && kept[0].url === 'https://e.test/1');
+  // 整池只剩弱证据时不清空——「查到一条」永远好于 no_results。
+  const weakOnly = [items[1]];
+  assert.equal(quality.keepRelevant('今晚南昌天气', weakOnly).length, 1);
+});
+
+test('覆盖率相对阈值：强答案在场时淘汰搭便车条目，弱池不清空', () => {
+  const strong = [
+    { title: '小米SU7最新售价公布', snippet: '小米SU7标准版售价21.59万起', url: 'https://e.test/s' },
+    { title: ' unrelated 游戏攻略', snippet: '里面顺便提到一次小米', url: 'https://e.test/x' },
+  ];
+  const kept = quality.keepRelevant('小米su7售价多少', strong);
+  assert.ok(kept.every(x => x.url !== 'https://e.test/x'), '只擦到泛词的不该混进证据');
+  assert.equal(kept.length, 1);
+  // 池子整体都弱（best 覆盖率低）时保留弱证据，不制造 no_results。
+  const weak = [
+    { title: '原神官网', snippet: '《原神》最新活动祈愿现已开启', url: 'https://e.test/w' },
+  ];
+  assert.equal(quality.keepRelevant('原神新活动', weak).length, 1);
+});
+
+test('口语疑问词能进语义路由，陈述句不误触', () => {
+  // 实测现场：「马斯克最近在干嘛」没问号没关键词，连路由器都没被问就跳过。
+  assert.equal(policy.gate('马斯克最近在干嘛', undefined).route, true);
+  assert.equal(policy.gate('那咋办啊', undefined).route, true);
+  assert.equal(policy.gate('啥意思啊这个', undefined).route, true);
+  assert.equal(policy.gate('我最近好累啊', undefined).route, false, '纯陈述不放行');
+  assert.equal(policy.gate('晚安啦', undefined).route, false);
+});

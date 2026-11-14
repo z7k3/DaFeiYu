@@ -21,6 +21,10 @@ function fakeHttps(t, handler) {
   t.after(() => { for (const timer of timers) clearTimeout(timer); });
   t.mock.method(https, 'get', (url, options, callback) => {
     const call = { url: String(url), options, destroyed: false };
+    // handler 的序号 = 请求发起顺序。以前传「响应时的 calls.length-1」，
+    // 串行时代恰好等于发起序号；双源并行后两个在途请求会拿到同一个号，
+    // 按 i 分发响应的用例全被错配（193 假红就是这个）。
+    const ordinal = calls.length;
     calls.push(call);
     const req = new EventEmitter();
     let res;
@@ -40,7 +44,7 @@ function fakeHttps(t, handler) {
     };
     later(() => {
       if (call.destroyed) return;
-      const spec = handler(call, calls.length - 1) || {};
+      const spec = handler(call, ordinal) || {};
       if (spec.error) return req.emit('error', new Error(spec.error));
       if (spec.never) return;
       res = new EventEmitter();
@@ -235,8 +239,9 @@ test('drip-fed response has an absolute deadline and destroys the request', asyn
   const started = Date.now();
   assert.deepEqual(await web.search('显卡行情', { timeoutMs: 35 }), []);
   assert.ok(Date.now() - started < 500);
-  assert.equal(calls.length, 1, 'no fresh full timeout for normalized retry');
-  assert.equal(calls[0].destroyed, true);
+  // 首轮双源并行 = 恰好 2 个在途请求，都随截止销毁；之后再无重试请求。
+  assert.equal(calls.length, 2, 'parallel first round only; no fresh full timeout for retries');
+  assert.ok(calls.every(x => x.destroyed), 'both in-flight requests destroyed at deadline');
 });
 
 test('redirect cycles are bounded and preserve required Weibo headers', async (t) => {
@@ -414,4 +419,31 @@ test('Bing 跳转链接还原真实来源并去掉跟踪参数', () => {
   const target = 'https://example.test/article?utm_source=bing&id=1#section';
   const html = bing(['显卡行情', 'https://www.bing.com/ck/a?u=a1' + Buffer.from(target).toString('base64url')]);
   assert.equal(web.parseBing(html)[0].url, 'https://example.test/article?id=1');
+});
+
+
+test('bing 返回广告页时 so360 并行结果兜底成功', async (t) => {
+  // 2026-11-14 实测：cn.bing.com 对程序化抓取间歇性返回广告/默认页
+  // （搜歌词给战网/企业微信/金蝶）。首轮双源并行后，另一源的好结果照常可用。
+  const junk = bing(['WPS Office - PDF, Word, Excel', 'https://www.wps.cn/'], ['企业微信', 'https://work.weixin.qq.com/']);
+  fakeHttps(t, (call) => call.url.includes('so.com')
+    ? { body: so('孤勇者歌词全文', 'https://www.iqiyi.com/lyric/') }
+    : { body: junk });
+  const results = await web.search('孤勇者完整歌词', { timeoutMs: 3000 });
+  assert.ok(results.length >= 1, 'bing 垃圾页不应导致整轮 no_results');
+  assert.equal(results[0].url, 'https://www.iqiyi.com/lyric/');
+});
+
+test('so.com 反爬 302 到 http 验证码页：拒绝跟跳并如实报 blocked', async (t) => {
+  // 实测 2026-11-14：so.com 对程序化抓取高频后会把搜索 302 到
+  // http://qcaptcha.so.com/?ret=...&src=captcha。https-only 政策不放松，
+  // 但错误码必须是 blocked（换源/冷却），不是 unsupported_protocol。
+  const calls = fakeHttps(t, (call) => call.url.includes('so.com')
+    ? { status: 302, headers: { location: 'http://qcaptcha.so.com/?ret=x&src=captcha' } }
+    : { body: bing(['显卡报价', 'https://example.test/good']) });
+  const value = await web.searchResult('显卡行情', { timeoutMs: 2000 });
+  assert.ok(value.items.length >= 1, 'bing 侧照常出结果');
+  const soAttempt = value.attempts.find(a => a.provider === 'so360');
+  assert.equal(soAttempt && soAttempt.code, 'blocked');
+  assert.ok(calls.every(c => !c.url.includes('qcaptcha')), '绝不跟跳验证码页');
 });

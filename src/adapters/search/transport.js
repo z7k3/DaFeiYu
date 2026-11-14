@@ -57,7 +57,13 @@ function getText(url, opts = {}) {
     if (performance.now() >= deadline) return finish(searchError('deadline_exceeded'));
     try {
       const parsed = new URL(target);
-      if (parsed.protocol !== 'https:') return finish(searchError('unsupported_protocol'));
+      if (parsed.protocol !== 'https:') {
+        // so.com 反爬把搜索 302 到 http://qcaptcha.so.com（明文验证码页）。https-only
+        // 照样拒绝跟跳，但错误要如实叫 blocked：报 unsupported_protocol 会让人去查
+        // 传输层，实际该做的是等冷却/换源。
+        if (/captcha/i.test(parsed.hostname + parsed.pathname)) return finish(searchError('blocked'));
+        return finish(searchError('unsupported_protocol'));
+      }
       req = https.get(parsed.toString(), { headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0 Safari/537.36',
         'Accept-Language': 'zh-CN,zh;q=0.9', Accept: 'text/html,application/json,*/*', ...(opts.headers || {}),
@@ -69,7 +75,11 @@ function getText(url, opts = {}) {
           if (redirects >= 5) return finish(searchError('too_many_redirects'));
           let next;
           try { next = new URL(res.headers.location, target); } catch { return finish(searchError('invalid_redirect')); }
-          if (next.protocol !== 'https:') return finish(searchError('unsupported_protocol'));
+          // 与 visit() 入口同一口径：明文验证码页叫 blocked，其余明文跳转仍拒（SSRF 加固不放松）。
+          if (next.protocol !== 'https:') {
+            if (/captcha/i.test(next.hostname + next.pathname)) return finish(searchError('blocked'));
+            return finish(searchError('unsupported_protocol'));
+          }
           // 旧跳转页立即释放，新连接沿用同一个绝对时限和取消信号。
           clearTimeout(timer);
           opts.signal?.removeEventListener('abort', abort);
