@@ -977,8 +977,13 @@ _LAST_ATTEMPT = {}
 # 重启后仍会挡死发送。所以把「最近发出去的正文」落盘（只存正文和秒级时间，
 # 不存会话名/wxid），重启后照样能认出自己的残留。
 _RESIDUE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "bg-recent-sends.json")
-_RESIDUE_TTL = 30 * 60      # 30 分钟内的才算「可能是我们的残留」
-_RESIDUE_MAX = 8
+_RESIDUE_TTL = 120 * 60     # 2 小时内的都算「可能是我们的残留」。
+# 为什么放宽：微信会把没发出去的输入框内容存进数据库草稿，重开微信也恢复。
+# 2026-11-14 实见：14:09 发送风暴打进输入框的残留，15:04 才开始挡发送——
+# 旧的 30 分钟 TTL + 8 条窗口双重失效，残留被当成用户草稿，之后每条回复
+# 都被 input_not_empty 拒掉。匹配要求整段一致或前缀（见
+# _looks_like_own_residue），用户草稿恰好逐字撞上我们正文的概率可忽略。
+_RESIDUE_MAX = 32
 _ATTEMPT_LIST = None
 
 
