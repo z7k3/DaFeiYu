@@ -1455,6 +1455,17 @@ function splitBubbles(text, { maxChars = 120, maxBubbles = 2, preferSeparate = f
   if (!raw) return [];
   const limit = Math.max(8, Number(maxChars) || 120);
   const maxN = Math.max(1, Math.floor(Number(maxBubbles) || 1));
+  // 名单/列表回复是一个整体：≥3 行以编号或项目符号开头的行拆散会把
+  // 「1 ZywOo」「2 donk」变成一条人名一个气泡（2026-11-14 实见 CS2 top20
+  // 被拆成 6 条连发，还触发了脏输入保护把剩余气泡取消）。整段合成一条，
+  // 上限放宽到 600 字（名单本身就是要长内容，微信单条放得下）。
+  const rawLinesForList = raw.split('\n').map((l) => l.trim()).filter(Boolean);
+  const LIST_LINE = /^\s*(?:\d{1,2}[.、)）]?\s*\S|[①-⑳]\s*\S|[-*•]\s*\S)/;
+  const listHit = rawLinesForList.filter((l) => LIST_LINE.test(l)).length;
+  if (listHit >= 3 && listHit >= rawLinesForList.length - 2) {
+    const cap = Math.max(600, limit * 6);
+    return [raw.length > cap ? raw.slice(0, cap - 1).trimEnd() + '…' : raw];
+  }
   // 模型另起一行时，字数少也要尽量保留气泡边界。
   let separate = raw.split(/\n+/).map((line) => line.trim()).filter(Boolean);
   let separator = '\n';
