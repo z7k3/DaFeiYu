@@ -176,7 +176,11 @@ function hasEngagedSet(state, senderId, nowMs) {
 function freeChatVeto(verdict) {
   if (!verdict || typeof verdict !== 'object') return false;
   if (verdict.addressee === 'her') return false;
-  if (!['unknown', 'other'].includes(verdict.addressee)) return false;
-  return Number(verdict.confidence) >= 0.5;
+  // unknown（毫无指向信号）：抽签醒来就是乱插嘴，不需要置信度门槛——
+  // 实测样本里 no_signal 的置信度天然只有 0.2，按 0.5 卡等于全不放行。
+  if (verdict.addressee === 'unknown') return true;
+  // other（明确在跟别人说话）：置信度够才否决。
+  if (verdict.addressee === 'other') return Number(verdict.confidence) >= 0.5;
+  return false;
 }
-module.exports = { herNames, namedHerIn, isAddressed, filterSelfMentions, talkingToOthers, analyze, hasEngagedSet };
+module.exports = { herNames, namedHerIn, isAddressed, filterSelfMentions, talkingToOthers, analyze, hasEngagedSet, freeChatVeto };
