@@ -39,8 +39,12 @@ Get-ChildItem -LiteralPath (Join-Path $Source 'bridge') -Filter '*.py' | ForEach
 }
 # examples/ 与 server.js、assets/
 Copy-Item (Join-Path $Source 'server.js') (Join-Path $App 'server.js') -Force; $changed++
+# package.json 必须跟着代码走：内核版本号（src/app.js require('../package.json')）和启动器
+# 界面显示的版本都读运行目录这份。以前不同步，4.1.0 装机后内核升到 4.1.3 界面还显示
+# 4.1.0（2026-11-14 实见）。
+Copy-Item (Join-Path $Source 'package.json') (Join-Path $App 'package.json') -Force; $changed++
 if (Test-Path (Join-Path $Source 'examples')) { robocopy (Join-Path $Source 'examples') (Join-Path $App 'examples') /MIR /NFL /NDL /NJH /NJS /NP | Out-Null }
 if (Test-Path (Join-Path $Source 'assets')) { robocopy (Join-Path $Source 'assets') (Join-Path $App 'assets') /E /NFL /NDL /NJH /NJS /NP | Out-Null }
 
-Write-Host ('✅ 同步完成：src 镜像 + bridge ' + (Get-ChildItem -LiteralPath (Join-Path $Source 'bridge') -Filter '*.py').Count + ' 个 .py + examples/server.js/assets')
+Write-Host ('✅ 同步完成：src 镜像 + bridge ' + (Get-ChildItem -LiteralPath (Join-Path $Source 'bridge') -Filter '*.py').Count + ' 个 .py + examples/server.js/assets/package.json')
 Write-Host '⚠️  需要重启内核与微信桥接后才生效（启动器里点「重启」）。'
