@@ -36,6 +36,10 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
     const out = { ...value, attempts: [...attempts, ...(value.attempts || [])], staleItems: [...staleItems, ...(value.staleItems || [])], elapsedMs: Date.now() - started };
     // 默认 1400 字会截掉第 3 条以后的摘要；放宽到 3200，persona 侧有自己的截断兜底。
     out.text = formatResult(out, { maxChars: 3200 });
+    if (out.reason === 'stale_only' && out.items.length) {
+      // 旧证据放行时必须让模型知道这是存档：否则会把去年的名单当今年报出来
+      out.text += '\n（注意：以上资料均为较旧时间的存档，回答时必须说明资料对应的年份时间，不得当作当前最新情况。）';
+    }
     completed = out;
     say('complete', { status: out.status, reason: out.reason, selected: out.items.length, chars: out.text.length, elapsedMs: out.elapsedMs });
     return out;

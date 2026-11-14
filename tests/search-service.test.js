@@ -203,3 +203,14 @@ test('名单类查询抓结果页正文，把完整名单带进资料；闲聊�
   await f2.run('随便聊聊今天怎么样');
   assert.equal(idle.length, 0, '非原文/名单类不浪费预算抓正文');
 });
+
+test('stale_only 放行旧证据时，资料文本带存档标注（persona 必须报年份）', async () => {
+  const { result } = require('../src/core/search/result');
+  const f = fixture({ need: true, query: 'Falcons 队员名单', kind: 'web' });
+  f.deps.providers.searchResult = async () => result(
+    [{ title: 'Falcons 阵容名单', snippet: '2025年1月名单', url: 'https://example.test/r', provider: 'bing' }],
+    { status: 'ok', reason: 'stale_only' });
+  const value = await f.run('Falcons 队员名单');
+  assert.equal(value.reason, 'stale_only');
+  assert.match(value.text, /较旧时间的存档/);
+});

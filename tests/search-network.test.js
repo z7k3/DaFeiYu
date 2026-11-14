@@ -447,3 +447,23 @@ test('so.com 反爬 302 到 http 验证码页：拒绝跟跳并如实报 blocked
   assert.equal(soAttempt && soAttempt.code, 'blocked');
   assert.ok(calls.every(c => !c.url.includes('qcaptcha')), '绝不跟跳验证码页');
 });
+
+test('名单类查询全部过旧时，交出带时间的旧证据而不是空手而归', async (t) => {
+  // 2026-11-14 实见：「Falcons 队员名单」10 条候选全被判 stale → 交白卷 →
+  // 她只能回答"没查到靠谱的结果"。旧名单页对名单类查询是有用证据。
+  fakeHttps(t, call => call.url.includes('www.so.com') ? { body: '' }
+    : { body: bing(['Falcons 阵容名单', 'https://example.test/roster', '2025年1月15日 Falcons 队员名单公布']) });
+  const value = await web.searchResult('Falcons 队员名单', { timeoutMs: 1000, maxAgeDays: 365 });
+  assert.equal(value.reason, 'stale_only');
+  assert.equal(value.items.length, 1, '旧证据要交出，不再交白卷');
+  assert.equal(value.items[0].url, 'https://example.test/roster');
+});
+
+test('价格/今天类硬时效查询全过旧时仍交白卷（旧数字有害）', async (t) => {
+  fakeHttps(t, call => call.url.includes('www.so.com') ? { body: '' }
+    : { body: bing(['显卡报价', 'https://example.test/old', '2010年3月4日 显卡报价']) });
+  const value = await web.searchResult('今天显卡价格', { timeoutMs: 1000, maxAgeDays: 2 });
+  assert.equal(value.status, 'empty');
+  assert.equal(value.reason, 'stale_only');
+  assert.deepEqual(value.items, []);
+});

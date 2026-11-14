@@ -83,11 +83,21 @@ async function searchResult(query, opts = {}) {
   if (!valid().length && !site) await ask('baike', body);
   const split = quality.splitFreshness(q, quality.keepRelevant(body, all), opts);
   staleItems.push(...split.staleItems);
-  const items = split.items.slice(0, Math.max(1, Math.min(10, Number(opts.limit) || 5)));
+  let items = split.items.slice(0, Math.max(1, Math.min(10, Number(opts.limit) || 5)));
+  let staleFallback = false;
+  // 名单/资料类查询全部过旧时交出「带时间的旧证据」而不是空手：
+  // 实测「Falcons 队员名单」10 条候选全被判 stale → 她只能回答"没查到靠谱的结果"，
+  // 但旧名单页对她完全有用（如实报年份即可）。价格/今天这类硬时效查询除外——
+  // 旧数字是有害证据，宁可空手（交给上层"没查到"）。
+  if (!items.length && split.staleItems.length
+      && !/(今天|今日|刚刚|刚才|实时|现在|此刻|多少钱|什么价|价格|报价|行情)/i.test(body)) {
+    items = split.staleItems.slice(0, Math.max(1, Math.min(3, Number(opts.limit) || 5)));
+    staleFallback = true;
+  }
   // 百科是补充源：它的空结果不能把主搜索的 parse_error 洗成 no_results，
   // 否则「解析结构变了」这种真故障会被当成「今天没搜到」。
   const coreAttempts = attempts.filter((a) => a.provider !== 'baike');
-  const reason = items.length ? 'available' : opts.signal?.aborted ? 'aborted' : deadlineExpired || budget() <= 0 ? 'deadline_exceeded'
+  const reason = items.length ? (staleFallback ? 'stale_only' : 'available') : opts.signal?.aborted ? 'aborted' : deadlineExpired || budget() <= 0 ? 'deadline_exceeded'
     : staleItems.length ? 'stale_only' : coreAttempts.length && coreAttempts.every(a => a.status === 'failed') ? coreAttempts.at(-1)?.code || 'no_results' : 'no_results';
   report(opts.trace, 'result', { candidates: all.length, stale: staleItems.length, selected: items.length,
     sources: items.map(x => new URL(x.url).hostname) });
