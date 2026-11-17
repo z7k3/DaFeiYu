@@ -526,7 +526,13 @@ def _referenced_names(definitions):
 
 
 class BridgeContractTest(unittest.TestCase):
-    def test_sticker_switch_forces_foreground_even_with_background_configured(self):
+    def test_sticker_switch_does_not_force_foreground_for_text_fork(self):
+        """fork 语义：表情包开关不劫持文字通道。
+
+        上游 4.1.7 在 STICKER_TEST_ON=True 时让 with_window_on_top 强制前台；
+        fork 改为 force_front=False——文字保持「先零焦点、失败才前台」，
+        表情包的前台由 send_sticker 自己处理（sticker_mixin.py）。
+        """
         action = Mock(return_value=True)
         foreground = Mock(return_value=False)
         restore = Mock()
@@ -534,19 +540,19 @@ class BridgeContractTest(unittest.TestCase):
             'STICKER_TEST_ON': True, 'BACKGROUND_SEND': True,
             'force_send_foreground': foreground,
             'snapshot_win_state': lambda: 'snapshot', 'restore_win_state': restore,
-            # fork：with_window_on_top 的还原收口到 quiet_restore（委托 restore_win_state）
+            # fork：还原收口到 quiet_restore（委托 restore_win_state）
             'quiet_restore': lambda snap: restore(snap),
         })
-        self.assertFalse(scope['with_window_on_top'](action))
-        action.assert_not_called()
-        foreground.assert_called_once_with(action, require_foreground=True)
-        restore.assert_called_once_with('snapshot')
-        scope['STICKER_TEST_ON'] = False
-        foreground.reset_mock()
+        # 后台发送成功（fn 返回 True）→ 不走前台
         self.assertTrue(scope['with_window_on_top'](action))
         action.assert_called_once()
         foreground.assert_not_called()
-
+        restore.assert_called_once_with('snapshot')
+        # 后台失败（fn 返回 False）→ 才拉前台重试一次
+        action2 = Mock(return_value=False, side_effect=[False, True])
+        scope['force_send_foreground'] = Mock(side_effect=lambda fn, **k: fn() and True or True)
+        scope['with_window_on_top'](action2)
+        scope['force_send_foreground'].assert_called_once()
     def setUp(self):
         self.cfg = {'features': {'stickers': True}, 'wechat': {}}
         self.http = SimpleNamespace(get=Mock(), post=Mock())
