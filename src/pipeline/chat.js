@@ -2169,13 +2169,20 @@ class Bot {
     const maxBubbles = Math.max(1, Number(this.config.chat.maxBubbles) || 2);
     const hard = LIMITS.maxOutputHard || 4000;
     const normalMaxChars = Math.max(20, Math.min(Number(isGroup ? this.config.chat.groupMaxChars : this.config.chat.privateMaxChars) || LIMITS.maxOutputNormal, hard));
-    const maxChars = msg.discussion
+    // 名单/列表回复放宽到名单上限：分泡器的「名单整段合成」规则给列表 600 字宽限，
+    // 但整轮硬截断发生在分泡**之前**，120 的私聊上限会先把名单切成「11 Tw」半个词
+    // （2026-11-17 实见 CS2 top20），600 的宽限永远轮不到。名单是结构化内容，
+    // 识别出列表（换行列表或行内连续编号）就按名单上限算；认真讨论档仍取窄。
+    let maxChars = msg.discussion
       ? Math.min(normalMaxChars, Math.max(20, Number(this.config.chat.discussionMaxChars) || LIMITS.maxOutputDiscussion))
       : normalMaxChars;
-    // 字数设置约束整轮正文，不能因分句、多气泡或讨论模式而放大。
+    if (persona.isListReply(text)) maxChars = Math.max(maxChars, persona.LIST_REPLY_CAP);
+    // 整轮硬截断：切了要带「…」，这个标记会被后面的分泡清洗剥掉，最后要补回来
+    let truncatedWhole = false;
     if (!decision.diaryExpanded && Array.from(text).length > maxChars) {
       text = Array.from(text).slice(0, maxChars - 1).join('').trimEnd() + '…';
       decision.finalText = text;
+      truncatedWhole = true;
     }
     const preferSeparate = Boolean(msg.separateRequested);
     let bubbles;
@@ -2202,6 +2209,11 @@ class Bot {
     }
     // 仅当本轮确实拆出了多段文字时，保留用户要求的文字发送方式。
     decision.separateText = preferSeparate && bubbles.length > 1;
+    // 整轮截断的「…」在上面各分泡路径的尾部标点清洗里会被剥掉；
+    // 它是「我没说完」的唯一提示，必须在最后一条气泡上补回来。
+    if (truncatedWhole && bubbles.length && !bubbles[bubbles.length - 1].endsWith('…')) {
+      bubbles[bubbles.length - 1] += '…';
+    }
     // emoji / 颜文字单独一条发，不粘在句末。
     // 以前回加和「颜文字用量」概率绑在一起（M28）：chance=0（关/吵架模式）时模型自带的
     // emoji 被剥掉就再也回不来。现在解耦：模型自带的 emoji 无论概率多少都按原设计

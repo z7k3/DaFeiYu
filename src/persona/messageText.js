@@ -31,6 +31,27 @@ function cleanIncomingForPersona(text, config, extraNames = []) {
   return { text: s, atMe: hadAlias, hadAlias };
 }
 
+// 名单行：以编号/序号/项目符号开头的行（1. xx / 1、xx / ① xx / - xx）
+const LIST_LINE = /^\s*(?:\d{1,2}[.、)）]?\s*\S|[\u2460-\u2473]\s*\S|[-*•]\s*\S)/;
+// 行内连续编号：模型经常把名单写在一行里（「1 ZywOo 2 donk 3 ropz …」），
+// 没有换行时靠「≥3 组连续的『编号+词条』」识别。误伤后果只是这条回复
+// 放宽到名单上限（600），比漏伤（名单被 120 字硬切）轻得多。
+const INLINE_LIST_RUN = /(?:^|[\s：:，,（(])\d{1,2}[.、)）]?\s+\S+(?:\s+\d{1,2}[.、)）]?\s+\S+){2,}/;
+// 名单类回复的整轮字数上限：与 splitBubbles 名单分支的宽限一致。
+// chat.js 的整轮硬截断必须认这个数，否则名单宽限永远轮不到（2026-11-17
+// 实见 CS2 top20 在 privateMaxChars=120 下被切成「11 Tw」半个词）。
+const LIST_REPLY_CAP = 600;
+
+/** 这条回复是不是名单/列表（换行列表或行内连续编号） */
+function isListReply(text) {
+  const raw = String(text || '').replace(/\r/g, '');
+  if (!raw) return false;
+  const lines = raw.split('\n').map((l) => l.trim()).filter(Boolean);
+  const hits = lines.filter((l) => LIST_LINE.test(l)).length;
+  if (hits >= 3 && hits >= lines.length - 2) return true;
+  return INLINE_LIST_RUN.test(raw);
+}
+
 function splitBubbles(text, { maxChars = 120, maxBubbles = 2, preferSeparate = false } = {}) {
   const raw = String(text || '').replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').trim();
   if (!raw) return [];
@@ -38,12 +59,11 @@ function splitBubbles(text, { maxChars = 120, maxBubbles = 2, preferSeparate = f
   const maxN = Math.max(1, Math.floor(Number(maxBubbles) || 1));
   // 名单/列表回复是一个整体：≥3 行以编号或项目符号开头的行拆散会把
   // 「1 ZywOo」「2 donk」变成一条人名一个气泡（2026-11-14 实见 CS2 top20
-  // 被拆成 6 条连发）。整段合成一条，上限放宽到 600 字。
-  const rawLinesForList = raw.split('\n').map((l) => l.trim()).filter(Boolean);
-  const LIST_LINE = /^\s*(?:\d{1,2}[.、)）]?\s*\S|[\u2460-\u2473]\s*\S|[-*•]\s*\S)/;
-  const listHit = rawLinesForList.filter((l) => LIST_LINE.test(l)).length;
-  if (listHit >= 3 && listHit >= rawLinesForList.length - 2) {
-    const cap = Math.max(600, limit * 6);
+  // 被拆成 6 条连发）。行内连续编号（「1 ZywOo 2 donk …」不带换行）同理：
+  // 按句切会把尾巴硬切丢掉（2026-11-17 实见 11 Tw）。整段合成一条，
+  // 上限放宽到 600 字。
+  if (isListReply(raw)) {
+    const cap = Math.max(LIST_REPLY_CAP, limit * 6);
     return [raw.length > cap ? raw.slice(0, cap - 1).trimEnd() + '…' : raw];
   }
 
@@ -79,4 +99,4 @@ function splitBubbles(text, { maxChars = 120, maxBubbles = 2, preferSeparate = f
   });
 }
 
-module.exports = { aliasList, cleanIncomingForPersona, splitBubbles };
+module.exports = { aliasList, cleanIncomingForPersona, splitBubbles, isListReply, LIST_REPLY_CAP };
