@@ -74,3 +74,6 @@ WhaleLauncher.exe.old
 
 # 本地宣传片制作工程（素材体积很大，只留在本机）
 promo-video/
+
+# 提交词/任务草稿等一次性文件（.msgC 教训：曾连着提交词草稿一起入库）
+.msg*
