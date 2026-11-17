@@ -9,6 +9,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { readJson } = require('../infra/jsonFile');
+const { recoverRestore, restoreFiles } = require('./backupRestore');
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -19,6 +20,7 @@ const SECRET_SETTING_KEYS = ['apiKey', 'keys', 'visionApiKey', 'voiceApiKey'];
 
 const FILES = [
   { key: 'memory', name: 'memory/' },
+  { key: 'personas', name: 'personas/' },
   { key: 'persona', name: 'persona.json' },
   { key: 'settings', name: 'settings.json' },
   { key: 'careState', name: 'care-state.json' },
@@ -70,6 +72,18 @@ function collectMemoryFiles(memoryDir) {
   return out;
 }
 
+/** 只打包一层用户文件（自建人设预设 / 删除标记），不递归子目录 */
+function collectFlatFiles(dir, pattern) {
+  const out = {};
+  try {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !pattern.test(entry.name)) continue;
+      try { out[entry.name] = fs.readFileSync(path.join(dir, entry.name), 'utf8'); } catch { /* 跳过读不了的文件 */ }
+    }
+  } catch { /* 目录不存在 */ }
+  return out;
+}
+
 function collect(root, { withSecrets = false } = {}) {
   const dir = dataDir(root);
   const bundle = {
@@ -81,8 +95,10 @@ function collect(root, { withSecrets = false } = {}) {
   };
   const memory = collectMemoryFiles(path.join(dir, 'memory'));
   if (Object.keys(memory).length) bundle.files.memory = memory;
+  const personas = collectFlatFiles(path.join(dir, 'personas'), /\.json$/i);
+  if (Object.keys(personas).length) bundle.files.personas = personas;
   for (const item of FILES) {
-    if (item.key === 'memory') continue;
+    if (item.key === 'memory' || item.key === 'personas') continue;
     const value = readJson(path.join(dir, item.name));
     if (value === null) continue;
     bundle.files[item.key] = item.key === 'settings' && !withSecrets ? scrubSecrets(value) : value;
@@ -184,7 +200,7 @@ function validateBundle(bundle) {
   }
   const files = bundle.files;
   if (!object(files)) throw new Error('备份里的 files 必须是对象');
-  for (const key of ['memory', 'store', 'settings', 'persona', 'careState', 'shareState']) {
+  for (const key of ['memory', 'personas', 'store', 'settings', 'persona', 'careState', 'shareState']) {
     if (Object.hasOwn(files, key) && !object(files[key])) throw new Error('备份里的 ' + key + ' 结构不对，已取消恢复');
   }
   if (!files.memory && !files.store) throw new Error('备份里没有可恢复的记忆');
@@ -192,73 +208,48 @@ function validateBundle(bundle) {
   for (const body of Object.values(files.memory || {})) {
     if (typeof body !== 'string') throw new Error('备份里的记忆文件内容必须是文本，已取消恢复');
   }
+  for (const body of Object.values(files.personas || {})) {
+    if (typeof body !== 'string') throw new Error('备份里的人设预设内容必须是文本，已取消恢复');
+  }
   // 路径穿越防护：记忆包里的 key 只能是相对路径
   for (const rel of Object.keys(files.memory || {})) {
     if (rel.includes('..') || path.isAbsolute(rel) || /^[a-zA-Z]:/.test(rel)) {
       throw new Error('备份里有非法路径，已取消恢复：' + rel);
     }
   }
+  for (const rel of Object.keys(files.personas || {})) {
+    if (rel.includes('..') || rel.includes('/') || rel.includes('\\') || path.isAbsolute(rel) || /^[a-zA-Z]:/.test(rel)) {
+      throw new Error('备份里有非法预设路径，已取消恢复：' + rel);
+    }
+  }
   return files;
-}
-
-function writeMemoryFiles(memoryDir, memory, { keepLegacy = true, keepArchive = true } = {}) {
-  const legacyDir = path.join(memoryDir, 'legacy');
-  const legacyBackup = keepLegacy && fs.existsSync(legacyDir)
-    ? fs.readdirSync(legacyDir).map((n) => ({ n, body: fs.readFileSync(path.join(legacyDir, n)) }))
-    : [];
-  // archive/ 是「只移动、不删除」的冷数据，不在 bundle 里。恢复当前活跃记忆时
-  // 必须先把它暂存出来，否则下面 rmSync(memoryDir) 会把几个月不活跃的会话一起删掉。
-  const archiveDir = path.join(memoryDir, 'archive');
-  const archiveTmp = `${memoryDir}.archive-keep-${process.pid}`;
-  let archiveKept = false;
-  if (keepArchive && fs.existsSync(archiveDir)) {
-    try {
-      fs.rmSync(archiveTmp, { recursive: true, force: true });
-      fs.cpSync(archiveDir, archiveTmp, { recursive: true });
-      archiveKept = true;
-    } catch { archiveKept = false; }
-  }
-  try {
-    fs.rmSync(memoryDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 40 });
-    fs.mkdirSync(memoryDir, { recursive: true });
-    for (const [rel, body] of Object.entries(memory || {})) {
-      const target = path.join(memoryDir, rel);
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, String(body), 'utf8');
-    }
-    if (legacyBackup.length) {
-      fs.mkdirSync(legacyDir, { recursive: true });
-      for (const item of legacyBackup) fs.writeFileSync(path.join(legacyDir, item.n), item.body);
-    }
-    if (archiveKept) {
-      fs.cpSync(archiveTmp, archiveDir, { recursive: true });
-    }
-  } finally {
-    if (archiveKept) {
-      try { fs.rmSync(archiveTmp, { recursive: true, force: true }); } catch { /* ignore */ }
-    }
-  }
 }
 
 /** 从 bundle 恢复；恢复前先另存当前记忆 */
 function restoreFrom(root, bundle) {
   const files = validateBundle(bundle);
-  writeSnapshot(root, 'before-restore');
   const dir = dataDir(root);
+  recoverRestore(dir);
+  writeSnapshot(root, 'before-restore');
   fs.mkdirSync(dir, { recursive: true });
   const restored = [];
+  const preparedFiles = {};
+  const preparedDirs = {};
 
   if (files.memory) {
-    writeMemoryFiles(path.join(dir, 'memory'), files.memory);
     restored.push('memory/');
   } else if (files.store) {
     // v1 备份：先落回旧文件，下一次启动会走迁移
-    fs.writeFileSync(path.join(dir, 'store.json'), JSON.stringify(files.store), 'utf8');
+    preparedFiles['store.json'] = JSON.stringify(files.store);
     restored.push('store.json（旧版，启动后自动迁移）');
+  }
+  if (files.personas) {
+    preparedDirs.personas = files.personas;
+    restored.push('personas/');
   }
 
   for (const item of FILES) {
-    if (item.key === 'memory' || !(item.key in files)) continue;
+    if (item.key === 'memory' || item.key === 'personas' || !(item.key in files)) continue;
     let value = files[item.key];
     if (item.key === 'settings') {
       const current = readJson(path.join(dir, item.name)) || {};
@@ -270,9 +261,10 @@ function restoreFrom(root, bundle) {
       if (value.provider && value.provider !== current.provider && value.apiKey === undefined) merged.apiKey = (merged.keys || {})[value.provider] || '';
       value = merged;
     }
-    fs.writeFileSync(path.join(dir, item.name), JSON.stringify(value, null, 2), 'utf8');
+    preparedFiles[item.name] = JSON.stringify(value, null, 2);
     restored.push(item.name);
   }
+  restoreFiles(dir, files.memory, preparedFiles, preparedDirs);
   return { restored, ...summarize(bundle) };
 }
 

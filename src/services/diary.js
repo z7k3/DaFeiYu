@@ -235,11 +235,16 @@ class DiaryService {
     const cfg = { ...this.config, persona: { ...persona, master: { names, wxids } } };
 
     const candidates = [];
-    for (const session of this.store.sessions.values()) {
-      if (!session || session.platform !== 'wechat') continue;
-      const chatId = String(session.chatId || session.key || '');
-      if (session.chatType !== 'private' && !/^wechat:u:/.test(chatId)) continue;
-      const wxid = chatId.replace(/^wechat:u:/, '');
+    for (const [key, session] of this.store.sessions) {
+      if (!session) continue;
+      const chatId = String(session.chatId || session.key || key || '');
+      const canonical = /^([^:]+):([ug]):(.+)$/.exec(chatId);
+      // 旧会话可能先以默认 web 元数据创建；规范 key 可确定来源和类型，
+      // 日记只读兼容这层差异，不修改记忆内容或存储算法。群聊 key 始终排除。
+      if (canonical ? canonical[1] !== 'wechat' || canonical[2] !== 'u'
+        : session.platform !== 'wechat' || session.chatType !== 'private') continue;
+      const wxid = canonical ? canonical[3] : chatId;
+      if (!wxid || /@chatroom$/i.test(wxid) || /^(filehelper|unknown)$/i.test(wxid)) continue;
       let hit = matchMaster(cfg, { platform: 'wechat', senderId: wxid, senderName: session.title || '' });
       let rank = hit.reason === 'wxid' ? 2 : (hit.isMaster ? 1 : 0);
       if (!rank) {
@@ -386,8 +391,12 @@ class DiaryService {
     if (this.skipExisting(day)) return 'existing';
     const target = this.ownerTarget();
     if (!target) {
-      this.logger?.debug?.(`[diary] empty day=${day} reason=no_owner_session`);
-      this.state = { status: 'empty', message: '还没配置主人，或找不到主人的私聊会话，未生成日记', file: '' };
+      const master = this.config.persona?.master || {};
+      const configured = Boolean(master.names?.length || master.wxids?.length || this.config.persona?.ownerName);
+      this.logger?.warn?.(`[diary] empty day=${day} reason=no_owner_session configured=${configured} sessions=${this.store.sessions.size}`);
+      this.state = { status: 'empty', message: configured
+        ? '找不到主人的微信私聊记录：请让主人给机器人发一条私聊消息，确认识别为主人后重试（群聊不作为日记素材）'
+        : '尚未设置主人：请在人设中选择主人，再与机器人私聊后重试', file: '' };
       return 'empty';
     }
     const persona = this.config.persona || {};

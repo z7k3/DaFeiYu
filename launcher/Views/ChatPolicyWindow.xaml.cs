@@ -5,7 +5,7 @@ using System.Windows;
 
 namespace WhaleLauncher.Views
 {
-    public partial class ChatPolicyWindow : Window
+    public partial class ChatPolicyWindow : System.Windows.Controls.UserControl
     {
         private readonly RuntimeSupervisor _sup;
         private readonly ContactCheckList _muted;

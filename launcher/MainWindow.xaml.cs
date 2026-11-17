@@ -36,6 +36,10 @@ namespace WhaleLauncher
         private bool _refreshing;
         private bool _memoryNoticeChecked;
 
+        // 官网和赞助入口固定在侧栏底部；链接写死，不依赖内核或网络配置，断网时浏览器自行提示。
+        private const string OfficialSite = "https://bot.zyyc.cc/";
+        private const string SponsorPage = "https://afdian.com/a/Banan1ce";
+
         private static readonly NavEntry[] NavKeys =
         {
             new NavEntry { Key = "状态", Label = "状态", Icon = Geometry.Parse("M4 4h7v7H4z M13 4h7v4h-7z M13 10h7v10h-7z M4 13h7v7H4z") },
@@ -55,6 +59,7 @@ namespace WhaleLauncher
 
             var dir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
             _sup = new RuntimeSupervisor(dir);
+            _sup.UpdateBlocked = true;
             _pluginMarket = new PluginMarket(dir);
 
             // 正式版不该显示成 v4.0-alpha：那会让用户以为自己装的是测试版，
@@ -82,7 +87,7 @@ namespace WhaleLauncher
             Loaded += async (_, __) =>
             {
                 Nav.SelectedIndex = 0;
-                _ = SilentUpdateCheckAsync();
+                await SilentUpdateCheckAsync(allowBlocking: true);
                 await RefreshAsync();
             };
             Closing += OnClosingDuringUpdate;
@@ -108,6 +113,8 @@ namespace WhaleLauncher
             var opening = UpdateToast.Visibility != Visibility.Visible;
             var manifest = _lastManifest?.Manifest;
             UpdateToastText.Text = text ?? "已检测到新版本";
+            UpdateToastWarning.Text = UpdateManifestService.ReleaseWarning(manifest);
+            UpdateToastWarning.Visibility = UpdateToastWarning.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
             UpdateToastNotes.Text = UpdateManifestService.ReleaseSummary(manifest);
             var details = UpdateManifestService.ReleaseDetails(manifest);
             if (opening || details != UpdateToastDetails.Text) UpdateToastDetailsExpander.IsExpanded = false;
@@ -130,7 +137,7 @@ namespace WhaleLauncher
 
         private void OnToastUpdateClick(object sender, RoutedEventArgs e)
         {
-            if (_lastManifest != null && _lastManifest.HasUpdate) _ = RunUpdateAsync(_lastManifest, askFirst: true);
+            if (_lastManifest != null && _lastManifest.HasUpdate) ApplyManifestPolicy(_lastManifest, interactive: true);
             else OnCheckUpdate(sender, null);
             e.Handled = true;
         }
@@ -208,7 +215,7 @@ namespace WhaleLauncher
         /// 拿清单结果决定界面形态。这里只做「提示 / 强制 / 禁止启动」的判定，
         /// 不下载；真下载交给 UpdateService 下载官方安装包。
         /// </summary>
-        private async Task SilentUpdateCheckAsync()
+        private async Task SilentUpdateCheckAsync(bool allowBlocking = false)
         {
             if (_updating || _checkingUpdates) return;
             _checkingUpdates = true;
@@ -216,7 +223,7 @@ namespace WhaleLauncher
             try
             {
                 var chk = await UpdateManifestService.FetchAsync(_sup.BaseDir);
-                ApplyManifestPolicy(chk, false, allowBlocking: false);
+                ApplyManifestPolicy(chk, false, allowBlocking);
             }
             finally { _checkingUpdates = false; }
         }
@@ -235,6 +242,7 @@ namespace WhaleLauncher
 
         private void ApplyManifestPolicy(ManifestCheck chk, bool interactive, bool allowBlocking = true)
         {
+            if (allowBlocking) _sup.UpdateBlocked = chk.Policy == UpdatePolicy.Force || chk.Policy == UpdatePolicy.Kill;
             switch (chk.Policy)
             {
                 case UpdatePolicy.Kill:
@@ -318,7 +326,8 @@ namespace WhaleLauncher
                     + (chk.Manifest.Message.Length > 0 ? chk.Manifest.Message + "\n\n" : "")
                     + "更新会下载官方安装包，校验 SHA256 后覆盖安装；data\\ 和 config.json 不会被改动。\n"
                     + "更新期间启动器会退出，结束后自动重新打开。\n\n现在更新吗？",
-                    "检查更新", okText: "现在更新", cancelText: "稍后")) return;
+                    "检查更新", okText: "现在更新", cancelText: "稍后",
+                    warningText: UpdateManifestService.ReleaseWarning(chk.Manifest))) return;
             }
 
             _updating = true;
@@ -554,6 +563,22 @@ namespace WhaleLauncher
 
         private void OnSettings(object sender, RoutedEventArgs e) => GoTo("设置");
 
+        private void OnOpenWebsite(object sender, RoutedEventArgs e) => OpenExternal(OfficialSite, "打开官网失败");
+
+        private void OnOpenSponsor(object sender, RoutedEventArgs e) => OpenExternal(SponsorPage, "打开赞助页面失败");
+
+        private void OpenExternal(string url, string failureTitle)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                AppDialog.Show(this, failureTitle + "：\n" + ex.Message + "\n\n可以手动在浏览器打开：" + url, failureTitle);
+            }
+        }
+
         // ── 顶栏动作 ────────────────────────────────────────────
         private bool AnythingRunning => _sup.NodeRunning || _sup.BridgeRunning;
 
@@ -561,25 +586,23 @@ namespace WhaleLauncher
         {
             if (_busy) return;
             _busy = true;
+            BtnToggle.IsEnabled = BtnRestart.IsEnabled = false;
             try
             {
                 if (AnythingRunning)
                 {
-                    BtnToggle.IsEnabled = false;
                     _sup.Say("— 停止中 —");
                     await Task.Run(() => _sup.StopAll());
                     await Task.Delay(200);
                 }
                 else
                 {
-                    BtnToggle.IsEnabled = false;
                     _sup.Say("— 启动中 —");
                     await _sup.StartAllAsync(clearRestartHistory: false);
                 }
             }
             finally
             {
-                BtnToggle.IsEnabled = true;
                 _busy = false;
                 await RefreshAsync();
             }
@@ -589,9 +612,9 @@ namespace WhaleLauncher
         {
             if (_busy) return;
             _busy = true;
+            BtnToggle.IsEnabled = BtnRestart.IsEnabled = false;
             try
             {
-                BtnRestart.IsEnabled = false;
                 _sup.Say("— 重启中 —");
                 await Task.Run(() => _sup.StopAll());
                 await Task.Delay(600);
@@ -599,7 +622,6 @@ namespace WhaleLauncher
             }
             finally
             {
-                BtnRestart.IsEnabled = true;
                 _busy = false;
                 await RefreshAsync();
             }
@@ -628,7 +650,7 @@ namespace WhaleLauncher
                 var s = await _sup.ProbeAsync();
 
                 // 内核每次就绪后查一次：启动时自动迁移了旧记忆就弹一次提示（ack 后不再弹）
-                if (!s.NodeReady) _memoryNoticeChecked = false;
+                if (!s.NodeReady || s.ExternalNode) _memoryNoticeChecked = false;
                 else if (!_memoryNoticeChecked)
                 {
                     _memoryNoticeChecked = true;
@@ -642,15 +664,22 @@ namespace WhaleLauncher
                     : (s.BrOnline ? (Brush)FindResource("Warn") : (Brush)FindResource("Idle"));
 
                 NodeStateText.Text = s.NodeUp ? "端口 " + s.Port : "内核未启动";
-                BridgeStateText.Text = s.BrOnline ? "在线" : (s.NodeUp ? "连接中" : "未启动");
+                BridgeStateText.Text = s.BrOnline ? "在线" : (s.BridgeUp ? "连接中" : s.NodeUp ? "离线" : "未启动");
 
-                var who = string.IsNullOrEmpty(s.BrAccountNick) ? s.BrAccount : s.BrAccountNick;
-                WechatStateText.Text = s.BrAccountOk ? "已登录" : (s.BrOnline ? "待确认" : "未登录");
+                var who = s.BrOnline ? (string.IsNullOrEmpty(s.BrAccountNick) ? s.BrAccount : s.BrAccountNick) : "";
+                WechatStateText.Text = s.BrOnline ? (s.BrAccountOk ? "已登录" : "待确认") : "未登录";
                 WechatLabel.ToolTip = string.IsNullOrEmpty(who) ? "微信" : "微信 · " + who;
-                BtnToggleText.Text = AnythingRunning ? "停止" : "启动";
+                var ownsProcesses = AnythingRunning;
+                const string externalTip = "内核已在后台运行，请用原来的方式管理它";
+                BtnToggleText.Text = ownsProcesses ? "停止" : s.ExternalNode ? "后台运行中" : "启动";
+                BtnToggle.IsEnabled = !_busy && (ownsProcesses || !s.ExternalNode);
+                BtnToggle.ToolTip = s.ExternalNode && !ownsProcesses ? externalTip : null;
+                BtnRestart.IsEnabled = !_busy && !s.ExternalNode;
+                BtnRestart.ToolTip = s.ExternalNode ? externalTip : "先停内核与桥接，再按固定顺序重启";
 
                 // 内核与端口已经并进顶栏的内核胶囊；这里只说桥接和需要处理的状态
                 var parts = new List<string>();
+                if (s.ExternalNode) parts.Add("内核由后台启动");
                 if (s.NodeUp)
                 {
                     if (s.BrOnline) parts.Add(s.BrLastSeenSec >= 0 ? $"桥接 {s.BrLastSeenSec} 秒前心跳" : "桥接在线");

@@ -48,4 +48,23 @@ function clipWithEllipsis(value, max) {
   return s.length > max ? s.slice(0, max) + '…' : s;
 }
 
-module.exports = { describeError };
+/**
+ * 错误文案：只给用户看的那一行，绝不回显原始异常对象或堆栈。
+ *
+ * HTTP 接口以前写 `String((err && err.message) || err)`，兜底会把整个异常对象
+ * 交给 String()；V8 现在只给 "Error: xxx"，但扫描器无法确认这一点（CWE-209）。
+ * 统一走这里：取 message、去首尾空白、只留第一行、限长、先脱敏。
+ *
+ * @param {*} err
+ * @param {string} [fallback]
+ * @param {{maxLength?:number}} [opts]
+ * @returns {string}
+ */
+function errorMessage(err, fallback = '操作失败', { maxLength = 200 } = {}) {
+  const raw = (err && err.message) || (typeof err === 'string' ? err : '') || '';
+  const line = redactSecrets(String(raw)).split(/[\r\n]/)[0].trim();
+  return line ? line.slice(0, maxLength) : fallback;
+}
+
+module.exports = { describeError, errorMessage };
+

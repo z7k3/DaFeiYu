@@ -5,12 +5,13 @@
  *
  * 约定（从现在开始每个新功能都要遵守）：
  *   1. 功能必须有开关，默认值写在这里，并进 DEFAULT_CONFIG；
- *   2. 开关必须能通过 API 改（POST /api/features，启动器「实验开关」就是调它）；
+ *   2. 开关必须能通过 API 改；启动器按所属能力专页或设置维护区提供唯一入口；
  *   3. 开关写回 config.json，重启/热重载都还在；
- *   4. 关掉开关 = 回到旧行为，不能关了就崩。
+ *   4. 关闭语义按每项说明；布局开关不回滚人格，不能把普通维护项都称为实验功能。
  */
 
 const { getByPath } = require('./objpath');
+const { parseBoolean } = require('./configValues');
 
 const REGISTRY = [
   {
@@ -20,6 +21,12 @@ const REGISTRY = [
     desc: '默认关闭。开启后可按傲娇、炸毛、其他三类上传表情包；关闭立即取消未发送任务，不挑图、不带回包字段、不轮询，管理接口停用。实验发送只在已打开的目标微信会话前台校验通过时进行，不自动切会话。',
     default: false,
     experimental: true,
+  },
+  {
+    key: 'javascriptPlugins', path: 'features.javascriptPlugins',
+    label: 'JavaScript 插件（实验性，完整系统权限）',
+    desc: '默认关闭。开启后仍须逐个确认插件权限。JavaScript 可访问网络、文件、系统命令及全部主程序 API，只启用信任的作者。关闭会停止受管理的插件进程并取消尚未执行的插件发送任务。',
+    default: false, experimental: true,
   },
   {
     key: 'envContext',
@@ -46,7 +53,7 @@ const REGISTRY = [
     key: 'staticSystem',
     path: 'features.staticSystem',
     label: '系统提示词静态化（前缀缓存）',
-    desc: 'system 只留人设/规则/日期，时间、心情、说话人、@、字数、梗、联网资料、动作账本全部挪到最后一轮消息的「本轮状态」。关掉 = 完全回到旧行为（system 里什么都塞）。',
+    desc: '开启后将本轮状态放在最后一条用户消息，保持系统前缀稳定；关闭后将状态放入 system。只改变位置，不改变人设、顶嘴人格或设置含义。',
     default: true,
   },
   {
@@ -130,9 +137,9 @@ function toBool(value, fallback = false) {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'number') return value !== 0;
   const s = String(value).trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on', '开'].includes(s)) return true;
-  if (['0', 'false', 'no', 'off', '关', ''].includes(s)) return false;
-  return fallback;
+  if (!s) return false;
+  const parsed = parseBoolean(s);
+  return parsed === undefined ? fallback : parsed;
 }
 
 function isOn(config, key) {

@@ -13,11 +13,14 @@
  *   npm run force-now                      # force=true ：立即强制
  *   node scripts/manifest-policy.js --force-from 4.0.8      # 只强制 >= 4.0.8
  *   node scripts/manifest-policy.js --force-from null       # 取消强制范围
+ *   node scripts/manifest-policy.js --force-versions 4.1.6  # 新客户端精确名单
+ *   node scripts/manifest-policy.js --force-versions '[]'   # 新客户端不强制
+ *   node scripts/manifest-policy.js --force-versions null   # 删除字段，返回旧协议
  *   node scripts/manifest-policy.js --kill-below 4.0.2     # 熔断
  *   node scripts/manifest-policy.js --kill-below null      # 取消熔断
  *   node scripts/manifest-policy.js --force-after-hours 6  # 时间闸改成 6 小时
  *
- * 改完记得 commit + push，客户端 1~5 分钟内生效。
+ * 正式清单只在安装包可用后发布；运行中的客户端通常每 6 小时检查一次。
  */
 
 const fs = require('node:fs');
@@ -42,11 +45,15 @@ if (wantHelp) {
   npm run force-now                      立即强制：force=true
   node scripts/manifest-policy.js --force-from 4.0.8      只强制 >= 4.0.8
   node scripts/manifest-policy.js --force-from null       取消强制范围
+  node scripts/manifest-policy.js --force-versions 4.1.6,4.1.2  精确版本名单，与旧 force 独立
+  node scripts/manifest-policy.js --force-versions '[]'        清空名单，不回落旧强制
+  node scripts/manifest-policy.js --force-versions null        删除字段，返回旧协议（慎用）
   node scripts/manifest-policy.js --kill-below 4.0.2       熔断：低于 4.0.2 不许启动
   node scripts/manifest-policy.js --kill-below null        取消熔断
   node scripts/manifest-policy.js --force-after-hours 6    时间闸改成 6 小时
 
-改完记得 git commit + push；客户端 1~5 分钟内生效。`);
+brake 会同时清空新名单；--force 单独使用时只改旧协议字段。
+改完确认安装包已可用再发布；运行中通常每 6 小时检查一次。`);
   process.exit(0);
 }
 
@@ -65,6 +72,27 @@ try {
 
 let touched = false;
 
+function validVersion(value) {
+  return typeof value === 'string' && /^[vV]?[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?$/.test(value)
+    && value.replace(/^[vV]/, '').split('.').every(part => Number(part) <= 2147483647);
+}
+
+const versionsArg = arg('force-versions');
+if (versionsArg !== undefined) {
+  if (versionsArg === 'null') delete m.force_versions;
+  else {
+    let versions;
+    try { versions = versionsArg.startsWith('[') ? JSON.parse(versionsArg) : versionsArg.split(','); }
+    catch { console.error('--force-versions 必须是版本列表或 JSON 数组'); process.exit(1); }
+    if (!Array.isArray(versions) || versions.length > 256 || !versions.every(validVersion)) {
+      console.error('--force-versions 每项必须是 x.y.z 或 x.y.z.w，最多 256 项；清空用 []');
+      process.exit(1);
+    }
+    m.force_versions = [...new Set(versions.map(version => version.replace(/^[vV]/, '')))];
+  }
+  touched = true;
+}
+
 const forceArg = arg('force');
 if (forceArg !== undefined) {
   if (forceArg === 'true') m.force = true;
@@ -79,12 +107,14 @@ if (forceArg !== undefined) {
 
 const killArg = arg('kill-below');
 if (killArg !== undefined) {
+  if (killArg !== 'null' && killArg !== '' && !validVersion(killArg)) { console.error('--kill-below 必须是 x.y.z / x.y.z.w 或 null'); process.exit(1); }
   m.kill_below = killArg === 'null' || killArg === '' ? null : killArg.replace(/^[vV]/, '');
   touched = true;
 }
 
 const forceFromArg = arg('force-from');
 if (forceFromArg !== undefined) {
+  if (forceFromArg !== 'null' && forceFromArg !== '' && !validVersion(forceFromArg)) { console.error('--force-from 必须是 x.y.z / x.y.z.w 或 null'); process.exit(1); }
   m.force_from = forceFromArg === 'null' || forceFromArg === '' ? null : forceFromArg.replace(/^[vV]/, '');
   touched = true;
 }
@@ -118,6 +148,7 @@ console.log('  manifest_version   ' + m.manifest_version);
 console.log('  latest             ' + m.latest);
 console.log('  force              ' + forceText);
 console.log('  force_from         ' + (m.force_from || 'null'));
+console.log('  force_versions     ' + (Object.hasOwn(m, 'force_versions') ? JSON.stringify(m.force_versions) : '缺失（旧协议）'));
 console.log('  kill_below         ' + killText);
 console.log('  force_after_hours  ' + m.force_after_hours);
 console.log('');

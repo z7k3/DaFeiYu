@@ -52,6 +52,11 @@ function clampInt(v, min, max, fallback) {
   return Math.min(max, Math.max(min, Math.trunc(n)));
 }
 
+function stripInternalTimestamps(text) {
+  // 只去掉行首的内部标记，保留正常回答中的日期、时间和引用内容。
+  return String(text ?? '').replace(/^[ \t]*(?:\[(?:\d{4}-)?\d{2}-\d{2}[ \t]+\d{2}:\d{2}(?::\d{2})?\][ \t]*)+/gm, '').trim();
+}
+
 module.exports = {
   SENSITIVE_PATTERNS,
   sanitizeForModel,
@@ -59,4 +64,5 @@ module.exports = {
   formatStamp,
   normalizeForCompare,
   clampInt,
+  stripInternalTimestamps,
 };

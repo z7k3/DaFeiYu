@@ -19,3 +19,4 @@ imageio-ffmpeg==0.8.1
 zstandard==0.25.0
 opencv-python==5.0.0.93
 pyautogui==0.9.54
+silk-python==0.2.9

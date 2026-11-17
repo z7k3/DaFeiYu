@@ -16,15 +16,19 @@ public sealed partial class MomentsPage : UserControl
     };
 
     readonly RuntimeSupervisor sup;
+    readonly ConfigSaver saver;
     bool reading;
     bool loadingSettings;
     bool publishSettingsLoaded;
     int viewGeneration;
+    bool loadingPage;
+    bool settingsLoaded;
 
     public MomentsPage(RuntimeSupervisor supervisor)
     {
         InitializeComponent();
         sup = supervisor;
+        saver = new ConfigSaver(supervisor);
         ActionBox.ItemsSource = Array.ConvertAll(Actions, a => a.Label);
         ActionBox.SelectedIndex = 0;
 
@@ -37,12 +41,17 @@ public sealed partial class MomentsPage : UserControl
         BtnPublishHappy.Click += async (_, _) => await OpenPublishFolderAsync("happy");
         BtnPublishCute.Click += async (_, _) => await OpenPublishFolderAsync("cute");
         BtnPublishAngry.Click += async (_, _) => await OpenPublishFolderAsync("angry");
-        Loaded += async (_, _) => await Task.WhenAll(LoadSettingsAsync(), LoadLatestAsync(), LoadPublishAsync());
+        Loaded += async (_, _) => {
+            if (loadingPage) return;
+            loadingPage = true;
+            try { await Task.WhenAll(LoadSettingsAsync(), LoadLatestAsync(), LoadPublishAsync()); }
+            catch (Exception ex) { if (IsLoaded) StatusText.Text = Api.FriendlyError(ex); }
+            finally { loadingPage = false; }
+        };
 
         // 离开页面即清空第三方正文与输入，并让旧请求停止回填。
         Unloaded += (_, _) => {
             viewGeneration++;
-            publishSettingsLoaded = false;
             BtnRefreshPublish.IsEnabled = true;
             TxtOutput.Clear();
             StatusText.Text = "";
@@ -125,10 +134,13 @@ public sealed partial class MomentsPage : UserControl
 
     async Task LoadSettingsAsync()
     {
+        if (settingsLoaded) return;
+        var generation = viewGeneration;
         loadingSettings = true;
         try
         {
             var res = await sup.ReadConfigurationAsync("/api/moments/settings");
+            if (generation != viewGeneration) return;
             if (!res.Ok) { AutoStatus.Text = "读不到自动策略设置：" + res.Error; return; }
             ChkAutoLike.IsChecked = res.Bool("autoLike");
             var hours = (int)res.Long("autoReadEveryHours");
@@ -153,6 +165,7 @@ public sealed partial class MomentsPage : UserControl
             var max = res.Long("autoLikeMaxPerDay");
             AutoStatus.Text = res.Bool("autoLike")
                 ? $"自动点赞已开，每天最多 {max} 条。" : "自动点赞已关。";
+            settingsLoaded = true;
         }
         catch (Exception ex) { AutoStatus.Text = "读不到自动策略设置：" + Api.FriendlyError(ex); }
         finally { loadingSettings = false; }
@@ -163,14 +176,12 @@ public sealed partial class MomentsPage : UserControl
         if (loadingSettings) return;
         try
         {
-            var res = await sup.SaveConfigurationAsync("/api/moments/settings", new {
-                autoLike = ChkAutoLike.IsChecked == true,
-                autoReadEveryHours = SelectedAutoReadHours(),
+            var res = await saver.SaveAsync(() => new System.Collections.Generic.Dictionary<string, object> {
+                ["moments.autoLike"] = ChkAutoLike.IsChecked == true,
+                ["moments.autoReadEveryHours"] = SelectedAutoReadHours(),
             });
             if (!res.Ok) { AutoStatus.Text = Api.Message(res); return; }
-            var max = res.Long("autoLikeMaxPerDay");
-            AutoStatus.Text = res.Bool("autoLike")
-                ? $"自动策略已保存；每天最多 {max} 条。" : "自动策略已保存；自动点赞已关闭。";
+            AutoStatus.Text = "自动策略已保存。";
         }
         catch (Exception ex) { AutoStatus.Text = "保存失败：" + Api.FriendlyError(ex); }
     }
@@ -223,13 +234,16 @@ public sealed partial class MomentsPage : UserControl
         if (items.ValueKind == JsonValueKind.Array)
             foreach (var item in items.EnumerateArray())
             {
+                // 历史快照可比单次读取大得多，限制 UI 文本量，避免切页时布局阻塞。
+                if (count >= 100 || text.Length >= 100000) break;
                 count++;
                 var name = item.GetProperty("nickname").GetString();
                 var seconds = item.GetProperty("create_time").GetDouble();
                 var time = seconds >= 0 && seconds <= 253402300799
                     ? DateTimeOffset.FromUnixTimeSeconds((long)seconds).ToLocalTime().ToString("yyyy-MM-dd HH:mm") : "时间未知";
                 text.AppendLine($"{name} · {time}");
-                text.AppendLine(item.GetProperty("text").GetString());
+                var body = item.GetProperty("text").GetString() ?? "";
+                text.AppendLine(body.Length > 4000 ? body.Substring(0, 4000) + "…" : body);
                 text.AppendLine($"图片 {item.GetProperty("imageCount")} / 视频 {item.GetProperty("videoCount")}");
                 text.AppendLine();
             }

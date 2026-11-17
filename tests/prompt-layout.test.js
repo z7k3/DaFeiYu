@@ -11,7 +11,7 @@
  *   1. 同一天内 system 字节稳定（私聊/群聊、换个人说话都不变）；
  *   2. 日期只在 system 里出现一次，每天跟着 now 变；
  *   3. 每轮会变的东西在尾部，时间戳由 ts 确定性推导。
- * 以及回滚开关 features.staticSystem=false 必须和改造前逐字一致（tests/fixtures/prompt-legacy）。
+ * 以及 features.staticSystem=false 只移动动态块，不改变当前设置和人格语义。
  */
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -55,7 +55,7 @@ test('同一天内 system 字节稳定：私聊换个人说话、隔一分钟都
   assert.equal(c, d, '群里换个人说话，system 必须一字节都不差');
 });
 
-test('system 里只有静态块：心情/说话人/字数/@/联网/链接/对喷/动作账本都在尾部', () => {
+test('system 里只有静态块：说话人/字数/@/联网/链接/对喷/动作账本在尾部，不注入心情', () => {
   const cfg = config();
   const msg = groupMsg({
     senderName: '阿螈', text: '@鲸鲸 北京天气怎么样',
@@ -71,7 +71,7 @@ test('system 里只有静态块：心情/说话人/字数/@/联网/链接/对喷
     '对方发的链接', '第二条人格', '最近做过的事', '群平均每句', '学这个群说话']) {
     assert.ok(!parts.system.includes(leaking), `system 里不该出现「${leaking}」：那是每轮会变的内容`);
   }
-  for (const expected of ['语气底子', '最多约', '当前上下文参与者', '刚联网搜到的资料', '对方发的链接',
+  for (const expected of ['最多约', '当前上下文参与者', '刚联网搜到的资料', '对方发的链接',
     '第二条人格', '最近做过的事', '学这个群说话']) {
     assert.ok(parts.tail.includes(expected), `尾部应该带上「${expected}」`);
   }
@@ -101,7 +101,7 @@ test('日期行只在 system 里出现一次，跟着 now 走（不写死年份�
   assert.match(sys1, /按下面那行「今天是…」回答/);
 });
 
-test('历史消息时间戳：首条带、间隔不到 5 分钟不带、≥5 分钟带、跨天带', () => {
+test('历史与当前消息不注入时间戳，跨天也只保留消息顺序', () => {
   const at = (day, h, m) => new Date(2026, 10, day, h, m, 0).getTime();
   const history = [
     { role: 'user', name: '阿甲', uid: 'a', text: '九点那条', ts: at(3, 9, 0) },
@@ -112,11 +112,9 @@ test('历史消息时间戳：首条带、间隔不到 5 分钟不带、≥5 分
   const turns = buildTurns({ chatType: 'private', senderName: '小海', text: '现在这条', ts: at(3, 9, 10) }, history, '', '');
   const text = turns.map((t) => t.content).join('\n');
 
-  assert.match(text, /\[11-03 09:00\] 九点那条/, '首条历史要带时间戳');
-  assert.doesNotMatch(text, /\[11-03 09:01\]/, '隔 1 分钟不该再打标记（太吵，也省 token）');
-  assert.match(text, /\[11-03 09:06\] 六分钟后/, '隔了 5 分钟以上要重新打标记');
-  assert.match(text, /\[11-04 00:10\] 跨天那条/, '跨天必须带日期，否则模型不知道过了一天');
-  assert.match(text, /\[11-03 09:10\] 现在这条/, '当前这条永远带时间戳');
+  assert.doesNotMatch(text, /\[\d{2}-\d{2} \d{2}:\d{2}\]/);
+  for (const item of history) assert.ok(text.includes(item.text));
+  assert.ok(text.endsWith('现在这条'));
 });
 
 test('同一条消息当「当前」和当「历史」，时间戳字符串完全一致', () => {
@@ -129,8 +127,8 @@ test('同一条消息当「当前」和当「历史」，时间戳字符串完�
   }).prompt;
 
   const stamps = (s) => (s.match(/\[\d{2}-\d{2} \d{2}:\d{2}\]/g) || []);
-  assert.deepEqual([...new Set(stamps(asCurrent))], ['[11-03 15:48]']);
-  assert.ok(stamps(asHistory).includes('[11-03 15:48]'), '当历史时渲染出来的字符串必须一模一样');
+  assert.deepEqual(stamps(asCurrent), []);
+  assert.deepEqual(stamps(asHistory), []);
 });
 
 test('当前消息顺序固定：正文 → 记忆块 → 本轮状态', () => {
@@ -153,8 +151,7 @@ test('当前消息顺序固定：正文 → 记忆块 → 本轮状态', () => {
   assert.equal(parts.tail.startsWith('【本轮状态】'), true);
 });
 
-test('features.staticSystem=false：system 与改造前逐字一致（回滚开关）', () => {
-  const dir = path.join(__dirname, 'fixtures', 'prompt-legacy');
+test('features.staticSystem=false：只移动状态，不回滚人设与能力语义', () => {
   const events = [{ ts: new Date(2026, 10, 3, 15, 40, 0).getTime(), type: 'sticker', detail: '开心/wave.gif', status: 'confirmed' }];
   const scenarios = {
     'default-private': {
@@ -194,16 +191,16 @@ test('features.staticSystem=false：system 与改造前逐字一致（回滚开�
   };
 
   for (const [name, ctx] of Object.entries(scenarios)) {
-    const want = fs.readFileSync(path.join(dir, `${name}.txt`), 'utf8');
-    assert.equal(persona.buildSystem(ctx), want, `旧行为（${name}）必须逐字一致，回滚才不会翻车`);
+    const modern = persona.buildPromptParts({ ...ctx, config: { ...ctx.config, features: { ...ctx.config.features, staticSystem: true } } });
+    assert.equal(persona.buildSystem(ctx), [modern.system, modern.tail].filter(Boolean).join('\n\n'), `${name} 仅改变状态位置`);
   }
 
-  // 旧断言也要在 legacy 模式下跑一遍：时间、场景、语气底子都还在 system 里
+  // 非静态布局同样提供日期、场景和能力，但不恢复随机心情。
   const legacy = scenarios['default-group'];
   const sys = persona.buildSystem(legacy);
-  assert.match(sys, /【此刻】现在是2026年11月3日 周二 15:48/);
-  assert.match(sys, /【场景】你在微信群「深海鱼塘」里，刚看到「阿螈」说话/);
-  assert.match(sys, /语气底子/);
+  assert.match(sys, /今天是 2026年11月3日 周二/);
+  assert.match(sys, /在微信群「深海鱼塘」里，这条是「阿螈」说的/);
+  assert.doesNotMatch(sys, /语气底子/);
   assert.match(sys, /刚联网搜到的资料/);
   assert.match(sys, /【最近做过的事/, '动作账本在旧行为里也在 system');
 });
@@ -212,5 +209,5 @@ test('静态模式下 buildTurnState 为空转（旧行为不再拼尾部）', (
   const cfg = config({ features: { staticSystem: false } });
   const parts = persona.buildPromptParts({ config: cfg, msg: privateMsg({ text: '在吗' }), now: NOW });
   assert.equal(parts.tail, '');
-  assert.match(parts.system, /【此刻】/, '旧行为里时间还在 system');
+  assert.match(parts.system, /【本轮状态】/, '关闭静态布局时状态在 system');
 });

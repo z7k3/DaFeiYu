@@ -1,8 +1,26 @@
 # Api 3 消息流程插件
 
-本地开发版新增消息插件。公开上架需要市场同时提供 index-v3.json 和 Api 3 校验。市场投稿目标仍为 Banan1cee/whale-girl-plugins 的 main。
+4.1.0 支持 Wasm 消息插件，市场通过 index-v3.json 分发并进行 Api 3 校验。网络、检索、定时和完整系统权限能力见最低 4.1.2 的「插件JavaScriptApi4.md」。市场投稿目标仍为 Banan1cee/whale-girl-plugins 的 main。
 
 ## 安装和授权
+
+### 同时兼容旧 4.x 与正式 1.x
+
+迁移版 4.1.6.1 起，原有 plugin.json 可添加以下兼容字段，市场条目同步填写，其他必填字段不变：
+
+```json
+{
+  "MinAppVersion": "4.1.0",
+  "appCompatibility": [
+    { "appEpoch": 1, "minAppVersion": "4.1.0" },
+    { "appEpoch": 2, "minAppVersion": "1.0.0" }
+  ]
+}
+```
+
+一个 Wasm 包可声明两套范围，先选代次再比较版本；顶层范围保留给旧客户端。新字段缺省的旧包不会自动获得正式代兼容。正式版 1.0.0 是重新编号，不表示历史 1.x 已有 Api 3。可选上限、单代包及外部市场校验边界见 [插件市场规范](插件市场规范.md)。
+
+### 包结构与授权
 
 ZIP 根目录放 plugin.json 和 plugin.wasm。清单 Api 填 3，Kind 填 message，Hooks 声明需要的扩展点，Permissions 声明附加权限。MinAppVersion 填 4.1.0。其他名称、作者、版本及描述字段沿用原规则。
 

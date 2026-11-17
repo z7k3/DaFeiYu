@@ -4,7 +4,7 @@ const path = require('node:path');
 const { json, readBody } = require('../util');
 const { isLoopbackRequest } = require('../security');
 const migrate = require('../../memory/migrate');
-const { describeError } = require('../../infra/errors');
+const { describeError, errorMessage } = require('../../infra/errors');
 
 /**
  * 旧版（3.x）记忆的检测 / 转换。
@@ -74,7 +74,7 @@ module.exports = function register(router) {
       return json(res, 200, { ok: true, ...status });
     } catch (err) {
       runtime.logger.warn('旧记忆检测失败：' + describeError(err));
-      return json(res, 500, { ok: false, error: '检测失败：' + ((err && err.message) || err) });
+      return json(res, 500, { ok: false, error: '检测失败：' + errorMessage(err) });
     }
   });
 
@@ -127,7 +127,7 @@ module.exports = function register(router) {
       });
     } catch (err) {
       runtime.logger.warn('手动转换旧记忆失败：' + describeError(err));
-      return json(res, 500, { ok: false, error: '转换失败：' + ((err && err.message) || err) });
+      return json(res, 500, { ok: false, error: '转换失败：' + errorMessage(err) });
     } finally {
       running = false;
     }

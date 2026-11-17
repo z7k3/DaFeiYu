@@ -86,7 +86,7 @@ test('正常回答不会被改动，也不会白跑一次重写', async () => {
 test('提示词里明确禁止复读', async () => {
   const { bot, cleanup } = makeBot({ replies: ['随便'] });
   const d = await bot.decide(g('@鲸鲸 在吗'));
-  assert.match(d.system, /不要复读对方刚说的话/);
+  assert.match(d.system, /不复读对方的话/);
   cleanup();
 });
 

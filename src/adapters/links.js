@@ -13,6 +13,8 @@ const https = require('node:https');
 const dns = require('node:dns');
 const net = require('node:net');
 const { URL } = require('node:url');
+const path = require('node:path');
+const { Worker } = require('node:worker_threads');
 const { decodeEntities } = require('./search/html');
 
 const URL_RE = /https?:\/\/[^\s<>"'（）()【】\[\]\u4e00-\u9fa5]+/g;
@@ -109,12 +111,16 @@ function isPrivateHost(hostname) {
   return false;
 }
 
-function fetchUrl(urlString, { timeoutMs = 6000, maxBytes = 700 * 1024, redirects = 4, allowPrivate = false, deadline = 0 } = {}) {
+function fetchUrl(urlString, { timeoutMs = 6000, maxBytes = 700 * 1024, redirects = 4, allowPrivate = false, deadline = 0, signal } = {}) {
   return new Promise((resolve) => {
     let settled = false;
     let timer = null;
     let activeRequest = null;
-    const done = (v) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
+    let abort = null;
+    const done = (v) => { if (!settled) { settled = true; clearTimeout(timer); if (abort) signal?.removeEventListener('abort', abort); resolve(v); } };
+    abort = () => { done({ ok: false, error: 'aborted' }); activeRequest?.destroy(); };
+    if (signal?.aborted) return abort();
+    signal?.addEventListener('abort', abort, { once: true });
     // 整条重定向链共用一个总预算：以前每跳都重新计时，4 跳最坏 6×4=24 秒
     const budget = Number(deadline) > 0 ? Number(deadline) : Date.now() + Math.max(1, Number(timeoutMs) || 6000);
     const remaining = () => Math.max(1, budget - Date.now());
@@ -170,7 +176,7 @@ function fetchUrl(urlString, { timeoutMs = 6000, maxBytes = 700 * 1024, redirect
             let next;
             try { next = new URL(res.headers.location, parsed).toString(); }
             catch { return done({ ok: false, error: 'bad_url', status }); }
-            fetchUrl(next, { timeoutMs, maxBytes, redirects: redirects - 1, allowPrivate, deadline: budget }).then(done);
+            fetchUrl(next, { timeoutMs, maxBytes, redirects: redirects - 1, allowPrivate, deadline: budget, signal }).then(done);
             return;
           }
           const chunks = [];
@@ -210,6 +216,36 @@ function fetchUrl(urlString, { timeoutMs = 6000, maxBytes = 700 * 1024, redirect
       if (Date.now() >= budget) return done({ ok: false, error: 'timeout' });
       start(address, family);
     });
+  });
+}
+
+let activeParsers = 0;
+function parsePageBounded(html, url, { timeoutMs, signal }) {
+  if (signal?.aborted) return Promise.resolve({ error: 'aborted' });
+  if (activeParsers >= 2) return Promise.resolve({ error: 'parse_busy' });
+  return new Promise(resolve => {
+    let worker, timer, settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      activeParsers -= 1;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      worker?.terminate().catch(() => {});
+      resolve(value);
+    };
+    const abort = () => finish({ error: 'aborted' });
+    activeParsers += 1;
+    try {
+      worker = new Worker(path.join(__dirname, 'linkPageWorker.js'), {
+        workerData: { html, url }, resourceLimits: { maxOldGenerationSizeMb: 32 },
+      });
+      worker.once('message', finish);
+      worker.once('error', () => finish({ error: 'parse_failed' }));
+      worker.once('exit', () => finish({ error: 'parse_failed' }));
+      timer = setTimeout(() => finish({ error: 'parse_timeout' }), Math.max(1, Math.min(1000, timeoutMs)));
+      signal?.addEventListener('abort', abort, { once: true });
+    } catch { finish({ error: 'parse_failed' }); }
   });
 }
 
@@ -257,7 +293,8 @@ const cache = new Map();
 /**
  * 读取一个链接：返回 { ok, url, kind, title, description, article, error }
  */
-async function describeLink(urlString, { timeoutMs = 6000, cacheMinutes = 60, allowPrivate = false } = {}) {
+async function describeLink(urlString, { timeoutMs = 6000, cacheMinutes = 60, allowPrivate = false, signal } = {}) {
+  if (signal?.aborted) return { ok: false, url: String(urlString || '').slice(0, 500), error: 'aborted' };
   const key = String(urlString || '').slice(0, 500);
   // 允许/不允许私网的结果要分开缓存，否则「试过一次被挡」会一直挡
   const cacheKey = key + (allowPrivate ? '|p' : '');
@@ -265,25 +302,27 @@ async function describeLink(urlString, { timeoutMs = 6000, cacheMinutes = 60, al
   const hitTtl = hit && Number.isFinite(hit.ttl) ? hit.ttl : cacheMinutes;
   if (hit && Date.now() - hit.at < hitTtl * 60 * 1000) return { ...hit.value, cached: true };
 
-  const res = await fetchUrl(key, { timeoutMs, allowPrivate });
+  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || 6000);
+  const res = await fetchUrl(key, { timeoutMs, allowPrivate, deadline, signal });
   let value;
   if (!res.ok) {
     value = { ok: false, url: key, kind: kindOf(key), error: res.error };
   } else {
-    const info = parsePage(res.body, res.finalUrl);
-    const ok = Boolean(info.title || info.description || info.article);
+    const info = await parsePageBounded(res.body, res.finalUrl, { timeoutMs: deadline - Date.now(), signal });
+    const ok = !info.error && Boolean(info.title || info.description || info.article);
     value = {
       ok,
-      url: info.url,
-      kind: info.kind,
+      url: info.url || key,
+      kind: info.kind || kindOf(key),
       title: info.title,
       description: info.description,
       article: info.article,
-      error: ok ? '' : 'empty',
+      error: info.error || (ok ? '' : 'empty'),
     };
   }
   // 失败结果只缓存很短时间：一次 DNS/超时抖动不该让同一个链接一小时内
   // 都被判成“打不开”，后续重试根本没发请求。
+  if (value.error === 'aborted' || value.error === 'parse_busy') return value;
   cache.set(cacheKey, {
     at: Date.now(),
     value,

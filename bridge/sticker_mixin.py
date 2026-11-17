@@ -59,7 +59,7 @@ class StickerMixin:
 
     def sticker_activity_allowed(self, username=''):
         try:
-            return not (self.foreground_is_fullscreen() or (username and (username in self.dead_chats or not self.group_is_alive(username))))
+            return not (self.foreground_is_fullscreen() or (username and (self.chat_paused(username) or not self.group_is_alive(username))))
         except Exception:
             return False
 
@@ -117,6 +117,9 @@ class StickerMixin:
                         if not current_gui.use_window(hwnd) or int(current_gui.main_hwnd) != hwnd:
                             return G.sticker_result('failed', 'unable to bind the verified account window')
                         uia = getattr(current_gui, '_uia', None)
+                        if uia is None:
+                            # 冷启动/驱动重建后缓存未初始化不等于不可用，先走正式获取入口。
+                            uia = current_gui._get_uia()
                         if uia is None:
                             return G.sticker_result('failed', 'UIA target proof is unavailable; no OCR fallback')
                         search_keys = [chat_display_name] + [a for a in aliases if a and a != chat_display_name]
@@ -212,6 +215,29 @@ class StickerMixin:
             if self.sticker_config_now() is not None:
                 G.log('表情包结果：', outcome['status'], outcome['error'])
         return outcome
+
+    def cancel_reply_sticker(self, item, expected_username):
+        """Release a reserved reply without claiming it or touching WeChat."""
+        if not isinstance(item, dict) or not expected_username or self.sticker_config_now() is None:
+            return False
+        if not item.get('id') or not item.get('generation') or item.get('chatUsername') != expected_username:
+            return False
+        payload = {'id': item['id'], 'generation': item['generation'], 'chatUsername': expected_username}
+        try:
+            response = G.LOCAL_HTTP.post(self.sticker_base + '/api/stickers/cancel',
+                                         json=payload, headers=self.sticker_headers, timeout=3)
+            body = response.json() if response.status_code == 200 else None
+            cancelled = bool(isinstance(body, dict) and body.get('ok') is True
+                             and isinstance(body.get('item'), dict)
+                             and body['item'].get('status') == 'cancelled'
+                             and body['item'].get('id') == item['id']
+                             and body['item'].get('generation') == item['generation']
+                             and body['item'].get('chatUsername') == expected_username)
+            G.log('[sticker] stage=cancel result=%s reason=reply_delivery_stopped' % ('cancelled' if cancelled else 'unconfirmed'))
+            return cancelled
+        except Exception as exc:
+            G.log('[sticker] stage=cancel result=unconfirmed reason=cancel_request_failed type=%s' % type(exc).__name__)
+            return False
 
     def sticker_test_loop(self):
         """常驻但默认休眠：关闭时不访问任何表情包接口、文件或窗口，也不打印日志。"""

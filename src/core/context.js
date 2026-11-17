@@ -4,7 +4,7 @@ const { createHash } = require('node:crypto');
 const { sanitizeForModel, formatStamp } = require('./text');
 const { stripMasterDispute } = require('./identity');
 const time = require('../infra/time');
-const history = require('./history');
+const historyTools = require('./history');
 const { estimateBudgetTokens } = require('../infra/textBudget');
 
 // Qwen 需要足够的上下文才能分清群里是谁在说话；按字符限额而不是只给几条消息。
@@ -62,15 +62,8 @@ function buildTurns(msg, history, memoryBlock = '', tailBlock = '', timeZone = '
       return `${m.name || m.senderName || '群友'}（参与者${tag}）`;
     };
     const entries = [];
-    let previousTs = 0;
-    const stampOf = makeStamper(timeZone);
     for (const event of past) {
       if (!event.text || event.error) continue;
-      const ts = Number(event.ts || 0);
-      const gap = previousTs && ts - previousTs > 1800000 ? `[间隔约 ${Math.round((ts - previousTs) / 60000)} 分钟]\n` : '';
-      previousTs = ts || previousTs;
-      // 每条事件前的时间戳同样只在首条 / 隔 5 分钟 / 跨天时出现
-      const stamp = stampOf(ts);
       const record = {
         发言人: speaker(event),
         内容: sanitizeForModel(String(event.text).slice(0, MAX_TURN_CHARS)),
@@ -79,11 +72,9 @@ function buildTurns(msg, history, memoryBlock = '', tailBlock = '', timeZone = '
       if (event.mentionedNames?.length) record.其他提及对象 = event.mentionedNames;
       if (event.inferredTargetNames?.length) record.可能承接的对象 = event.inferredTargetNames;
       if (event.replyToName) record.引用对象 = event.replyToName;
-      entries.push(gap + stamp + JSON.stringify(record));
+      entries.push(JSON.stringify(record));
     }
-    // 当前这条永远带时间戳：它就是「现在」。
-    const currentStamp = `[${formatStamp(Number(msg.ts) || Date.now(), timeZone)}] `;
-    const current = currentStamp + JSON.stringify({
+    const current = JSON.stringify({
       发言人: speaker(msg),
       // 挨骂的时候要让它看见原话，否则不知道对面骂了什么，回怼就没劲
       内容: String(msg.fight ? String(msg.cleanText || msg.text) : sanitizeForModel(msg.cleanText || msg.text))
@@ -107,7 +98,7 @@ function buildTurns(msg, history, memoryBlock = '', tailBlock = '', timeZone = '
       const buildSummary = () => {
         const texts = dropped
           .map((line) => {
-            const obj = history.parseHistoryLine(line);
+            const obj = historyTools.parseHistoryLine(line);
             if (!obj) return '';
             return `${obj.发言人 ? String(obj.发言人).replace(/（参与者[0-9a-f]+）/, '') : ''}：${String(obj.内容 || '').slice(0, 24)}`;
           })
@@ -140,34 +131,19 @@ function buildTurns(msg, history, memoryBlock = '', tailBlock = '', timeZone = '
     if (!trimmed) return;
     turns.push({ role, content: trimmed });
   };
-  let previousTs = 0;
-  const stampOf = makeStamper(timeZone);
   for (const m of past) {
     if (m.error || !m.text) continue;
-    const ts = Number(m.ts || 0);
-    let gap = '';
-    if (isGroup && previousTs && ts - previousTs > 30 * 60 * 1000) {
-      gap = `[中间相隔 ${Math.round((ts - previousTs) / 60000)} 分钟]\n`;
-    }
-    previousTs = ts || previousTs;
-    // 时间戳节流必须对每条消息都走一遍（包括 assistant），「上一条」才算得准
-    const stamp = stampOf(ts);
     if (m.role === 'assistant') {
-      push('assistant', isGroup ? `${gap}${stamp}[鲸鲸] ${m.text}` : m.text, false);
+      push('assistant', m.text);
     } else {
-      const label = isGroup ? `${stamp}[${m.name || '群友'}] ${m.text}` : `${stamp}${m.text}`;
-      push('user', sanitizeForModel(gap + label), false);
+      push('user', sanitizeForModel(m.text));
     }
   }
   // 保证最后一条是当前用户消息，并明确这是当前事件而非历史。
   const current = msg.cleanText || msg.text;
   const currentBody = msg.fight ? String(current) : sanitizeForModel(current);
-  // 当前这条永远带时间戳（它就是「现在」），同一 ts 的渲染和历史里完全一致。
-  const currentStamp = `[${formatStamp(Number(msg.ts) || Date.now(), timeZone)}] `;
-  const currentText = isGroup
-    ? `${currentStamp}[${msg.senderName || '群友'}] ${currentBody}`
-    : `${currentStamp}${currentBody}`;
-  push('user', currentText, false);
+  // 收集等待只读桥接计时器，不把内部接收时间拼进模型正文。
+  push('user', currentBody);
   // 记忆块和本轮状态都不参与上面 1,800 字的单条截断（预算由 memory / persona 层控制）
   if (memory) {
     const last = turns[turns.length - 1];

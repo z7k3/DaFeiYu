@@ -4,7 +4,12 @@ import sys
 import unittest
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
-from bridge_ast import load_function
+from bridge_ast import load_function as _load_function
+
+
+def load_function(name, environment):
+    environment.setdefault('foreground_is_moments', lambda: False)
+    return _load_function(name, environment)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bridge import uia_boot as boot
@@ -351,4 +356,3 @@ class RecoveryTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

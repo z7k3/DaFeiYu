@@ -4,7 +4,7 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const stickers = require('../adapters/stickers');
 const { installPresets } = require('../adapters/stickerPresets');
-const { describeError } = require('../infra/errors');
+const { describeError, errorMessage } = require('../infra/errors');
 const { tagId, tagName } = require('../infra/privacy');
 const probe = require('../infra/probe');
 const ACTIVE = new Set(['queued', 'reserved', 'sending']);
@@ -67,7 +67,7 @@ class StickerService {
       this._runMaintenance().catch((err) => {
         this.maintenance.phase = 'done';
         this.maintenance.finishedAt = Date.now();
-        this.maintenance.errors.push(String((err && err.message) || err));
+        this.maintenance.errors.push(errorMessage(err));
         if (this.logger) this.logger.warn('表情包图库维护失败（不影响收发）：' + describeError(err));
       });
     });
@@ -184,6 +184,11 @@ class StickerService {
       if (enabled) this.startMaintenance();
     }
     for (const job of this.jobs.values()) {
+      if (job.pluginId && ACTIVE.has(job.status) && !this.pluginAllowed?.(job)) {
+        job.status = job.status === 'sending' ? 'unconfirmed' : 'cancelled';
+        job.error = '插件授权已撤回，未自动重试';
+        this._note(job, job.status);
+      }
       // 卡住的任务 90 秒就释放：以前是 5 分钟，失败一次就把这个会话堵 5 分钟，
       // 用户感觉「25% 概率压根没生效」。
       if (ACTIVE.has(job.status) && this.now() - job.at > 90 * 1000) {
@@ -305,6 +310,21 @@ class StickerService {
     }
     job.status = 'sending';
     this.logger?.info('[sticker] stage=claim result=sending job=' + job.id);
+    return { ...job };
+  }
+  cancelReserved(id, generation, chatUsername) {
+    this.requireEnabled();
+    const job = this.jobs.get(String(id || ''));
+    if (!job) throw fail('找不到这个任务', 404);
+    if (!generation || generation !== this.generation || generation !== job.generation
+      || !chatUsername || chatUsername !== job.chatUsername) throw fail('任务代次或目标会话不匹配', 409);
+    if (job.status === 'cancelled') return { ...job };
+    // 已领取的任务可能已经操作微信，不能伪装成尚未发送的取消。
+    if (job.status !== 'reserved') throw fail('任务已领取或结束，不能取消预留任务', 409);
+    job.status = 'cancelled';
+    job.error = 'reply_delivery_stopped';
+    this._note(job, 'cancelled');
+    this.logger?.info('[sticker] stage=cancel result=cancelled job=' + job.id + ' reason=reply_delivery_stopped');
     return { ...job };
   }
   ack(id, status, error = '') {

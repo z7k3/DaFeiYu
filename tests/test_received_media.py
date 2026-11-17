@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import types
 import unittest
 import uuid
@@ -26,6 +27,10 @@ sys.path.insert(0, str(ROOT / 'tests'))
 sys.path.insert(0, str(ROOT / 'bridge'))
 import emoji_vision
 from image_cache import bind_target_probe, V2_MAGIC
+from image_ui_fallback import (capture_preview_image, export_original,
+                               read_image_via_ui, reset_cooldown)
+from media_key_compat import install_key_scan_guard
+from receiver_mixin import image_dir_note, image_key_note, run_media_with_timeout
 
 
 from bridge_ast import load_function  # noqa: E402
@@ -67,6 +72,37 @@ class ReceivedMediaTests(unittest.TestCase):
         self.assertEqual(nested('describe_image', env)({'username': 'peer', 'local_id': 4}), '')
         self.assertEqual(download.call_count, 8)
         self.assertEqual(sleeps, [0.5, 1, 2])
+        post.assert_not_called()
+
+    def test_image_falls_back_to_ui_capture_when_local_file_is_missing(self):
+        buf = io.BytesIO()
+        Image.new('RGB', (40, 30), 'red').save(buf, format='JPEG')
+        shot = buf.getvalue()
+        env, post, _sleeps = self.env(Mock(return_value=None))
+        ui = Mock(return_value=shot)
+        env['image_ui_fallback'] = ui
+        msg = {'username': 'peer', 'local_id': 4}
+        self.assertEqual(nested('describe_image', env)(msg), '蓝色图片')
+        ui.assert_called_once_with(msg)
+        self.assertEqual(len(post.call_args_list), 1, '截图也要送去识图')
+
+    def test_image_fallback_failure_is_explained_and_not_sent(self):
+        env, post, _sleeps = self.env(Mock(return_value=None))
+        env['image_ui_fallback'] = Mock(return_value=b'')
+        msg = {'username': 'peer', 'local_id': 4}
+        self.assertEqual(nested('describe_image', env)(msg), '')
+        self.assertIn('界面兜底', msg.get('_media_fail') or '')
+        post.assert_not_called()
+
+    def test_missing_image_key_skips_pointless_retries_and_uses_ui_fallback(self):
+        # 密钥取不到时再等 3.5 秒也不会变；聊天不会等，直接转界面兜底。
+        download = Mock(side_effect=RuntimeError('无法获取图片 AES 密钥：请保持微信登录'))
+        env, post, sleeps = self.env(download)
+        env['image_ui_fallback'] = Mock(return_value=b'')
+        self.assertEqual(nested('describe_image', env)({'username': 'peer', 'local_id': 4}), '')
+        self.assertEqual(download.call_count, 2, '只试 full/best 各一次，不再空转三轮')
+        self.assertEqual(sleeps, [], '密钥问题不需要等待重试')
+        env['image_ui_fallback'].assert_called_once()
         post.assert_not_called()
 
     def test_decryption_validates_current_image_instead_of_old_probe(self):
@@ -213,6 +249,10 @@ class MediaFailureLogTests(unittest.TestCase):
             display_name=lambda chat: '好友',
             db=types.SimpleNamespace(get_nickname=lambda sender: '张三'),
             LOCAL_HTTP=types.SimpleNamespace(post=Mock()),   # 真连微信/服务端的替身
+            token='',
+            bot_url='http://localhost/webhook/wechat',
+            CONN_STATE={'ok': True},
+            ONLY_CHATS=[],
         )
         env.update(stubs)
         env['log_throttled'] = nested('log_throttled', env)
@@ -231,7 +271,7 @@ class MediaFailureLogTests(unittest.TestCase):
         env['log_error'].assert_called_once()
         return env['log_error'].call_args.args[0]
 
-    def test_image_failure_logs_error_and_sends_nothing(self):
+    def test_image_failure_logs_error_and_lets_her_reply(self):
         env = self.env({'describe_image': Mock(return_value=''),
                         'describe_emoji': Mock(), 'STICKER_COLLECT': True})
         msg = self.message('图片')
@@ -242,7 +282,33 @@ class MediaFailureLogTests(unittest.TestCase):
         # 日志已脱敏：会话/发送者只留稳定 hash，不再写真实昵称。
         for piece in ('会话=#', '发送者=#', '类型=图片', '消息id=peer:shard1:7', '空描述'):
             self.assertIn(piece, line)
-        env['LOCAL_HTTP'].post.assert_not_called()
+        # 取不到图不再装没看见：把「没取到」交给模型，让它自然回一句。
+        payload = env['LOCAL_HTTP'].post.call_args.kwargs['json']
+        self.assertIn('没取到', payload['text'])
+        self.assertIn('不要编造', payload['text'])
+        self.assertTrue(payload['text'].startswith('（对方发了一张图片，但这边没取到'))
+
+    def test_two_failed_images_both_reach_the_kernel(self):
+        # 占位文本对同一会话是固定的，不能因此把第二张图当「重复消息」丢掉。
+        env = self.env({'describe_image': Mock(return_value='')})
+        env['LOCAL_HTTP'].post.return_value = types.SimpleNamespace(
+            status_code=400, json=lambda: {})
+        env['on_message_inner'](self.message('图片', local_id=9101), None)
+        env['on_message_inner'](self.message('图片', local_id=9102), None)
+        self.assertEqual(env['LOCAL_HTTP'].post.call_count, 2)
+
+    def test_skipped_messages_are_logged_with_reason(self):
+        # 每条没处理的消息都要能在日志里找到原因，不能只剩一个 return。
+        env = self.env({'describe_image': Mock(return_value='')})
+        env['on_message_inner'](self.message('文本', content=''), None)
+        env['on_message_inner'](self.message('文件', content='<msg><appmsg></appmsg></msg>'), None)
+        env['on_message_inner'](self.message('文本', content='在吗', sender_username='self'), None)
+        lines = ' '.join(str(call.args) for call in env['log'].call_args_list)
+        self.assertIn('消息未处理', lines)
+        self.assertIn('正文为空', lines)
+        self.assertIn('没有可读正文', lines)
+        self.assertIn('自己发出的消息', lines)
+        self.assertIn('消息id=', lines, '每条跳过日志都要带消息 id')
 
     def test_separate_text_reply_sends_two_messages_even_with_auto_voice(self):
         data = {'ok': True, 'action': 'reply', 'reply': '先保存。再重启。',
@@ -312,6 +378,293 @@ class MediaFailureLogTests(unittest.TestCase):
         self.assertEqual(nested('describe_image', env)(msg), '')
         self.assertEqual(msg.get('_media_fail'), 'FileNotFoundError')
         env['LOCAL_HTTP'].post.assert_not_called()
+
+
+class MediaHangGuardTests(unittest.TestCase):
+    """发一张图把整个会话卡死：图片密钥扫描不能无限等，识别也不能无限跑。"""
+
+    def test_slow_key_scan_is_abandoned_instead_of_blocking_the_chat(self):
+        calls = []
+
+        def slow_scan(monitor=False, monitor_timeout=120.0, probe=None):
+            calls.append(monitor)
+            time.sleep(2.0)          # 真实现是 120 秒的「每 2 秒重扫」循环
+            return 'late-key'
+
+        dl = types.SimpleNamespace(_scan_aes_key=slow_scan)
+        logs = []
+        self.assertTrue(install_key_scan_guard(dl, log=lambda *a: logs.append(a),
+                                               timeout=0.2, cooldown=60.0))
+        started = time.monotonic()
+        self.assertIsNone(dl._scan_aes_key(monitor=True))
+        self.assertLess(time.monotonic() - started, 1.5, '超时后必须马上返回，不能等原扫描跑完')
+        self.assertEqual(calls, [False], '必须强制单次扫描，不再挂 120 秒 monitor')
+        self.assertTrue(any('先跳过' in str(item) for item in logs), '要留下能看懂的日志')
+
+        # 冷却期内不再扫内存，避免每条图片都再卡一次
+        self.assertIsNone(dl._scan_aes_key(monitor=True))
+        self.assertEqual(calls, [False])
+
+    def test_fast_key_scan_result_still_passes_through(self):
+        seen = []
+
+        def quick(monitor=False, monitor_timeout=120.0, probe=None):
+            seen.append((monitor, probe))
+            return 'fast-key'
+
+        dl = types.SimpleNamespace(_scan_aes_key=quick)
+        self.assertTrue(install_key_scan_guard(dl, log=lambda *a: None, timeout=1.0, cooldown=0))
+        self.assertEqual(dl._scan_aes_key(monitor=True, probe=b'p'), 'fast-key')
+        self.assertEqual(seen, [(False, b'p')], '取到密钥时原样返回，只是不再 monitor')
+        self.assertFalse(install_key_scan_guard(dl), '重复安装要幂等')
+
+    def test_media_recognition_timeout_releases_the_chat(self):
+        msg = {'username': 'peer', 'local_id': 9}
+        started = time.monotonic()
+        out = run_media_with_timeout(lambda: time.sleep(3.0) or '迟到的描述', '图片', msg,
+                                     log=lambda *a: None, timeout=0.2)
+        self.assertEqual(out, '')
+        self.assertLess(time.monotonic() - started, 1.5, '识别超时必须立刻放弃这一条')
+        self.assertIn('识别超时', msg.get('_media_fail') or '')
+
+    def test_media_recognition_result_passes_through(self):
+        msg = {'username': 'peer', 'local_id': 10}
+        out = run_media_with_timeout(lambda: '图里是一碗面', '图片', msg, log=lambda *a: None)
+        self.assertEqual(out, '图里是一碗面')
+        self.assertNotIn('_media_fail', msg)
+
+    def test_media_recognition_exception_is_reported_not_raised(self):
+        msg = {'username': 'peer', 'local_id': 11}
+
+        def boom():
+            raise RuntimeError('下载失败')
+
+        self.assertEqual(run_media_with_timeout(boom, '表情', msg, log=lambda *a: None), '')
+        self.assertEqual(msg.get('_media_fail'), 'RuntimeError')
+
+
+class ImageDiagnosticsTests(unittest.TestCase):
+    """密钥取不到时要能一眼看出：能不能离线派生、图来自哪个账号目录。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_image_key_note_reports_cfg_and_cache(self):
+        workdir = self.root / 'keys'
+        workdir.mkdir()
+        db = types.SimpleNamespace(cfg_dword=0x1234, workdir=str(workdir))
+        self.assertIn('cfgDword 可用', image_key_note(db))
+
+        (workdir / 'image_keys.json').write_text('{}', encoding='utf-8')
+        db2 = types.SimpleNamespace(cfg_dword=None, workdir=str(workdir))
+        note = image_key_note(db2)
+        self.assertIn('cfgDword 不可用', note)
+        self.assertIn('密钥缓存有', note)
+
+        self.assertIn('密钥缓存没有', image_key_note(types.SimpleNamespace(
+            cfg_dword=None, workdir=str(self.root / 'missing'))))
+
+    def test_image_dir_note_tells_current_account_from_elsewhere(self):
+        current = self.root / 'wxid_a_1111'
+        image = current / 'msg' / 'attach' / 'x' / '2026-11' / 'Img' / 'a.dat'
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b'x')
+        db = types.SimpleNamespace(account_dir=str(current))
+        self.assertEqual(image_dir_note(db, str(image)), '当前账号目录')
+
+        other = self.root / 'wxid_b_2222' / 'msg' / 'attach' / 'x' / 'Img' / 'a.dat'
+        self.assertIn('非当前账号目录', image_dir_note(db, str(other)))
+        self.assertEqual(image_dir_note(types.SimpleNamespace(account_dir=''), str(image)), '')
+
+
+class ImageUiFallbackTests(unittest.TestCase):
+    """磁盘解密失败后的界面兜底：导出明文 / 截预览窗，两者都不能把异常抛出去。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        reset_cooldown()
+
+    def test_export_original_returns_the_file_wechat_wrote(self):
+        out = self.root / 'exported.jpg'
+        out.write_bytes(b'\xff\xd8\xff' + b'0' * 32)
+        seen = {}
+
+        def download(user, local_id, **kwargs):
+            seen.update(kwargs, user=user, local_id=local_id)
+            return str(out)
+
+        dl = types.SimpleNamespace(download_image_original=download)
+        got = export_original(dl, {'username': 'peer', 'local_id': 7, 'shard': 's2'},
+                              chat_name='好友', save_dir=str(self.root), log=lambda *a: None)
+        self.assertEqual(got, str(out))
+        self.assertEqual(seen['shard'], 's2')
+        self.assertEqual(seen['chat_name'], '好友')
+
+    def test_export_original_swallows_vendor_errors(self):
+        def boom(*a, **k):
+            raise RuntimeError('UI 挂了')
+
+        dl = types.SimpleNamespace(download_image_original=boom)
+        self.assertEqual(export_original(dl, {'username': 'peer', 'local_id': 1}), '')
+
+    def test_capture_preview_grabs_the_new_window_and_closes_it(self):
+        image = Image.new('RGB', (400, 300), 'green')
+        pressed = []
+        calls = {'n': 0}
+
+        class Ctrl:
+            BoundingRectangle = types.SimpleNamespace(left=10, top=10, right=410, bottom=310)
+
+        def previews():
+            calls['n'] += 1
+            return [] if calls['n'] == 1 else [(7, Ctrl())]   # 第一次是「点之前」
+
+        class UIA:
+            def ensure_window(self):
+                return True
+
+            def current_chat(self):
+                return '好友'
+
+            def _message_list(self):
+                return object()
+
+            def _wechat_hwnds(self):
+                return [1]
+
+            def _pid_from_hwnd(self, hwnd):
+                return 2
+
+        class Inp:
+            def real_click(self, x, y):
+                calls['click'] = (x, y)
+
+            def key(self, vk):
+                pressed.append(vk)
+
+        msg_row = {'local_id': 7, 'type': '图片', 'content': ''}
+        dl = types.SimpleNamespace(
+            db=types.SimpleNamespace(get_message_row=lambda *a, **k: msg_row,
+                                     get_messages=lambda *a, **k: [msg_row]),
+            _DB_ROW_KIND={'图片': 'image'},
+            _locate_image_row=lambda *a, **k: (Ctrl(), 'ok'),
+            _sent_by_self=lambda row: False,
+            _bubble_click_xs=lambda rect, is_self: [100],
+            _preview_windows=previews,
+        )
+        data = capture_preview_image(dl, {'username': 'peer', 'local_id': 7}, chat_name='好友',
+                                     log=lambda *a: None, uia=UIA(), inp=Inp(),
+                                     grab=lambda bbox: image, sleep=lambda _s: None)
+        self.assertTrue(data.startswith(b'\xff\xd8'), '截图要转成 JPEG 字节')
+        self.assertEqual(calls.get('click'), (100, 160), '点的是气泡中线')
+        self.assertEqual(pressed, [0x1B], '截完要把预览窗关掉')
+
+    def test_capture_preview_missing_bubble_returns_empty(self):
+        dl = types.SimpleNamespace(
+            db=types.SimpleNamespace(get_message_row=lambda *a, **k: {'local_id': 1},
+                                     get_messages=lambda *a, **k: []),
+            _DB_ROW_KIND={'图片': 'image'},
+            _locate_image_row=lambda *a, **k: (None, 'not-in-db'),
+            _sent_by_self=lambda row: False,
+            _bubble_click_xs=lambda rect, is_self: [],
+            _preview_windows=lambda: [],
+        )
+
+        class UIA:
+            def ensure_window(self):
+                return True
+
+            def current_chat(self):
+                return '好友'
+
+            def _message_list(self):
+                return object()
+
+            def _wechat_hwnds(self):
+                return []
+
+        self.assertEqual(capture_preview_image(dl, {'username': 'peer', 'local_id': 1},
+                                               log=lambda *a: None, uia=UIA(),
+                                               inp=types.SimpleNamespace(), grab=lambda **k: None,
+                                               sleep=lambda _s: None), b'')
+
+    def test_read_image_via_ui_prefers_export_then_capture(self):
+        out = self.root / 'plain.jpg'
+        out.write_bytes(b'\xff\xd8\xffexported')
+        dl = types.SimpleNamespace(download_image_original=lambda *a, **k: str(out))
+        self.assertEqual(read_image_via_ui(dl, {'username': 'peer', 'local_id': 1}),
+                         b'\xff\xd8\xffexported')
+
+    def test_ui_fallback_logs_every_failure_reason(self):
+        logs = []
+
+        class UIA:
+            def ensure_window(self):
+                return False
+
+        read_image_via_ui(types.SimpleNamespace(), {'username': 'peer', 'local_id': 3},
+                          log=lambda *a: logs.append(' '.join(str(x) for x in a)),
+                          uia=UIA(), inp=types.SimpleNamespace(),
+                          grab=lambda **k: None, sleep=lambda _s: None)
+        text = '\n'.join(logs)
+        self.assertIn('拿不到微信主窗', text, '界面拿不到就要写清原因')
+        self.assertIn('没取到图', text, '最终失败也要留一行')
+
+    def test_fallback_failure_logs_include_stage(self):
+        dl = types.SimpleNamespace(
+            db=types.SimpleNamespace(get_message_row=lambda *a, **k: {'local_id': 1},
+                                     get_messages=lambda *a, **k: []),
+            _DB_ROW_KIND={'图片': 'image'},
+            _locate_image_row=lambda *a, **k: (None, 'not-in-db'),
+            _sent_by_self=lambda row: False,
+            _bubble_click_xs=lambda rect, is_self: [],
+            _preview_windows=lambda: [],
+        )
+        logs = []
+
+        class UIA:
+            def ensure_window(self):
+                return True
+
+            def current_chat(self):
+                return '好友'
+
+            def _message_list(self):
+                return object()
+
+            def _wechat_hwnds(self):
+                return []
+
+        capture_preview_image(dl, {'username': 'peer', 'local_id': 1},
+                              log=lambda *a: logs.append(' '.join(str(x) for x in a)),
+                              uia=UIA(), inp=types.SimpleNamespace(),
+                              grab=lambda **k: None, sleep=lambda _s: None)
+        self.assertTrue(any('没在可视区认出' in line for line in logs))
+
+    def test_ui_fallback_tries_every_image_and_only_cools_when_asked(self):
+        calls = {'n': 0}
+
+        class UIA:
+            def ensure_window(self):
+                calls['n'] += 1
+                return False
+
+        msg = {'username': 'peer', 'local_id': 2}
+        common = dict(log=lambda *a: None, uia=UIA(), inp=types.SimpleNamespace(),
+                      grab=lambda **k: None, sleep=lambda _s: None)
+        for _ in range(2):
+            self.assertEqual(read_image_via_ui(types.SimpleNamespace(), msg, **common), b'')
+        self.assertEqual(calls['n'], 2, '默认不能因为上一张失败，就把下一张图也丢掉')
+
+        # 只有调用方明确要冷却时才会跳过
+        self.assertEqual(read_image_via_ui(types.SimpleNamespace(), msg, cooldown=60, **common), b'')
+        self.assertEqual(calls['n'], 3)
+        self.assertEqual(read_image_via_ui(types.SimpleNamespace(), msg, cooldown=60, **common), b'')
+        self.assertEqual(calls['n'], 3, '显式冷却期内不再动界面')
 
 
 if __name__ == '__main__':

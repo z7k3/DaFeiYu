@@ -2,6 +2,7 @@
 """bridge composition root: creates BridgeRuntime and runs start()."""
 import engine as G
 from account_mixin import AccountMixin
+from bridge_log import dump_hang_trace
 from parent_watch import start_watchdog
 from window_mixin import WindowMixin
 from sender_mixin import SenderMixin
@@ -61,24 +62,22 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
         try:
             import faulthandler
             try:
-                _hang_file = open(G.os.path.join(G.ROOT, 'data', 'bridge-hang.log'), 'a', encoding='utf-8')
-                # 健康运行时不能无限写栈：只 dump 一次，不 repeat。
-                faulthandler.dump_traceback_later(40, repeat=False, file=_hang_file)
-                G.boot('已开启卡死堆栈转储（40s）')
-            except Exception:
-                pass
-            try:
                 _crash_file = open(G.os.path.join(G.ROOT, 'data', 'bridge-crash.log'), 'a', encoding='utf-8')
                 _crash_file.write('\n==== %s 进程启动（pid=%d）====\n' % (G.time.strftime('%Y-%m-%d %H:%M:%S'), G.os.getpid()))
                 _crash_file.flush()
-                faulthandler.enable(file=_crash_file, all_threads=True)
-                G.boot('已开启崩溃堆栈记录（data/bridge-crash.log）')
+                # CPython 的定时转储线程在无 GIL 时读取其他线程的帧，
+                # 帧恰好被释放会让桥接崩溃（python/cpython#140815）。
+                # 原生异常也只记录故障线程，避免在异步回调中遍历其他线程。
+                faulthandler.enable(file=_crash_file, all_threads=False)
+                G.boot('已开启故障线程堆栈记录（data/bridge-crash.log）')
             except Exception:
                 pass
             G.boot('开始 import requests')
             import requests
             G.boot('开始 import wechatauto（可能较慢，10~20 秒）')
             from wechatauto import MediaDownloader, WeChatDB, WeChatGUI
+            from window_activation import install as install_safe_activation
+            install_safe_activation()
             from wechatauto.db import Listener
             self.MediaDownloader = MediaDownloader
             self.WeChatDB = WeChatDB
@@ -153,7 +152,7 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
                 G.log('源码运行：先装 bridge/requirements.txt 里的依赖，并把 vendor/wechatauto 加进 PYTHONPATH；')
                 G.log('用启动器时它会自动从 runtime/python 加载，不用手动装包。')
             return 1
-        self.cfg = G.read_config()
+        self.cfg = G.CURRENT_CONFIG
         self.token = G.bridge_config.wechat_token(self.cfg)
         self.bot_url = G.build_bot_url(self.cfg)
         self.aliases = ((self.cfg.get('persona') or {}).get('aliases') or []) + [(self.cfg.get('persona') or {}).get('name') or '鲸鲸']
@@ -189,6 +188,7 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
         G.log('打开微信数据库（这一步偶尔会卡，最多等 90 秒）…')
         _db_box = self._open_db_with_timeout(90)
         if _db_box.get('timeout'):
+            dump_hang_trace()
             G.log('')
             G.log('✗ 打开微信数据库卡住超过 90 秒，已放弃这次启动（不是崩溃，是卡死）。')
             G.log('  常见原因：微信没完全登录 / 数据库被占用 / 微信正在更新。')
@@ -254,6 +254,7 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
         self.send_lock = G.threading.Lock()
         self.account_lock = G.threading.RLock()
         self.dead_chats = set()
+        self.dead_chat_until = {}
         self.fail_streak = {}
         self.self_wxid = self.db.wxid
         self.ACCOUNT = {'hwnd': 0, 'verified': False, 'why': '', 'label': ''}
@@ -268,7 +269,28 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
         G.log('开始监听新消息…（Ctrl+C 退出）')
         self.pipeline = G.MessagePipeline(workers=G.PIPELINE_WORKERS, per_chat_limit=G.PIPELINE_QUEUE_LIMIT, log=G.log)
         self.batches = G.MessageBatches(limit=max(4, G.PIPELINE_QUEUE_LIMIT * 2), log=G.log)
-        G.log('消息调度：%d 个 worker（同一会话串行、跨会话并发，连发的几条合并成一次）' % G.PIPELINE_WORKERS)
+
+        def flush_due(chat):
+            try:
+                queued = self.pipeline.submit(chat, self.flush_chat, chat, self.listener)
+            except Exception as exc:  # noqa: BLE001
+                queued = False
+                G.log('消息批次入队失败：', repr(exc))
+            if not queued:
+                self.batches.release(chat)
+                G.log_throttled(
+                    'settle-queue-closed:%s' % chat,
+                    '消息批次没能排上队（调度已关闭）：会话=%s' % G.safe_id(chat),
+                    ttl=60,
+                )
+
+        self.settle = G.SettleScheduler(
+            flush_due,
+            get_wait=lambda: (G.MESSAGE_SETTLE_MS, G.GROUP_MAX_BATCH_WAIT_MS),
+            log=G.log,
+        )
+        G.log('消息调度：%d 个 worker（同一会话串行、跨会话并发；私信安静 %.0fms、群聊最多 %.0fms 后合并）'
+              % (G.PIPELINE_WORKERS, G.MESSAGE_SETTLE_MS, G.GROUP_MAX_BATCH_WAIT_MS))
         G.threading.Thread(target=self.sticker_test_loop, daemon=True).start()
         G.threading.Thread(target=self.voice_test_loop, daemon=True, name='voice-send-test').start()
         self.listener = Listener(self.db, interval=0.4)
@@ -343,6 +365,10 @@ class BridgeRuntime(AccountMixin, WindowMixin, SenderMixin, StickerMixin, VoiceM
                     G.REMINDER_RUNNER.stop()
                 except Exception:
                     pass
+            try:
+                self.settle.close()
+            except Exception:
+                pass
             try:
                 self.pipeline.close(wait=False)
             except Exception:

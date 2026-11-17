@@ -43,6 +43,9 @@ namespace WhaleLauncher.Views
         private string _current = "";
         private bool _loading;
         private bool _savingCollect;
+        private bool _savingEnabled;
+        private bool _dirDirty;
+        private long _dirRevision;
         private bool _demandDirty;
         private bool _savingDemand;
         private int _demandRevision;
@@ -73,6 +76,7 @@ namespace WhaleLauncher.Views
         {
             InitializeComponent();
             _sup = sup;
+            TxtDir.TextChanged += (_, __) => { if (!_loading) { _dirDirty = true; _dirRevision++; } };
             Loaded += async (_, __) => await RefreshAsync();
         }
 
@@ -171,7 +175,7 @@ namespace WhaleLauncher.Views
             }
 
             _loading = true;
-            ChkEnabled.IsChecked = view.Enabled;
+            if (!_savingEnabled) ChkEnabled.IsChecked = view.Enabled;
             if (!_savingCollect) ChkCollect.IsChecked = view.CollectReceived;
             _loading = false;
             if (!string.IsNullOrEmpty(view.Dir)) _libraryDir = view.Dir;
@@ -203,7 +207,7 @@ namespace WhaleLauncher.Views
 
             DirHint.Text = "目录：" + view.Dir;
             if (string.IsNullOrWhiteSpace(TxtTestChat.Text)) TxtTestChat.Text = view.TestChat;
-            if (!TxtDir.IsKeyboardFocusWithin) TxtDir.Text = view.ConfiguredDir;
+            if (!TxtDir.IsKeyboardFocusWithin && !_dirDirty) TxtDir.Text = view.ConfiguredDir;
 
             // 内容签名：张数 + 每张 id/版本。没变就什么都不做（以前每次都整表重建）
             var signature = _current + "|" + string.Join(",", CurrentItems().Select((i) => i.Id + "@" + i.Version));
@@ -282,10 +286,12 @@ namespace WhaleLauncher.Views
         private async void OnSaveStickerSettings(object sender, RoutedEventArgs e)
         {
             if (_loading || TxtDir.Text.Trim() == _inventory.Str("configuredDir")) return;
+            var revision = _dirRevision;
             var res = await _sup.PatchConfigurationAsync( new Dictionary<string, object>
             {
                 ["sticker.dir"] = TxtDir.Text.Trim()
             });
+            if (res.Ok && revision == _dirRevision) _dirDirty = false;
             StatusText.Text = res.Ok
                 ? "表情包设置已保存 · " + DateTime.Now.ToString("HH:mm:ss")
                 : "保存失败：" + Api.Message(res);
@@ -642,13 +648,19 @@ namespace WhaleLauncher.Views
         // ── 动作 ────────────────────────────────────────────────
         private async void OnToggleEnabled(object sender, RoutedEventArgs e)
         {
-            if (_loading) return;
+            if (_loading || _savingEnabled) return;
+            _savingEnabled = true;
+            ChkEnabled.IsEnabled = false;
+            try
+            {
             var on = ChkEnabled.IsChecked == true;
             var res = await _sup.SaveConfigurationAsync("/api/features", new { key = "stickers", value = on });
             StatusText.Text = res.Ok ? $"表情包已{(on ? "开启" : "关闭")}" : "保存失败：" + Api.Message(res);
             _loaded = false;
             _nextRefresh = DateTime.MinValue;
             await LoadAsync();
+            }
+            finally { _savingEnabled = false; ChkEnabled.IsEnabled = _sup.NodeRunning; }
         }
 
         private bool CanManageOnline()
@@ -754,19 +766,14 @@ namespace WhaleLauncher.Views
                 StatusText.Text = "先选一个分类。";
                 return;
             }
-            var dlg = new Microsoft.Win32.OpenFileDialog
-            {
-                Multiselect = true,
-                Filter = "图片|*.gif;*.png;*.jpg;*.jpeg;*.webp",
-                Title = "挑 1~5 张表情包"
-            };
-            if (dlg.ShowDialog() != true) return;
-            if (dlg.FileNames.Length > 5)
+            var files = AppFilePicker.OpenMany("挑 1~5 张表情包", ".gif;.png;.jpg;.jpeg;.webp", true);
+            if (files == null) return;
+            if (files.Length > 5)
             {
                 StatusText.Text = "一次最多 5 张，请分两批。";
                 return;
             }
-            await UploadFilesAsync(dlg.FileNames);
+            await UploadFilesAsync(files);
         }
 
         private async Task UploadFilesAsync(string[] files)
@@ -951,17 +958,13 @@ namespace WhaleLauncher.Views
         };
 
         private static string Str(JsonElement e, string n)
-            => e.ValueKind == JsonValueKind.Object && e.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String ? (v.GetString() ?? "") : "";
+            => JsonRead.Str(e, n);
 
         private static bool Bool(JsonElement e, string n)
-            => e.ValueKind == JsonValueKind.Object && e.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.True;
+            => JsonRead.Bool(e, n);
 
         private static double NumProp(JsonElement e, double fallback)
-        {
-            if (e.ValueKind == JsonValueKind.Number && e.TryGetDouble(out var d)) return d;
-            if (e.ValueKind == JsonValueKind.String && double.TryParse(e.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var s)) return s;
-            return fallback;
-        }
+            => JsonRead.DoubleValue(e, fallback);
 
         private static bool BoolProp(JsonElement e)
         {
@@ -971,12 +974,7 @@ namespace WhaleLauncher.Views
         }
 
         private static double Num(JsonElement e, string n)
-        {
-            if (e.ValueKind != JsonValueKind.Object || !e.TryGetProperty(n, out var v)) return 0;
-            if (v.ValueKind == JsonValueKind.Number && v.TryGetDouble(out var d)) return d;
-            if (v.ValueKind == JsonValueKind.String && double.TryParse(v.GetString(), out var s)) return s;
-            return 0;
-        }
+            => JsonRead.Double(e, n, 0);
 
         private static string S(JsonElement e, string n) => Str(e, n);
     }

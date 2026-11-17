@@ -7,6 +7,7 @@ using System.Windows;
 using System.Windows.Threading;
 using System.Threading;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 
 namespace WhaleLauncher
 {
@@ -47,7 +48,7 @@ namespace WhaleLauncher
             catch (AbandonedMutexException) { _ownsInstance = true; }
             if (!_ownsInstance)
             {
-                AppDialog.Show(null, "鲸鲸已经在运行，请切回已有窗口。", "鲸鲸", danger: true);
+                ActivateExistingInstance();
                 Shutdown();
                 return;
             }
@@ -58,6 +59,31 @@ namespace WhaleLauncher
             AppDomain.CurrentDomain.UnhandledException += (_, ex) => Crash("进程", ex.ExceptionObject as Exception);
             MainWindow = new MainWindow();
             MainWindow.Show();
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr handle);
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindowAsync(IntPtr handle, int command);
+
+        private static void ActivateExistingInstance()
+        {
+            using var current = Process.GetCurrentProcess();
+            foreach (var process in Process.GetProcessesByName(current.ProcessName))
+            {
+                using (process)
+                {
+                    try
+                    {
+                        if (process.Id == current.Id || process.MainWindowHandle == IntPtr.Zero ||
+                            !string.Equals(process.MainModule?.FileName, current.MainModule?.FileName, StringComparison.OrdinalIgnoreCase)) continue;
+                        ShowWindowAsync(process.MainWindowHandle, 9);
+                        SetForegroundWindow(process.MainWindowHandle);
+                        return;
+                    }
+                    catch (Exception) { }
+                }
+            }
         }
 
         protected override void OnExit(ExitEventArgs e)

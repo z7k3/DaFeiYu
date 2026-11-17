@@ -89,7 +89,7 @@ test('config.json 解析失败：loadConfig 把错误带出来，不再静默走
 
 test('文件不存在（首次运行）仍然能从 {} 起步写入', () => {
   const root = makeRoot(null);
-  const configFile = path.join(root, 'config.json');
+  const configFile = path.join(root, 'data', 'config.json');
   const runtime = makeRuntime(root);
   const res = applyConfigPatch(runtime, { 'chat.historyTurns': 42 });
   assert.deepEqual(res.changed, ['chat.historyTurns']);

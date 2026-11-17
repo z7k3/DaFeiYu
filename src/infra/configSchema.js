@@ -2,6 +2,7 @@
 
 const { getByPath } = require('./objpath');
 const time = require('./time');
+const { parseBoolean, parseNumber } = require('./configValues');
 
 /**
  * 配置校验：一张纯数据的表 + 两个函数。
@@ -18,7 +19,14 @@ const time = require('./time');
  * 不改行为：合法值原样通过；非法值只报错，不偷偷改。
  */
 
+const API_KEY_SPEC = Object.freeze({ type: 'string', maxLen: 250, noWhitespace: true, redactValue: true });
 const FIELDS = {
+  // 外部服务自行决定凭据格式，本地路由的短 Key 也应合法。
+  'deepseek.apiKey': API_KEY_SPEC,
+  'vision.apiKey': API_KEY_SPEC,
+  'voice.apiKey': API_KEY_SPEC,
+  'websearch.deepseek.apiKey': API_KEY_SPEC,
+  'websearch.zhihu.accessSecret': API_KEY_SPEC,
   // ---- 服务 ----
   'server.port': { type: 'int', min: 0, max: 65535 },
   'server.host': { type: 'string', maxLen: 255 },
@@ -36,6 +44,9 @@ const FIELDS = {
   'chat.privateMaxChars': { type: 'int', min: 20, max: 4000 },
   'chat.groupMaxChars': { type: 'int', min: 20, max: 4000 },
   'chat.maxBubbles': { type: 'int', min: 1, max: 12 },
+  // 连续消息收集：私信和群聊共用安静窗口；群聊另有从首条开始的最大等待。
+  'chat.messageSettleMs': { type: 'int', min: 0, max: 10000 },
+  'chat.groupMaxBatchWaitMs': { type: 'int', min: 0, max: 60000 },
 
   // ---- 采样参数 ----
   'deepseek.temperature': { type: 'float', min: 0, max: 2 },
@@ -83,12 +94,24 @@ const FIELDS = {
   'care.maxPerDay': { type: 'int', min: 0, max: 50 },
   'care.quietAfterMinutes': { type: 'int', min: 0, max: 1440 },
 
+  // ---- 语音识别 ----
+  'voice.enabled': { type: 'bool' },
+  'voice.provider': { type: 'enum', values: ['follow', 'auto', 'deepseek', 'dashscope', 'custom'] },
+  'voice.baseUrl': { type: 'string', maxLen: 500 },
+  'voice.model': { type: 'string', maxLen: 120 },
+  'voice.timeoutMs': { type: 'int', min: 1000, max: 300000 },
+  'voice.maxSeconds': { type: 'int', min: 1, max: 600 },
+
   // ---- 联网 / 链接 ----
   'links.enabled': { type: 'bool' },
   'links.timeoutMs': { type: 'int', min: 1000, max: 60000 },
   'links.cacheMinutes': { type: 'int', min: 0, max: 1440 },
   'links.allowPrivate': { type: 'bool' },
-  'websearch.enabled': { type: 'bool' },
+  // 本地搜索强制开启，不再暴露 websearch.enabled（老配置里的 false 也会被 loadConfig 覆盖）。
+  // 搜索 API 总开关：关闭时不调用任何第三方搜索 API，本地搜索仍照常执行。
+  'websearch.api.enabled': { type: 'bool' },
+  'websearch.api.followChat': { type: 'bool' },
+  'websearch.zhihu.dailyLimit': { type: 'int', min: 0, max: 100000 },
   // 语义路由（每句话先问一次模型「要不要联网」）：不配时只在像问句/命中事实词时才问；
   // true 则每句都问（更准，每句多 ~2 秒）；false 则完全按关键词。
   'websearch.semanticRoute': { type: 'bool' },
@@ -152,8 +175,6 @@ const FIELDS = {
   'wechat.pipelineQueueLimit': { type: 'int', min: 1, max: 32 },
 };
 
-const BOOLISH = new Set(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off', '开', '关']);
-
 function describe(expected) {
   switch (expected.type) {
     case 'int':
@@ -184,21 +205,19 @@ function shownValue(value, spec) {
 /** 校验单个值；返回错误文字，或 null 表示通过。 */
 function checkValue(value, spec) {
   if (spec.type === 'bool') {
-    if (typeof value === 'boolean') return null;
     // 老配置里有写成字符串的 "false"；只要值本身合法就放行
-    if (typeof value === 'string' && BOOLISH.has(value.trim().toLowerCase())) return null;
-    if (value === 1 || value === 0) return null;
+    if (parseBoolean(value) !== undefined) return null;
     return `应该是 ${describe(spec)}，实际是 ${shownValue(value, spec)}`;
   }
   if (spec.type === 'int') {
-    const n = typeof value === 'number' ? value : Number(String(value).trim());
+    const n = parseNumber(value);
     if (!Number.isFinite(n) || !Number.isInteger(n)) return `应该是整数，实际是 ${shownValue(value, spec)}`;
     if (spec.min !== undefined && n < spec.min) return `不能小于 ${spec.min}（实际 ${n}）`;
     if (spec.max !== undefined && n > spec.max) return `不能大于 ${spec.max}（实际 ${n}）`;
     return null;
   }
   if (spec.type === 'float') {
-    const n = typeof value === 'number' ? value : Number(String(value).trim());
+    const n = parseNumber(value);
     if (!Number.isFinite(n)) return `应该是数字，实际是 ${shownValue(value, spec)}`;
     if (spec.min !== undefined && n < spec.min) return `不能小于 ${spec.min}（实际 ${n}）`;
     if (spec.max !== undefined && n > spec.max) return `不能大于 ${spec.max}（实际 ${n}）`;
@@ -231,6 +250,8 @@ function checkValue(value, spec) {
   if (spec.type === 'string') {
     if (typeof value !== 'string') return `应该是字符串，实际是 ${shownValue(value, spec)}`;
     if (spec.pattern && !spec.pattern.test(value)) return '格式不对';
+    // Key 这类透传凭据不该夹空白：粘贴时带上的换行/空格会让请求头直接失效。
+    if (spec.noWhitespace && /\s/.test(value)) return `不能包含空格或换行`;
     if (spec.maxLen && value.length > spec.maxLen) return `太长（最多 ${spec.maxLen} 个字符）`;
     return null;
   }
@@ -266,4 +287,4 @@ function formatErrors(errors) {
   return errors.map((e) => `${e.path}：${e.message}`).join('；');
 }
 
-module.exports = { FIELDS, validate, checkValue, formatErrors, getByPath };
+module.exports = { FIELDS, API_KEY_SPEC, validate, checkValue, formatErrors, getByPath };

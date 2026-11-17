@@ -383,6 +383,26 @@ test('环境块不会被写进 data/ 下的任何文件', () => {
   }
 });
 
+function containsStoredEnvironment(text, file) {
+  // 配置模板的说明会介绍 <env> 标记；只排除说明字段，不放过其他值里的环境内容。
+  if (/\.json$/i.test(file)) {
+    try {
+      text = JSON.stringify(JSON.parse(text), (key, value) => key === '_说明' ? undefined : value);
+    } catch { /* 损坏 JSON 仍按原文检查，不能因解析失败放行。 */ }
+  }
+  return text.includes('<env>') || text.includes('所在地：');
+}
+
+test('落盘检测允许模板说明，但仍拦截实际环境信息及损坏 JSON', () => {
+  const template = fs.readFileSync(path.join(__dirname, '..', 'config', 'config.example.json'), 'utf8');
+  assert.equal(containsStoredEnvironment(template, 'config.json'), false);
+  for (const value of ['<env>\n系统：Windows\n</env>', '所在地：测试城市']) {
+    assert.equal(containsStoredEnvironment(JSON.stringify({ prompt: value }), 'config.json'), true);
+    assert.equal(containsStoredEnvironment(value, 'chat.log'), true);
+    assert.equal(containsStoredEnvironment('{"broken":' + value, 'config.json'), true);
+  }
+});
+
 test('仓库 data/ 里也没有环境块痕迹（真跑过也不许留档）', () => {
   const dataDir = path.join(__dirname, '..', 'data');
   const files = walkFiles(dataDir);
@@ -396,7 +416,7 @@ test('仓库 data/ 里也没有环境块痕迹（真跑过也不许留档）', (
     } catch {
       continue;
     }
-    if (text.includes('<env>') || text.includes('所在地：')) hits.push(path.relative(path.join(__dirname, '..'), file));
+    if (containsStoredEnvironment(text, file)) hits.push(path.relative(path.join(__dirname, '..'), file));
   }
   assert.deepEqual(hits, [], 'data/ 里出现了环境块内容，说明有地方把它写盘了');
 });

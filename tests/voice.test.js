@@ -13,11 +13,13 @@ const { DEFAULT_CONFIG } = require('../src/infra/config');
 const root = path.resolve(__dirname, '..');
 const bridge = require('./helpers/bridge-source');
 
-test('默认配置里有 voice，并且默认开启', () => {
+test('语音识别默认启用并跟随主模型，手动服务仍保留', () => {
   assert.ok(DEFAULT_CONFIG.voice, '缺少 voice 配置块');
   assert.equal(DEFAULT_CONFIG.voice.enabled, true);
-  assert.match(DEFAULT_CONFIG.voice.model, /asr/i);
+  assert.equal(DEFAULT_CONFIG.voice.provider, 'follow');
+  assert.equal(DEFAULT_CONFIG.voice.model, 'qwen3-asr-flash');
   assert.match(DEFAULT_CONFIG.voice.baseUrl, /^https:\/\//);
+  assert.match(DEFAULT_CONFIG.voice.baseUrl, /tools\/asr|dashscope/);
   assert.ok(Number(DEFAULT_CONFIG.voice.maxSeconds) >= 30);
 });
 

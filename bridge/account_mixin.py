@@ -98,10 +98,15 @@ class AccountMixin:
         ok = False
         try:
             if username.endswith('@chatroom'):
-                name = self.db.group_id_to_name(username) or ''
-                if not name:
-                    s = self.sessions.get(username) or {}
-                    name = s.get('last_sender') or ''
+                # 上游 group_id_to_name 只读群 nick_name，空值会退回内部 ID。
+                # get_nickname 按精确 username 读取本地备注，群和联系人都适用。
+                try:
+                    name = self.db.get_nickname(username) or ''
+                except Exception:
+                    pass
+                if not name or is_raw_chat_id(name):
+                    name = self.db.group_id_to_name(username) or ''
+                # last_sender 属于群成员，不能拿它打开群，否则可能发到私聊。
             else:
                 name = self.db.get_nickname(username) or ''
             ok = True
@@ -150,7 +155,7 @@ class AccountMixin:
             out.append(shown or username)
         # wxid / 群 id 在微信里搜不到；装进候选里只会让 open_chat 白搜一轮。
         out = [x for x in dict.fromkeys(out) if x and not is_raw_chat_id(x)]
-        if not partial:
+        if not partial and out:
             self.alias_cache[key] = out
         return out
 
@@ -290,6 +295,9 @@ class AccountMixin:
         if not selected:
             self.ensure_uia_ready()
         probe = WeChatUIA()
+        if self.foreground_is_moments():
+            # 切换朋友圈不代表账号失效，不在此时物化隐藏主窗的控件树。
+            return probe, [], []
         out = []
         try:
             hwnds = list(probe._wechat_hwnds() or ())
@@ -435,6 +443,8 @@ class AccountMixin:
 
     def pick_account_window(self, force=False, quiet=False):
         """确认哪个微信窗口是 config/启动器指定的账号，并钉死它。"""
+        if self.foreground_is_moments():
+            return bool(self.ACCOUNT.get('verified'))
         if self.ACCOUNT['verified'] and (not force):
             return True
         if G.WINDOW_HWND:
@@ -667,4 +677,3 @@ class AccountMixin:
         if not allowed:
             G.log_throttled('sticker-account-ambiguous', '表情包跳过：当前微信窗口和账号信息不一致，或多个窗口无法区分。只登录一个号且数据库匹配时无需手选；多开时请在设置中选账号。', ttl=300)
         return allowed
-

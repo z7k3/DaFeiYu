@@ -432,6 +432,56 @@ test('日记：没配置主人时不生成', async (t) => {
   assert.equal(f.calls.length, 0);
 });
 
+test('日记：按规范微信私聊 key 识别旧会话，不依赖过时的 platform/title 元数据', async t => {
+  const f = fixture(t);
+  const owner = f.store.sessions.get('test-chat');
+  owner.platform = 'web';
+  owner.title = '';
+  f.config.diary.sendToOwner = true;
+  await f.service.generate();
+  assert.equal(f.service.status().status, 'done');
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.queued.length, 1);
+  assert.equal(f.queued[0].wxid, 'wxid_master');
+});
+
+test('日记：历史群聊即使元数据误标私聊且含主人消息，也不能作为主人私聊日记', async t => {
+  const f = fixture(t);
+  const owner = f.store.sessions.get('test-chat');
+  owner.chatId = 'wechat:g:fixture-group@chatroom';
+  owner.chatType = 'private';
+  owner.messages.push({ role: 'user', uid: 'wxid_master', name: '主人', text: '群聊内容不可混入', ts: Date.now() });
+  await f.service.generate();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.queued.length, 0);
+});
+
+test('日记：缺主人私聊记录时提示下一步并留下不含 ID 或正文的诊断', async t => {
+  const f = fixture(t);
+  f.store.sessions.clear();
+  await f.service.generate();
+  assert.match(f.service.status().message, /私聊.*重试/);
+  assert.match(f.logs.join('\n'), /no_owner_session/);
+  assert.doesNotMatch(f.logs.join('\n'), /wxid_master|今天读完一本书/);
+});
+
+test('日记：真实存储先建立默认会话后收到微信消息，仍可只读识别主人且不改记忆文件', async t => {
+  const f = fixture(t);
+  const { Store } = require('../src/memory/store');
+  const store = new Store({ dir: path.join(f.dir, 'memory'), file: path.join(f.dir, 'store.json') });
+  t.after(() => store.close());
+  const key = 'wechat:u:wxid_master';
+  store.getState(key);
+  store.ensureSession(key, { platform: 'wechat', chatType: 'private' });
+  store.appendMessage(key, { role: 'user', uid: 'wxid_master', name: '主人', text: '今天聊了读书', ts: new Date(2026, 10, 6, 22, 58).getTime() });
+  const service = new DiaryService(f.config, { store, llm: f.llm, logger: { warn(s) { f.logs.push(s); }, info() {} }, now: () => new Date(2026, 10, 6, 22, 59).getTime() });
+  assert.equal(store.sessions.get(key).platform, 'web');
+  const before = JSON.stringify([...store.sessions.values()]);
+  await service.generate();
+  assert.equal(service.status().status, 'done');
+  assert.equal(JSON.stringify([...store.sessions.values()]), before);
+});
+
 test('日记：跨天后不把昨天的已完成状态带到今天', async (t) => {
   const f = fixture(t);
   await f.service.generate();

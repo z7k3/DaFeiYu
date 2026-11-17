@@ -60,10 +60,10 @@ const PROVIDERS = {
     // 默认用免费额度最稳的 flash 档；plus / max 作为能力升级项。
     model: 'qwen3.8-flash',
     needsKey: true,
-    hint: '阿里云百炼开通后拿 Key（sk- 开头）。默认 qwen3.8-flash（只收文本）；要更强还要能看图选 qwen3.7-plus 或 qwen3.8-max。报 429 就是额度/频率用完',
+    hint: '阿里云百炼开通后拿 Key（sk- 开头）。qwen3.8-flash / qwen3.7-flash / qwen3.7-plus / qwen3.8-max 支持图像输入；语音转写使用专用 qwen3-asr-flash。报 429 请检查额度和限流',
     models: ['qwen3.8-flash', 'qwen3.7-flash', 'qwen3.7-plus', 'qwen3.8-max'],
-    // 百炼「视觉理解」列表里 qwen3.8-max / qwen3.7-plus 都在；qwen3.8-flash 只在文本生成里
-    visionModels: ['qwen3.8-max', 'qwen3.7-plus'],
+    // 百炼当前图文模型均走多模态能力，不能把 Flash 系列误标为仅文本。
+    visionModels: ['qwen3.8-flash', 'qwen3.7-flash', 'qwen3.7-plus', 'qwen3.8-max'],
   },
   doubao: {
     label: '豆包 Doubao（火山方舟）',
@@ -173,10 +173,25 @@ const DEFAULT_CONFIG = {
     // 主人骂她时能不能还嘴（默认关：只许委屈不许骂回去）
     masterRoast: false,
   },
-  chat: { privateMaxChars: 100, groupMaxChars: 70, historyTurns: 120, groupHistoryTurns: 100, maxBubbles: 2, discussionMaxChars: 400, emojiChance: 0 },
+  chat: {
+    privateMaxChars: 100, groupMaxChars: 70, historyTurns: 120, groupHistoryTurns: 100,
+    maxBubbles: 2, discussionMaxChars: 400, emojiChance: 0,
+    // 连续消息收集：最后一条后安静多久再处理；群聊另有从首条开始的最大等待。
+    messageSettleMs: 1500, groupMaxBatchWaitMs: 5000,
+  },
   // 联网：问天气/新闻这类实时问题时现搜。city 用来把「今天天气怎么样」补成「上海 天气」，
   // 搜到的结果准得多；留空就按对方原话搜（也能用，但经常搜到别的城市）。
-  websearch: { enabled: true, city: '', timeoutMs: 8000 },
+  // enabled 是内部/测试用闸门：设置页不提供，加载配置时强制 true。API 搜索另有总开关。
+  websearch: {
+    enabled: true,
+    city: '',
+    timeoutMs: 8000,
+    // API 搜索：一个总开关；开启后才使用 providers 里勾选的搜索 API。
+    api: { enabled: true, followChat: true, providers: [] },
+    deepseek: { apiKey: '' },
+    // 知乎开放平台：免费额度有限，默认 4999 次/天，超了只走本地搜索。
+    zhihu: { accessSecret: '', dailyLimit: 4999 },
+  },
   // 环境：拼进提示词 <env> 块的稳定信息（开关在 features.envContext）。
   // location 是给人填的，可以精确到区（「厦门市思明区」）；留空就交给自动探测，
   // 探测也拿不到才退回 websearch.city（只有城市级），都没有就整行不写。
@@ -222,6 +237,7 @@ const DEFAULT_CONFIG = {
   },
   // 图片理解：默认智谱 GLM-4V-Flash（免费）
   features: {
+    javascriptPlugins: false,
     stickers: false,
     // 系统提示词静态化（前缀缓存）：关掉 = 回到「每轮都塞时间/心情/说话人」的旧行为
     staticSystem: true,
@@ -241,9 +257,12 @@ const DEFAULT_CONFIG = {
   },
 
   vision: { apiKey: '', baseUrl: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4.6v-flash', timeoutMs: 30000 },
-  // 语音识别：默认阿里云百炼 qwen3-asr-flash，apiKey 留空则用 settings.json / deepseek.apiKey
+  // 新安装默认启用并跟随聊天；已有的显式关闭和手动服务配置保持不变。
+  // provider=auto 时：地址含 dashscope 走百炼，含 api.deepseek.com 走 DeepSeek。
+  // apiKey 留空则用 settings.json / 同源服务商的 Key。
   voice: {
     enabled: true,
+    provider: 'follow',
     apiKey: '',
     baseUrl: 'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
     model: 'qwen3-asr-flash',
@@ -421,7 +440,7 @@ function migrateSampling(cfg, log) {
 function loadConfig({ root = projectRoot(), env = process.env, readOnly = false } = {}) {
   const { registerSecrets } = require('./redact');
   registerSecrets(env);
-  const configPath = path.join(root, 'config.json');
+  const configPath = require('./configPath').configPath(root);
   const configExists = fs.existsSync(configPath);
   // 解析失败不能悄悄当成「空配置」：那会让所有默认值顶上来，用户看到的是
   // 「配置全没了」，日志里却一个字都没有（真实事故：手填路径写了单反斜杠，
@@ -440,11 +459,16 @@ function loadConfig({ root = projectRoot(), env = process.env, readOnly = false 
       }
       fromFile = parsed;
     } catch (err) {
-      configError = require('./redact').redactSecrets((err && err.message) || err);
+      configError = require('./errors').errorMessage(err, 'config.json 读取失败');
       fromFile = {};
     }
   }
   const cfg = deepMerge(DEFAULT_CONFIG, fromFile);
+  // 旧版手动设置没有跟随标记；升级不能把它们当新默认覆盖。
+  const oldVoice = fromFile.voice;
+  if (oldVoice && !Object.prototype.hasOwnProperty.call(oldVoice, 'provider') && (oldVoice.baseUrl || oldVoice.apiKey || oldVoice.model)) cfg.voice.provider = 'auto';
+  const oldSearch = fromFile.websearch?.api;
+  if (oldSearch && !Object.prototype.hasOwnProperty.call(oldSearch, 'followChat') && oldSearch.providers?.length) cfg.websearch.api.followChat = false;
   registerSecrets(cfg);
   // 表情包不再按概率发送（分类由模型标记决定），旧的 chances / genericChance
   // 即使还留在 config.json 里也不参与运行，这里不再做任何兼容搬移。
@@ -467,6 +491,9 @@ function loadConfig({ root = projectRoot(), env = process.env, readOnly = false 
       }
     } catch { /* 写不了就算了，内存里已经生效 */ }
   }
+  // 本地搜索不再提供关闭入口：老配置里的 false 也不生效。
+  // 需要测试隔离时仍可直接构造 config 对象（不经过 loadConfig）。
+  cfg.websearch.enabled = true;
   cfg.server.port = Number(env.PORT || cfg.server.port) || 8787;
   cfg.server.host = env.HOST || cfg.server.host;
   if (env.DEEPSEEK_MODEL) cfg.deepseek.model = env.DEEPSEEK_MODEL;
@@ -498,10 +525,13 @@ function loadConfig({ root = projectRoot(), env = process.env, readOnly = false 
 
 /** 首次运行时生成 config.json，方便用户直接编辑 */
 function ensureConfigFile(root = projectRoot()) {
-  const target = path.join(root, 'config.json');
+  const target = require('./configPath').configPath(root);
   if (fs.existsSync(target)) return target;
   const example = path.join(root, 'config', 'config.example.json');
-  if (fs.existsSync(example)) fs.copyFileSync(example, target);
+  if (fs.existsSync(example)) {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(example, target);
+  }
   return target;
 }
 
@@ -564,28 +594,43 @@ function resolveVisionConfig(cfg) {
   // 没有这个标记的老设置（只写了 visionModel）按手动处理。
   // 自定义接口（visionProvider=custom）天然是手动：地址和模型都是用户自己填的。
   const customVision = settings.visionAuto !== true && String(settings.visionProvider || '').trim() === 'custom';
-  const manual = customVision || settings.visionManual === true || (hasModel && settings.visionManual === undefined);
+  const dedicated = Boolean(v.apiKey || settings.visionApiKey || settings.keys?.vision);
+  const manual = customVision || settings.visionManual === true || (hasModel && settings.visionManual === undefined)
+    || (dedicated && settings.visionAuto !== true);
   let model = String(settings.visionModel || v.model || 'glm-4.6v-flash').trim();
   let baseUrl = String(settings.visionBaseUrl || v.baseUrl || 'https://open.bigmodel.cn/api/paas/v4').trim();
   let auto = settings.visionAuto === true;
   // 手动模式下用户可能指定了「看图服务商」（跟聊天页一样先选服务商再选模型）。
   // 自动模式下服务商就是聊天服务商，不用单独存。
   let provider = auto ? '' : String(settings.visionProvider || '').trim();
+  let capabilityHint = '';
   // 还没跟随过（新装 / 刚切到不能看图的聊天模型）时，优先用当前服务商自己的看图模型：
   // 这样一把 Key 就能看图，不会退回需要智谱 Key 的默认模型。
-  if (!manual && !auto && hasModel === false && c.paths) {
+  if (!manual && (auto || hasModel === false) && c.paths && (auto || settings.provider || c.provider || c.deepseek || c.llm)) {
     try {
       const rt = resolveRuntime(c);
-      const fallback = ((rt.preset && rt.preset.visionModels) || [])[0] || '';
+      const models = (rt.preset && rt.preset.visionModels) || [];
+      const fallback = models.includes(rt.model) ? rt.model : models[0] || (auto ? rt.model : '');
+      if (!models.includes(rt.model)) {
+        capabilityHint = (rt.preset.models || []).includes(rt.model)
+          ? `当前聊天模型 ${rt.model} 不支持识图。`
+          : `当前聊天模型 ${rt.model} 的识图能力尚未确认。`;
+        capabilityHint += models.length ? `自动使用同服务商的 ${fallback}，也可手动修改。` : '请确认该接口支持图片，或手动选择看图服务。';
+      }
       if (fallback) {
         model = fallback;
-        baseUrl = String(rt.preset.baseUrl || baseUrl);
+        baseUrl = String(rt.baseUrl || baseUrl);
         auto = true;
         provider = '';
       }
     } catch { /* 取不到服务商信息就按原值 */ }
   }
-  return { ...v, model, baseUrl, manual, auto, provider };
+  const selected = provider === 'custom' ? null : PROVIDERS[provider]
+    || Object.values(PROVIDERS).find(p => p.baseUrl && p.baseUrl === baseUrl);
+  const supported = selected?.visionModels?.includes(model) ? true
+    : selected?.models?.includes(model) ? false : null;
+  if (supported === false) capabilityHint = `当前选择的看图模型 ${model} 不支持识图，请改选视觉模型。`;
+  return { ...v, model, baseUrl, manual, auto, provider, capabilityHint, supported };
 }
 
 /**
@@ -665,6 +710,19 @@ function maskKey(key) {
   return `${key.slice(0, 5)}****${key.slice(-4)}`;
 }
 
+function resolveVoiceConfig(cfg) {
+  const v = cfg.voice || {};
+  if ((v.provider || (v.baseUrl || v.apiKey ? 'auto' : 'follow')) === 'follow') {
+    return { ...v, enabled: v.enabled !== false, auto: true, ...require('./modelFollow').followVoice(resolveRuntime(cfg)) };
+  }
+  return { ...v, enabled: v.enabled !== false, auto: false, supported: true };
+}
+
+function resolveSearchConfig(cfg) {
+  const w = cfg.websearch || {};
+  return w.api?.followChat === true ? require('./modelFollow').followSearch(resolveRuntime(cfg), w) : w;
+}
+
 module.exports = {
   DEFAULT_CONFIG,
   PROVIDERS,
@@ -679,6 +737,8 @@ module.exports = {
   saveSettings,
   resolveRuntime,
   resolveVisionConfig,
+  resolveVoiceConfig,
+  resolveSearchConfig,
   maskKey,
   deepMerge,
   readJson,

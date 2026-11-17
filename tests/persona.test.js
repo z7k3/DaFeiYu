@@ -30,18 +30,19 @@ test('人设提示词包含场景、群聊礼仪和长度限制', () => {
   assert.ok(sys.length > 200);
 });
 
-test('私聊提示词要求短句、不用 Markdown', () => {
+test('私聊默认口语化，长内容按需组织', () => {
   const sys = assemblePrompt({
     config,
     msg: { chatType: 'private', senderName: '小海' },
     now: new Date('2024-05-01T10:00:00'),
   }).prompt;
   assert.match(sys, /私聊/);
-  assert.match(sys, /Markdown/);
+  assert.match(sys, /默认像微信聊天一样口语化/);
+  assert.match(sys, /长内容可按问题需要分行组织/);
 });
 
 for (const [label, customPrompt] of [['默认', ''], ['自定义', '你是鲸鲸，保持一点俏皮。']]) {
-  const promptConfig = { ...config, persona: { ...config.persona, customPrompt, stylePreset: '抽象' } };
+  const promptConfig = { ...config, persona: { ...config.persona, customPrompt } };
   const build = (extra = {}) => assemblePrompt({
     config: promptConfig,
     msg: { chatType: 'group', senderName: '阿螈', chatTitle: '深海鱼塘', ...extra },
@@ -51,16 +52,15 @@ for (const [label, customPrompt] of [['默认', ''], ['自定义', '你是鲸鲸
   test(`${label}提示词共享高优先级的多人指代和实质回答规则`, () => {
     const sys = build({ text: '@鲸鲸 小海说「你怎么还没吃饭」，是在问阿螈' });
     if (customPrompt) assert.ok(sys.startsWith(customPrompt), '保留自定义人设原文');
-    assert.match(sys, /对话理解与回答质量（最高优先级）/);
-    assert.match(sys, /优先于自定义人设、语气、梗、示例和反击要求/);
+    assert.match(sys, /交流原则/);
+    assert.match(sys, /不为了卖萌、接梗或简短而敷衍/);
     assert.match(sys, /群聊历史是多个人参与的消息事件/);
     assert.match(sys, /不是每个「你」都指机器人/);
     assert.match(sys, /@机器人只是请求你回应，不会把引用、转述或对其他人说的话中的「你」重新绑定/);
     assert.match(sys, /明确点名、@目标、引用对象和上下文中的明确指向优先/);
     assert.match(sys, /只有确实存在影响回答的歧义时才简短澄清/);
-    assert.match(sys, /回答简短但有实质内容/);
-    assert.match(sys, /不硬塞鲸鱼、海洋、吃的等主题/);
-    assert.match(sys, /不要反复用吃的、身份自述、口癖、缩写或抽象梗/);
+    assert.match(sys, /先回答关键点/);
+    assert.match(sys, /不硬塞口癖、角色主题/);
     assert.doesNotMatch(sys, /大白饭|白米饭/);
     assert.match(sys, /先前 assistant 的话也可能说错/);
     assert.match(sys, /不知道的事实或缩写就承认不确定，不猜全称/);
@@ -110,6 +110,38 @@ test('自定义人设按已认证关系轻调语气，不强制敷衍或撒娇',
       assert.doesNotMatch(sys, /当前发言者是已认证的主人/);
     }
   }
+});
+
+test('颜文字档位在默认人设和自定义人设里都进提示词', () => {
+  for (const customPrompt of ['', '你是鲸鲸。']) {
+    const sys = assemblePrompt({
+      config: { ...config, persona: { ...config.persona, customPrompt, emojiLevel: '关' } },
+      msg: { chatType: 'private', senderName: '小海' },
+      now: new Date('2024-05-01T14:30:00'),
+    }).prompt;
+    assert.match(sys, /【颜文字 \/ emoji】完全不要用/, customPrompt ? '自定义人设' : '默认人设');
+  }
+});
+
+test('已移除的抽象模式、情绪开关、整体语气不再影响提示词', () => {
+  const sys = assemblePrompt({
+    config: {
+      ...config,
+      persona: {
+        ...config.persona,
+        stylePreset: '抽象',
+        styleText: '每句都要带省略号',
+        emotions: false,
+      },
+    },
+    msg: { chatType: 'private', senderName: '小海' },
+    now: new Date('2024-05-01T14:30:00'),
+  }).prompt;
+  assert.doesNotMatch(sys, /抽象模式/);
+  assert.doesNotMatch(sys, /整体语气/);
+  assert.doesNotMatch(sys, /每句都要带省略号/);
+  assert.doesNotMatch(sys, /【情绪】/);
+  assert.match(sys, /【说话示例/, '普通模式仍然带说话示例');
 });
 
 test('深夜心情自动变困', () => {
@@ -213,15 +245,15 @@ test('别名是其他昵称的前缀时不能误删', () => {
   assert.equal(plainOther.text, '小鲸鱼好可爱');
 });
 
-test('认真讨论时允许更长回复，并带观点/例子要求', () => {
+test('认真讨论保留观点要求，但不绕过私聊字数设置', () => {
   const sys = assemblePrompt({
     config,
     msg: { chatType: 'private', senderName: '小海', discussion: true },
     now: new Date('2024-05-01T14:30:00'),
   }).prompt;
   assert.match(sys, /认真讨论模式/);
-  assert.match(sys, /可以有立场/);
-  assert.match(sys, /400/);
+  assert.match(sys, /说清观点和必要理由/);
+  assert.match(sys, new RegExp(`最多约 ${config.chat.privateMaxChars} 字`));
   const plain = assemblePrompt({
     config,
     msg: { chatType: 'private', senderName: '小海' },

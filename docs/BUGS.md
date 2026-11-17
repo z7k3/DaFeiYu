@@ -3,8 +3,48 @@
 每一行都是一次真实故障：先有现象，再定位根因，最后落一个能重复验证的修复。
 修新 bug 时照这个格式加到最上面，并在 `tests/` 里补一条能复现它的测试。
 
+**已接受的破坏性变更（BREAKING，2026-11-14）**：上游 PR155 已移除旧人设汇总响应与补丁写入中的 `preset`、`text`、`emotions` 语义，以及相关预设转换、预览支持、旧管理命令与设置项。用户于 2026-11-14 明确接受这些既有移除；上述旧 API 字段与旧命令不再支持，不保留这些旧能力的向后兼容语义。本次文档补记不表示三项缺陷纠错引入了上述移除，也不授权其他接口或权限收缩。
+
 | # | 现象 | 根因 | 修复 | 版本 | 回归测试 |
 | --- | --- | --- | --- | --- | --- |
+| 122 | 后台 UIA 连续失败后持续预热、重建，反复触碰异常微信窗口 | 心跳巡检没有失败暂停状态，重建失败或异常后继续每轮探测 | 连续三次失败保留一次原有重建机会，随后暂停该心跳线程探测；正常连接、实际发送账号核验不变，重连桥接恢复后台检查；首次调用卡死仍需另查 | 4.1.7 | `tests/test_heartbeat_uia_pause.py` |
+| 121 | 日记找不到已识别为主人的私聊会话 | 历史会话可能保留默认来源元数据，日记按来源字段排除，未结合规范会话 key | 日记只读兼容规范微信私聊 key，始终排除群聊；缺少主人记录时显示下一步操作并记录结构诊断 | 4.1.7 | `tests/diary.test.js` |
+| 120 | 异常链接网页或不返回的阅读器堵住聊天及同会话后续消息 | 网页解析占用主线程，消息层未给阅读器设置截止时间，失败记账再次抛错 | 网页在线程中限时解析，读取超时取消，失败继续回复并释放会话队列；失败记账异常不向上传播 | 4.1.7 | `tests/links.test.js` |
+| 119 | 自动看图沿用旧接口、清空聊天 Key 后回退旧专用 Key，纯文本模型仍被用于识图 | 自动配置保留旧服务状态，Key 回退链与实际选择不一致，能力元数据不完整 | 自动模式实时解析当前服务与模型，手动设置保持不变，清空 Key 不跨服务回退；已知不支持时提示并阻止请求，更新千问视觉能力表 | 4.1.7 | `tests/model-follow.test.js`、`tests/vision-follow.test.js`、`tests/providers.test.js` |
+| 118 | 填好聊天 Key 后语音识别仍无法使用或与测试调用不一致 | 运行包缺 SILK 解码库，识别配置独立且桥接未逐条读取聊天设置 | 补齐固定版本解码依赖和离线验证；默认跟随已适配官方接口，保留手动服务与关闭状态；逐条快照匹配地址和 Key，识别请求拒绝重定向 | 4.1.7 | `tests/test_voice_asr.py`、`tests/test_model_follow.py`、`tests/model-follow.test.js` |
+| 117 | 长回复随机超过私聊或群聊整轮字数上限，CI 的讨论长度回归偶发失败 | 正文先截断，随后追加 emoji 或颜文字时未计算剩余字数；测试误以为 emojiChance=0 关闭表情，实际仍按档位随机追加 | 追加前计算整轮气泡、完整表情及合并空格的字符数，空间不足则保留正文、不追加表情；固定随机结果覆盖私聊、群聊、讨论及单/双气泡 | 4.1.6.1 | `tests/bot.test.js` |
+| 116 | 发完一张图片 Bot 就不回话了，日志停在「图片缓存尚未就绪，等待重试（1/3）」，两分钟没动静，只能重启桥接 | 微信图片的 AES 密钥要从 Weixin.exe 进程内存里反推；随包 wechatauto 扫不到时会每 2 秒重扫、最多等 120 秒（`_scan_aes_key(monitor=True)`）。这段代码跑在「同一会话串行」的消息 worker 里，一张图就把整个会话后面的消息全堵住；磁盘这条走不通时也没有任何退路，只能丢掉这条消息 | 新增 `bridge/media_key_compat.py` 给实例打超时护栏：强制单次扫描、扫描本身超时就放弃这张图。`on_message_inner` 的图片 / 表情 / 语音识别统一走 `run_media_with_timeout`，超时只放弃这一条并记 error 日志。另补诊断与兜底：记录 `cfgDword` 能否离线派生、图片来自哪个账号目录；本地解不开时走 `bridge/image_ui_fallback.py`，先让微信自己导出明文，导出不了再截预览窗送看图模型；密钥问题跳过缓存重试，每张图单独尝试、不设时间窗丢弃，全都失败时把「没取到图」交给模型自然回一句（禁止编造画面），占位文本按消息 id 查重。所有没处理的消息与兜底失败步骤都补了「原因 + 会话 + 消息id」日志，不再有静默 return。不改 vendor 源码 | 4.1.3 | `tests/test_received_media.py`（密钥扫描超时、识别超时、来源与密钥诊断、界面兜底导出与截图、失败后仍回一句、两张图不被查重吞掉、跳过消息与兜底失败都有日志）、`tests/bridge-recovery.test.js` |
+| 115 | 探测期间用户删除并重打相同探测字时，草稿可能被清除后继续发送 | 把可见文字等于探测字当作所有权证据，绕过微信输入活动检查 | 有微信输入活动且仍有内容时保留草稿并返回 input_dirty，不清理、不键入正文、不发送；无用户编辑时仍允许清理延迟回读的自有探测字，修正 #108 的探测字豁免 | 4.1.3 | `tests/test_refactor_t14_upstream_guards.py`、`tests/test_bg_live_encoding.py` |
+| 114 | 普通文字、代码或附件中出现 refermsg 标签时被误当作引用，正文可能被改写或丢弃 | 仅靠标签子串识别引用，未核对消息类型与完整 XML 结构 | 普通文本保持原文；仅对候选卡片校验完整引用结构与类型，再沿用合法引用的提取路径；保留原发送者、白名单及后续闸门 | 4.1.3 | `tests/test_refactor_t14_upstream_guards.py`、`tests/bridge-quote-receive.test.js` |
+| 113 | 管理员使用改名为、改名成、改名字等长别名时，名字混入别名尾字；空后缀可能回退成短前缀 | 正则先匹配短别名并在后缀失败时回溯 | 先识别完整的最长别名，再提取和校验后缀；保留原名字清理、私聊主人与魔咒授权、原授权期限及退出管理规则 | 4.1.3 | `tests/refactor-t01-upstream-admin-alias.test.js`、`tests/command-authorization.test.js` |
+| 112 | 常规模型请求配置温度 0 后仍按默认温度生成 | payload 用真值回退吞掉显式零值，模型族能力判定分散 | 共用模型能力描述并保留常规请求的显式零值；缺失与非法温度使用默认值，安全重试及服务商参数差异保持兼容 | 4.1.3 | `tests/refactor-t02-model-capabilities.test.js`、`tests/sampling.test.js` |
+| 111 | 同 purpose 并发调用无法按单次请求关联用量 | 用量事件只有递增序号与用途，缺少可选请求身份 | 客户端新增可选请求上下文，完成、重试及流式用量沿用同一身份，旧调用保持兼容；chat 目的、上下文与记账接线仍由 T25 完成 | 4.1.3 | `tests/refactor-t02-request-usage.test.js`、`tests/usage-display.test.js` |
+| 110 | 用户在微信里「引用」一条消息再回复，机器人像没收到：桥接日志连「收到 私聊」都没有 | 引用回复是 appmsg（57<<32 后低 32 位为 49，类型名落到「文件/链接/卡片」），正文里没有 `<url>`，被 type 49 分支当成不认识的卡片直接丢弃；也从未解析过 `<refermsg>` | 先把 `<refermsg>` 拆成（被引用者、被引用原话、这次新打的字）的纯文本再进管道，兼容 4.x 的 `<title>`、老版本 `</msg>` 之后的位置、多层引用和 HTML 实体；解析成功只跳过卡片分支，白名单、系统通知、去重等闸门照旧 | 4.1.3 | `tests/test_receive_quote.py`、`tests/bridge-quote-receive.test.js` |
+| 109 | 连续两次发送失败后这个会话被永久跳过，微信恢复后照样不回，必须重启桥接 | 失败计数达到阈值就直接写进 `dead_chats`，和「被移出群」这种长期失效共用同一个集合，没有解除条件 | 连续失败改为停发 5 分钟，到点自动再试并清零计数；被移出群仍保持长期跳过 | 4.1.3 | `tests/test_bg_live_encoding.py`（`PausedChatTests`） |
+| 108 | 私聊回复反复发不出去，日志只有「编码探测后无法确认输入框已空」→ `input_dirty`，之后每次发送都报 `input_not_empty`，只能手动清空微信输入框 | 编码探测用 `WM_CHAR` 打字后只读 4 次（约 0.4 秒）就判稳定，微信把字同步进控件比这更慢：先读到空框，收尾时读到刚掉进来的「鲸」，判定为内容变化而放弃清理；框里只剩探测字时又因为「用户可能动过键鼠」同样放弃清理。探测字留在输入框，后续发送全被当作用户草稿拦住。探测一个字都没打进去也会被当成脏框 | 回读改为等值稳定、期望有字却读到空不算稳定；清理前重读，框已空直接算干净，探测字不再豁免微信输入活动检查，无法确认草稿所有权时按 #115 保留内容并停止发送，读不到内容仍不盲清；一个字都没写进去时按版本号编码继续发送，`input_dirty` 只在确认有残留时出现；撞到探测残留时日志直接说明要删哪个字 | 4.1.3 | `tests/test_bg_live_encoding.py`（探测字延迟落框、探测没打进去仍可发送、用户活动时保留不明草稿；无用户编辑时延迟探测字仍可清理） |
+| 107 | 主动搭话把字符串或非法权限值误判为放行，覆盖参数与缺省语义不一致 | 权限分支混用真值判断与通用回退，未区分字段缺省和显式非法 | 主动搭话复用严格布尔解析；非法授权保持限制，缺省沿用该权限域默认，并统一配置与临时覆盖规则 | 4.1.3 | `tests/refactor-t05-care-booleans.test.js` |
+| 106 | 主人硬 ID 已绑定后同名非主人仍入选主动搭话，旧昵称多人匹配有歧义 | 目标筛选重新按显示名猜测身份，与主人事实分离 | 复用主人事实并优先绑定 ID；旧昵称或备注只允许唯一弱匹配，拒绝歧义且不授予管理权限 | 4.1.3 | `tests/refactor-t05-owner-targets.test.js` |
+| 105 | 旧预算查询或配置响应覆盖新选择、编辑及卸载页面 | 异步结果缺少请求代次、表单修订和页面生命周期核验 | 已接入设置页面的查询与回填使用操作票据和页面失效保护，旧结果不回填 | 4.1.3 | `tests/refactor-t17-configuration.test.js`、`tests/launcher/JsonChecks/Program.cs` |
+| 104 | 保存期间编辑丢失、旧成功响应清除新密钥，失败后相同值不能重试 | 在途状态丢弃新编辑，提交前推进水位且密钥清理未核对快照 | 设置与表情包表单记录 desired/inFlight/committed 修订，仅成功推进水位；保留后续编辑并精确核对已提交密钥 | 4.1.3 | `tests/refactor-t17-configuration.test.js`、`tests/launcher/JsonChecks/Program.cs` |
+| 103 | JSON 缺失默认值被零吞掉，数字字符串解析受系统区域影响 | 读取失败与合法零值共用返回值，内部数字使用当前区域解析 | 保留公共读取入口并区分 Try 读取结果，内部数字采用不变区域；非法、溢出与非有限值回退 | 4.1.3 | `tests/launcher/JsonChecks/Program.cs` |
+| 102 | 主动搭话状态或账号缓存写入失败损坏旧件，固定临时名可能冲突 | 直接打开目标写入或复用同一临时文件 | 使用同目录唯一临时文件并原子替换，失败保留旧件且只清理本次临时文件；保留调用方 best-effort 与独占标记协议 | 4.1.3 | `tests/test_refactor_t13_atomic_json.py` |
+| 101 | 桥接日志节流键长期增长，并发首错与折叠计数不一致 | 多套无界字典使用不同时间窗口 | 共享容量、TTL 和并发抑制，保留首错、折叠计数及旧入口 None 返回 | 4.1.3 | `tests/test_refactor_t13_runtime.py` |
+| 100 | 缺省 token 或坏配置触发误重启，热改线程池参数后记录与实际不符 | 启动、重载和监视器各自读取并使用不同默认值 | 共用有效配置快照，坏 JSON 保留旧值并允许同 mtime 重读；需重启参数在安全重启前保留实际运行值 | 4.1.3 | `tests/test_refactor_t13_runtime.py` |
+| 99 | 提醒丢群 @、空目标仍发送，HTTP 或业务失败混同无任务及成功回执 | 生产提醒接线与受测工厂重复，工厂不匹配实际 get/post 客户端 | 真实装配委托统一适配器并校验目标和响应，保留插件授权、语音取消及关闭生命周期；未知结果不自动重试 | 4.1.3 | `tests/test_engine_reminder_wiring.py`、`tests/test_reminder_watch.py`、`tests/bridge-reminder-wiring.test.js` |
+| 98 | Python 同名测试被覆盖，桥接配置与目录回归在 CI 有可用解释器时仍被跳过 | 重复方法名只收集最后一个用例，测试只检查固定便携解释器路径 | 审计同名声明并保留两份原测试体，验证实际可用解释器；桥接回归使用隔离副本并禁止真实进程、磁盘和用户配置探测 | 4.1.3 | `tests/refactor-t23-python-audit.test.js`、`tests/refactor-t23-python-entry.test.js`、`tests/bridge-globals.test.js`、`tests/db-dir.test.js` |
+| 97 | 隐私扫描未读取文件或目录时仍可能报告干净 | 扫描计数与读取成功脱钩，读取异常未作为不完整结果传播 | 区分已读、主动排除和读取错误，严格 API 与命令行拒绝不完整结果；发布自检调用者的严格结果接线另行完成 | 4.1.3 | `tests/refactor-t23-privacy-scan.test.js`、`tests/privacy-scan.test.js` |
+| 96 | 本地与 CI 任务不一致，早先失败被后续成功覆盖，C# 静态文本被误记为执行证据 | 测试入口与退出码分别维护，库存未严格区分编译入口、调用声明和实际执行 | 共用有序任务清单并保留每个失败，校验嵌套项目的真实选中入口；静态声明明确不代表 case 已执行 | 4.1.3 | `tests/refactor-t23-test-tasks.test.js`、`tests/refactor-t23-inventory.test.js`、`tests/ci-test-order.test.js` |
+| 95 | 保存部分朋友圈设置时覆盖未提交字段，在线请求可能被严格校验拒绝，离线保存可能启动定位探测 | 调用者使用默认值或显式 undefined 补齐缺省字段，离线命令复用了在线副作用入口 | 在线与离线只保存本次提交字段，保留现有设置与显式零值；在线开启仍需确认并绑定实时账号，离线保存不启动定位探测 | 4.1.3 | `tests/refactor-t03-config-values.test.js`、`tests/refactor-t03-moments-caller.test.js`、`tests/launcher-offline-config.test.js` |
+| 94 | 合法开关写法被错存为关闭，空白数值变成零，留空密钥或嵌套功能更新覆盖原值 | 配置校验、两种补丁写入及离线命令使用不同转换和合并规则 | 共用严格布尔与数值解析，非法值整批拒绝，保留显式零值和留空密钥；按注册路径合并功能开关并拒绝非对象根及原型路径 | 4.1.3 | `tests/refactor-t03-config-values.test.js`、`tests/config-schema.test.js`、`tests/config-flag-compat.test.js` |
+| 93 | 记忆恢复复制归档失败后仍可能删除原数据，写入或交换中断可能留下部分恢复 | 归档复制异常被吞，恢复直接改写原目录；启动未先处理未完成事务 | 先完整准备并校验新树，再保留原副本执行交换；失败回滚，中断后在配置读取与 Store 构造前恢复，无法安全恢复时中止启动 | 4.1.3 | `tests/refactor-t08-restore.test.js`、`tests/refactor-t08-startup-recovery.test.js`、`tests/memory-backup.test.js` |
+| 92 | 停用消息插件后保存设置会重新生成启用授权 | 设置保存与初次启用共用写授权路径，未核对当前启用状态与源码哈希 | 保存仅修改配置；已有有效授权时才同步设置，首次启用和完整系统权限须单独确认；更新保留数据但撤回旧授权 | 4.1.2 | `tests/plugin-market/Program.cs`、`tests/javascript-plugins.test.js` |
+| 91 | 后台发送的多个失败状态都显示“草稿或正文校验失败”，无法判断是否已尝试发送 | 发送前已有草稿、输入中断和点击发送后残留被合并成一条提示 | 分别显示处理阶段并记录稳定原因码，保持草稿保护和禁止盲目重发 | 4.1.1 | `tests/test_bg_live_encoding.py` |
+| 90 | 文字发送失败后表情包仍占队列，后续请求一直在途直到超时 | 桥接只在日志中说已取消，没有结束服务端 reserved 任务 | 带桥接 token、代次和精确会话取消尚未领取的预留任务，取消幂等，sending 任务不受影响；语音替代回复也释放未用表情包 | 4.1.1 | `tests/test_reply_sticker_cancel.py`、`tests/sticker-service.test.js` |
+| 89 | 群聊能收到消息却提示只有内部 ID，无法发送；空别名一直不恢复 | 群名查询忽略本地备注，错误使用最后发言者作为群名，空别名查询被永久缓存 | 读取精确群联系人的备注并保留群名兼容查询，不再使用成员身份代替群身份，空查询允许重试 | 4.1.1 | `tests/test_group_send_resolution.py` |
+| 88 | 文字能发，表情包却报窗口绑定错误；未确认发送后即使输入框清空也一直被隔离 | 随包 UIA 构造器只设置公开 hwnd，发送和恢复护栏却只读取私有 _pinned_hwnd；测试伪造了私有字段而遗漏真实驱动形态 | 统一兼容公开及旧私有绑定，有冲突或公开字段未绑定仍拒绝；保留实时账号、根窗口、会话和草稿核验，不自动重发旧任务 | 4.1.1 | `tests/test_sticker_transport.py` |
+| 87 | 旧配置缺字段时，新消息因数据库延迟约 13 秒而被全部跳过 | 桥接过期阈值默认为 4 秒，与内核和模板的 120 秒不一致 | 启动和热加载缺省值统一为 120 秒，保留显式阈值，旧历史仍跳过 | 4.1.1 | `tests/test_bridge_startup_ready.py` |
+| 86 | 内核和桥接已在后台运行，启动器仍显示未启动，点击启动时端口冲突 | 状态探测只识别本启动器创建的子进程 | 通过本地健康接口识别现有内核并读取微信状态，启动前检查端口上的实例 | 4.1.1 | `tests/launcher/Checks` |
+| 85 | 桥接意外退出，崩溃栈位于 Python 线程转储逻辑 | `faulthandler` 定时转储并发遍历其他线程，遇到已释放的帧会触发原生异常 | 移除定时转储，故障只记录当前线程，实际超时时由 Python 线程同步记录诊断 | 4.1.1 | `tests/bridge-crash.test.js` |
 | 84 | 多开时消息偶尔从另一个号发出去；UIA 已选中窗口却一直“树是空壳”；网关有时重复发气泡 | 账号目录用前缀匹配、自动选号跳过 `windowHwnd` 归属校验、`pick_account_window` 无锁；UIA 读写用了两个不同的 kernel32 句柄；`sendBubbles` 第一条带完整 `bubbles` 后又逐条重发 | 账号只认全等或哈希后相等，`windowHwnd` 必须有数据库归属证据，择窗加 `account_lock`，未确认账号不再按标题兜底；UIA 统一 kernel32 + HANDLE 并记录读写失败；网关每条请求只带当前气泡，补 `accountWxid`；faulthandler 不重复 dump | 4.1.0 | `tests/bridge-adaptive-encoding.test.js`、`tests/wechat-account.test.js`、`tests/core-modules.test.js` |
 | 83 | 被静音后仍会续接话窗口；系统通知在磁盘里留下空会话；群聊长历史被二次裁剪后凭空消失；`maxMessages` 配置不生效 | 静音副作用写在闸门之前；`checkpoint` 对未知 key 也 `ensureChat`；context 二次裁剪只删 entries 不重建 summary；`pruneRaw` 固定用常量 | 静音消息在 trigger 直接返回，不写状态；`checkpoint` 只处理已存在会话；二次裁剪循环重算摘要；`maxMessages` 接入 `ChatStore.pruneRaw`，`archiveCount` 真统计 | 4.1.0 | `tests/core-modules.test.js`、`tests/memory-budget-plan.test.js`、`tests/context.test.js` |
 | 82 | 朋友圈卡在相机菜单、选图窗口或绿色发表按钮前 | 菜单小字漏识别，文件控件类型/层级与固定假设不符，自绘按钮 Invoke 可返回成功但无实际动作；原生 UIA 失败会影响整个桥接 | 独立子进程执行、内存 OCR、原生控件绑定 UIA、文案/预览核验后单次真实点击；未知结果不重发，保留额度和去重游标；补齐手动发表与三类配图 | 4.1.0 | `tests/test_moments_publish.py`、`tests/test_moments_worker.py`、`tests/test_moments_ocr.py`、`tests/moments.test.js` |
@@ -96,4 +136,11 @@
 2. **定位到最底层**：现象 → 直接原因 → 根因（哪个判断/哪行代码/哪个环境假设）。
 3. **一处修复**：同类判断只保留一份实现（主人判定、mime 判定、ffmpeg 查找都是这么收的）。
 4. **补回归测试**：`tests/` 里要有能在修复前失败、修复后通过的用例。
+   台账这一列只写 CI 真的会执行的入口，自检会拿 `.github/workflows/` 反查，写错就红：
+   - JS：`tests/xxx.test.js`（`npm test` 只跑 `tests/` 浅一层，别放子目录）
+   - Python：`tests/test_xxx.py`（`unittest discover -s tests -p 'test_*.py'`）
+   - C#：`tests/voice-send/VoiceSendChecks.csproj` 这类**项目文件**，或直接写它所在目录
+     （如 `tests/launcher/Checks`，自检会归约到目录里 CI 执行的 csproj）
+   - 出包类：写 `scripts/release-check.js` 这类真的在 CI 里跑的自检脚本；一个 bug 一行，
+     别写「启动器构建」这种没法验证的说法
 5. **写进这里**：一行一个问题，别让下一个人重踩。

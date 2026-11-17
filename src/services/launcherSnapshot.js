@@ -10,16 +10,10 @@ const presets = require('../persona/presets');
 const features = require('../infra/features');
 const { ReminderService } = require('./reminderService');
 
-const { applyPersonaPatch } = require('./persona');
+const { applyPersonaPatch, savePersonaPreset, deletePersonaPreset, renamePersonaPreset } = require('./persona');
 const { DiaryService } = require('./diary');
 const { MomentsPublisher } = require('./momentsPublisher');
-
-function momentsSettings(config) {
-  const m = config.moments || {};
-  return { ok: true, autoLike: m.autoLike === true,
-    autoLikeMaxPerDay: Number(m.autoLikeMaxPerDay) || 0,
-    autoReadEveryHours: Number(m.autoReadEveryHours) || 0 };
-}
+const { prepareFeatureCommand, momentsSettings, prepareMomentsSettingsPatch, prepareMomentsPublishPatch } = require('./configCommands');
 
 async function saveLocalConfiguration(root, { path, body }, env = process.env) {
   const config = loadConfig({ root, env, readOnly: true });
@@ -28,7 +22,7 @@ async function saveLocalConfiguration(root, { path, body }, env = process.env) {
   // 离线保存只在本机估算人设长度，不调用模型服务。
   llm.countPromptTokens = undefined;
   const runtime = { config, llm, logger: { info() {}, warn() {} },
-    gateways: new Map(), store: { summary: () => ({}) }, startedAt: Date.now() };
+    gateways: new Map(), store: { summary: () => ({}) }, startedAt: Date.now(), offlineConfiguration: true };
   const save = patch => { applyConfigPatch(runtime, patch); return { ok: true, ...publicConfig(config) }; };
   switch (path) {
     case '/api/config': return save(body.patch);
@@ -38,31 +32,41 @@ async function saveLocalConfiguration(root, { path, body }, env = process.env) {
     }
     case '/api/settings': return applySettings(runtime, body);
     case '/api/persona': return applyPersonaPatch(runtime, body);
+    case '/api/persona/preset/save': return savePersonaPreset(runtime, body);
+    case '/api/persona/preset/delete': return deletePersonaPreset(runtime, body);
+    case '/api/persona/preset/rename': return renamePersonaPreset(runtime, body);
+    case '/api/persona/preset/reset-market': return presets.resetMarketCopy(config, body.id);
+    case '/api/persona/export': {
+      const document = presets.fromConfig(config);
+      return document.customPrompt.length <= 24000 ? { ok: true, persona: document }
+        : { ok: false, error: '可分享包的自定义提示词最多 24000 字符，请先精简。' };
+    }
     case '/api/persona/preset': {
       const patch = presets.toPatch(presets.load(config, body.id));
       return patch ? applyPersonaPatch(runtime, { ...patch, sourcePreset: body.id })
         : { ok: false, error: '没有可导入的人设预设' };
     }
     case '/api/features': {
-      const feature = features.REGISTRY.find(entry => entry.key === body.key);
-      if (!feature || typeof body.value !== 'boolean') return { ok: false, error: '无效的功能设置' };
-      save({ [feature.path]: body.value });
+      let command;
+      try { command = prepareFeatureCommand(body); }
+      catch { return { ok: false, error: '无效的功能设置' }; }
+      save(command.patch);
       return { ok: true, features: features.list(config) };
     }
     case '/api/moments/settings':
-      save({ 'moments.autoLike': body.autoLike, 'moments.autoLikeMaxPerDay': body.autoLikeMaxPerDay,
-        'moments.autoReadEveryHours': body.autoReadEveryHours });
+      save(prepareMomentsSettingsPatch(body));
       return momentsSettings(config);
     case '/api/moments/publish-settings': {
       const publisher = new MomentsPublisher({ config });
       const current = publisher.settings();
-      const enabled = body.featureEnabled === true && body.enabled === true;
-      if (enabled && !current.account) {
+      const patch = prepareMomentsPublishPatch(body, current);
+      const enabled = (patch['moments.publishFeatureEnabled'] ?? current.featureEnabled)
+        && (patch['moments.publishEnabled'] ?? current.enabled);
+      const changingEnablement = Object.hasOwn(patch, 'moments.publishFeatureEnabled') || Object.hasOwn(patch, 'moments.publishEnabled');
+      if (changingEnablement && enabled && !current.account) {
         return { ok: false, error: '首次开启定时发表需要启动桥接并确认微信账号；可先保存其他发表设置。' };
       }
-      save({ 'moments.publishFeatureEnabled': body.featureEnabled === true,
-        'moments.publishEnabled': enabled, 'moments.publishWithImage': body.withImage === true,
-        'moments.publishIntervalHours': body.interval, 'moments.publishMaxPerDay': body.maxPerDay });
+      save(patch);
       return { ok: true, ...publisher.settings(), ...publisher.status() };
     }
     default: return { ok: false, error: '此操作需要启动内核。' };
@@ -84,7 +88,10 @@ function readSnapshot(root, env = process.env) {
     '/api/moments/publish-settings': { ok: true, ...publisher.settings(), ...publisher.status() },
     '/api/config': { ok: true, config: pub.config, secrets: pub.secrets },
     '/api/settings': getSettings(runtime),
-    '/api/persona': { ok: true, persona: persona.summary(config) },
+    '/api/persona': (() => {
+      const p = persona.summary(config);
+      return { ok: true, persona: p, presetSource: presets.sourceOf(config, p.sourcePreset) };
+    })(),
     '/api/persona/presets': { ok: true, presets: presets.list(config) },
     '/api/features': { ok: true, features: features.list(config) },
     '/api/reminders': { ok: true, items: reminders.list(), rules: {

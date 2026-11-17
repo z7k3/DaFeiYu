@@ -12,13 +12,14 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { errorMessage } = require('../../infra/errors');
 const { spawn } = require('node:child_process');
 
 const stickers = require('../../adapters/stickers');
 const { json, readBody, MIME } = require('../protocol');
 const { isLoopbackRequest } = require('../security');
 
-const BRIDGE_ONLY = new Set(['/api/stickers/gate', '/api/stickers/pending', '/api/stickers/claim', '/api/stickers/ack']);
+const BRIDGE_ONLY = new Set(['/api/stickers/gate', '/api/stickers/pending', '/api/stickers/claim', '/api/stickers/ack', '/api/stickers/cancel']);
 
 function stickerPath(config, emotion, name) {
   const dir = stickers.stickerDir(config, config.root);
@@ -88,7 +89,7 @@ module.exports = function register(router) {
         try {
           fs.unlinkSync(hit.file);
         } catch (err) {
-          return json(res, 500, { ok: false, error: '删除失败：' + ((err && err.message) || err) });
+          return json(res, 500, { ok: false, error: '删除失败：' + errorMessage(err) });
         }
         // 删完马上就读 status 列表，别等目录 mtime 生效。
         stickers.invalidateScan(path.dirname(hit.file));
@@ -138,7 +139,7 @@ module.exports = function register(router) {
             try { await launch(exe); } catch (err) { await launch('explorer.exe'); }
           } catch (err) {
             return json(res, 500, { ok: false, dir: target.dir, mode: target.mode,
-              error: '打开文件夹失败：' + ((err && err.message) || err) });
+              error: '打开文件夹失败：' + errorMessage(err) });
           }
         }
         return json(res, 200, { ok: true, dir: target.dir, mode: target.mode });
@@ -194,7 +195,7 @@ module.exports = function register(router) {
             const to = path.join(dir, nextLabel);
             if (fs.existsSync(from) && !fs.existsSync(to)) fs.renameSync(from, to);
           } catch (err) {
-            return json(res, 500, { ok: false, error: '改文件夹名失败：' + ((err && err.message) || err) });
+            return json(res, 500, { ok: false, error: '改文件夹名失败：' + errorMessage(err) });
           }
           extra[at] = { ...extra[at], label: nextLabel };
           stickers.writeExtraCategories(config, config.root, extra);
@@ -243,6 +244,13 @@ module.exports = function register(router) {
       return (async () => {
         const body = await readBody(req);
         return json(res, 200, { ok: true, item: service.claim(body && body.id) });
+      })();
+    }
+
+    if (pathname === '/api/stickers/cancel' && method === 'POST') {
+      return (async () => {
+        const body = await readBody(req);
+        return json(res, 200, { ok: true, item: service.cancelReserved(body && body.id, body && body.generation, body && body.chatUsername) });
       })();
     }
 

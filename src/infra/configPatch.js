@@ -4,6 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { loadConfig, DEFAULT_CONFIG } = require('./config');
 const configSchema = require('./configSchema');
+const features = require('./features');
+const { parseBoolean, parseNumber } = require('./configValues');
 const { getByPath } = require('./objpath');
 const time = require('./time');
 const { describeError } = require('./errors');
@@ -31,6 +33,8 @@ const SECRET_PATHS = new Set([
   'deepseek.apiKey',
   'vision.apiKey',
   'voice.apiKey',
+  'websearch.deepseek.apiKey',
+  'websearch.zhihu.accessSecret',
   'gateway.wechat.inboundToken',
   'admin.spell',
 ]);
@@ -39,7 +43,7 @@ function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
-function setByPath(obj, dotted, value) {
+function pathParts(dotted) {
   const parts = String(dotted).split('.').filter(Boolean);
   if (!parts.length) throw new Error('空的字段名');
   for (const p of parts) {
@@ -47,6 +51,11 @@ function setByPath(obj, dotted, value) {
       throw new Error('不允许改这个字段：' + dotted);
     }
   }
+  return parts;
+}
+
+function setByPath(obj, dotted, value) {
+  const parts = pathParts(dotted);
   let cur = obj;
   for (let i = 0; i < parts.length - 1; i += 1) {
     if (!isPlainObject(cur[parts[i]])) cur[parts[i]] = {};
@@ -56,15 +65,57 @@ function setByPath(obj, dotted, value) {
   return obj;
 }
 
+/** 删掉点号路径上的字段；父级不存在时返回 false。 */
+function deleteByPath(obj, dotted) {
+  const parts = pathParts(dotted);
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    if (!isPlainObject(cur[parts[i]])) return false;
+    cur = cur[parts[i]];
+  }
+  const last = parts[parts.length - 1];
+  if (!Object.prototype.hasOwnProperty.call(cur, last)) return false;
+  delete cur[last];
+  return true;
+}
+
+/** 清空一个对象里已经空的父级（只处理路径上的中间层，别把用户其它字段带走）。 */
+function pruneEmptyParents(obj, dotted) {
+  const parts = pathParts(dotted);
+  const stack = [];
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    if (!isPlainObject(cur[parts[i]])) return;
+    stack.push([cur, parts[i]]);
+    cur = cur[parts[i]];
+  }
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    const [parent, key] = stack[i];
+    if (isPlainObject(parent[key]) && Object.keys(parent[key]).length === 0) delete parent[key];
+  }
+}
+
+function specOf(dotted) {
+  if (Object.prototype.hasOwnProperty.call(configSchema.FIELDS, dotted)) return configSchema.FIELDS[dotted];
+  if (features.REGISTRY.some(entry => entry.path === dotted)) return { type: 'bool' };
+  return undefined;
+}
+
 /** 按现有配置的类型把接口送来的值转成正确类型（数字/开关/数组/JSON） */
 function coerceValue(config, dotted, value) {
   const cur = getByPath(config, dotted);
-  if (typeof cur === 'number') {
-    const n = typeof value === 'number' ? value : Number(String(value == null ? '' : value).trim());
-    if (!Number.isFinite(n)) throw new Error('「' + dotted + '」要填数字');
+  const spec = specOf(dotted);
+  const fallback = getByPath(DEFAULT_CONFIG, dotted);
+  if (spec?.type === 'bool' || typeof cur === 'boolean' || typeof fallback === 'boolean') {
+    const on = parseBoolean(value);
+    if (on === undefined) throw new Error('「' + dotted + '」要填 true / false');
+    return on;
+  }
+  if (spec?.type === 'int' || spec?.type === 'float' || typeof cur === 'number' || typeof fallback === 'number') {
+    const n = parseNumber(value);
+    if (n === undefined) throw new Error('「' + dotted + '」要填数字');
     return n;
   }
-  if (typeof cur === 'boolean') return value === true || value === 'true' || value === 1 || value === '1';
   if (Array.isArray(cur)) {
     if (Array.isArray(value)) return value.map((x) => String(x).trim()).filter(Boolean);
     return String(value == null ? '' : value).split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
@@ -194,7 +245,7 @@ function mergeConfigInPlace(target, src) {
 }
 
 function reloadRuntimeConfig(runtime) {
-  const next = loadConfig({ root: runtime.config.root, env: runtime.config.env });
+  const next = loadConfig({ root: runtime.config.root, env: runtime.config.env, readOnly: runtime.offlineConfiguration === true });
   // 人设另存在 persona.json；重载时必须与启动时一样合并，否则改称呼会把名字盖回默认。
   const personaStore = require('../persona/store');
   personaStore.apply(next, personaStore.load(next));
@@ -203,11 +254,18 @@ function reloadRuntimeConfig(runtime) {
   try { runtime.store?.replan?.(runtime.config); } catch { /* 预算重算失败不阻断配置保存 */ }
   // envContext 从关到开时，启动时跳过的地点探测要重新启动。
   try {
-    if (runtime.stopLocationProbe) runtime.stopLocationProbe();
-    const locationProbe = require('../services/location');
-    runtime.stopLocationProbe = locationProbe.startAutoProbe(runtime.config, { logger: runtime.logger });
+    // 离线设置进程没有启动内核，不能借保存配置自动启动定位或联网探测。
+    if (runtime.offlineConfiguration !== true) {
+      if (runtime.stopLocationProbe) runtime.stopLocationProbe();
+      const locationProbe = require('../services/location');
+      runtime.stopLocationProbe = locationProbe.startAutoProbe(runtime.config, { logger: runtime.logger });
+    }
   } catch { /* 探测失败不影响对话 */ }
   runtime.momentsPublisher?.reconcile();
+  // API 保存与文件监听走同一次调度，避免某条入口遗漏热重载副作用。
+  runtime.moments?.startAutoRead?.();
+  runtime.stickerService?.reconcile();
+  if (runtime.llm && typeof runtime.llm.reload === 'function') runtime.llm.reload();
   return result;
 }
 
@@ -221,36 +279,38 @@ function reloadRuntimeConfig(runtime) {
  * 其余（比如 gateway.wechat.outboundHeaders 这种真正的 JSON 字段）原样保留。
  */
 function flattenPatch(patch, prefix = '', out = {}) {
+  const fields = [...Object.keys(configSchema.FIELDS), ...features.REGISTRY.map(entry => entry.path)];
   for (const [key, value] of Object.entries(patch)) {
     const dotted = prefix ? `${prefix}.${key}` : key;
-    const expandable = !Object.prototype.hasOwnProperty.call(configSchema.FIELDS, dotted)
-      && Object.keys(configSchema.FIELDS).some((field) => field.startsWith(dotted + '.'));
+    if (!dotted.trim()) continue;
+    pathParts(dotted);
+    const expandable = !specOf(dotted) && fields.some(field => field.startsWith(dotted + '.'));
     if (isPlainObject(value) && expandable) flattenPatch(value, dotted, out);
     else out[dotted] = value;
   }
   return out;
 }
 
-/** 把接口提交的 { "persona.name": "新名字" } 写进 config.json 并立刻生效 */
-function applyConfigPatch(runtime, patch) {
-  if (!isPlainObject(patch)) throw new Error('patch 要是 { 字段名: 新值 } 这样的对象');
-  patch = flattenPatch(patch);
-  const file = runtime.config.paths.configFile;
-  let raw = {};
+function readRawConfig(file, allowMissing = true) {
   try {
-    raw = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')) || {};
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+    if (!isPlainObject(raw)) throw new Error('顶层不是 JSON 对象');
+    return raw;
   } catch (err) {
     // 只有「文件不存在」（首次运行）才从 {} 起步；JSON 坏了 / 没权限一律拒绝写入，
     // 否则启动器每点一次保存就把整份 config.json 覆盖成「只有本次改的字段」。
-    if (err && err.code === 'ENOENT') raw = {};
-    else {
-      throw Object.assign(
-        new Error(`config.json 读不出来（${(err && err.message) || err}），已拒绝保存，免得把整份配置覆盖掉。先手工修好 config.json 再改设置。`),
-        { statusCode: 500 }
-      );
-    }
+    if (allowMissing && err && err.code === 'ENOENT') return {};
+    throw Object.assign(
+      new Error(`config.json 读不出来（${(err && err.message) || err}），已拒绝保存，免得把整份配置覆盖掉。先手工修好 config.json 再改设置。`),
+      { statusCode: 500 }
+    );
   }
-  const changed = [];
+}
+
+function prepareConfigPatch(config, patch) {
+  if (!isPlainObject(patch)) throw Object.assign(new Error('patch 要是 { 字段名: 新值 } 这样的对象'), { statusCode: 400 });
+  try { patch = flattenPatch(patch); }
+  catch (err) { throw Object.assign(err, { statusCode: 400 }); }
   const pending = [];
   const errors = [];
   for (const [dotted, value] of Object.entries(patch)) {
@@ -258,34 +318,113 @@ function applyConfigPatch(runtime, patch) {
     if (!p) continue;
     // 密钥留空 = 不改（界面上看不到已存的 Key，不能一保存就把它清了）
     if (SECRET_PATHS.has(p) && p !== 'admin.spell' && (value === '' || value === null || value === undefined)) continue;
-    const spec = configSchema.FIELDS[p];
-    const next = normalizeBySpec(coerceValue(runtime.config, p, value), spec);
-    if (spec) {
-      const message = configSchema.checkValue(next, spec);
-      if (message) {
-        errors.push(p + '：' + message);
-        continue;
+    try {
+      const spec = specOf(p);
+      const next = normalizeBySpec(coerceValue(config, p, value), spec);
+      if (spec) {
+        const message = configSchema.checkValue(next, spec);
+        if (message) throw new Error(message);
       }
-    }
-    pending.push([p, next]);
-    changed.push(p);
+      pending.push([p, next]);
+    } catch (err) { errors.push(p + '：' + err.message); }
+  }
+  // 群聊最大等待不能小于安静窗口，否则后者永远等不到。
+  const touchesSettle = pending.some(([p]) => p === 'chat.messageSettleMs' || p === 'chat.groupMaxBatchWaitMs');
+  if (touchesSettle) {
+    const effective = (dotted, fallback) => {
+      const hit = pending.find(([p]) => p === dotted);
+      const value = getByPath(config, dotted);
+      return hit ? hit[1] : (value === undefined ? fallback : value);
+    };
+    const settleMs = Number(effective('chat.messageSettleMs', DEFAULT_CONFIG.chat.messageSettleMs));
+    const maxWaitMs = Number(effective('chat.groupMaxBatchWaitMs', DEFAULT_CONFIG.chat.groupMaxBatchWaitMs));
+    if (maxWaitMs < settleMs) errors.push('chat.groupMaxBatchWaitMs：群聊最大等待不能小于连续消息等待');
   }
   // 校验先于落盘：填错了就整批拒绝，别出现「改了一半」的状态
   if (errors.length) {
     throw Object.assign(new Error('配置没保存：' + errors.join('；')), { statusCode: 400 });
   }
-  if (!changed.length) return { changed, cleared: [] };
+  return pending;
+}
+
+function writeConfigPatch(file, raw, pending) {
   for (const [p, next] of pending) setByPath(raw, p, next);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+}
+
+/** 把接口提交的 { "persona.name": "新名字" } 写进 config.json 并立刻生效 */
+function applyConfigPatch(runtime, patch) {
+  const file = runtime.config.paths.configFile;
+  const raw = readRawConfig(file);
+  const pending = prepareConfigPatch(runtime.config, patch);
+  const changed = pending.map(([p]) => p);
+  if (!changed.length) return { changed, cleared: [] };
+  writeConfigPatch(file, raw, pending);
   const cleared = clearSettingsShadow(runtime, changed);
   reloadRuntimeConfig(runtime);
-  // 定时任务里只有朋友圈读取的间隔来自配置；配置一改就重排，别等重启。
-  runtime.moments?.startAutoRead?.();
-  runtime.stickerService?.reconcile();
-  if (runtime.llm && typeof runtime.llm.reload === 'function') runtime.llm.reload();
   runtime.logger.info(`设置接口保存了配置：${changed.join('、')}${cleared.length ? `（同时清了 ${cleared.join('、')}，让改动真的生效）` : ''}`);
   return { changed, cleared };
+}
+
+/**
+ * 删除密钥：普通 patch 的「空值 = 不改」不能用来清 Key，所以单独走这个入口。
+ * 只允许 SECRET_PATHS，避免接口被拿来删任意配置。config.json 和
+ * data/settings.json 同路径上的值都会删掉，防止旧覆盖项把 Key 又盖回来。
+ */
+function clearSecrets(runtime, paths) {
+  const list = (Array.isArray(paths) ? paths : [])
+    .map((p) => String(p == null ? '' : p).trim())
+    .filter(Boolean);
+  if (!list.length) throw Object.assign(new Error('要指定要清除的密钥字段'), { statusCode: 400 });
+  for (const p of list) {
+    if (!SECRET_PATHS.has(p)) {
+      throw Object.assign(new Error('不允许清除这个字段：' + p), { statusCode: 400 });
+    }
+    pathParts(p);
+  }
+
+  const file = runtime.config.paths.configFile;
+  const raw = readRawConfig(file);
+  let changed = false;
+  for (const p of list) {
+    if (deleteByPath(raw, p)) {
+      pruneEmptyParents(raw, p);
+      changed = true;
+    }
+  }
+  if (changed) fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+
+  // settings.json 只有同路径的旧覆盖项才删；不去猜顶层 apiKey，免得误删聊天 Key。
+  const settingsFile = runtime.config.paths.settingsFile;
+  try {
+    const st = readRawConfig(settingsFile);
+    let settingsChanged = false;
+    for (const p of list) {
+      if (deleteByPath(st, p)) {
+        pruneEmptyParents(st, p);
+        settingsChanged = true;
+      }
+      // 语音 Key 还有两处旧存放位置：settings.voiceApiKey / settings.keys.voice。
+      // 只清 voice.apiKey 时一并删掉，避免界面已关、桥接又捡起旧 Key。
+      if (p === 'voice.apiKey') {
+        if (Object.prototype.hasOwnProperty.call(st, 'voiceApiKey')) {
+          delete st.voiceApiKey;
+          settingsChanged = true;
+        }
+        if (isPlainObject(st.keys) && Object.prototype.hasOwnProperty.call(st.keys, 'voice')) {
+          delete st.keys.voice;
+          if (!Object.keys(st.keys).length) delete st.keys;
+          settingsChanged = true;
+        }
+      }
+    }
+    if (settingsChanged) fs.writeFileSync(settingsFile, JSON.stringify(st, null, 2), 'utf8');
+  } catch { /* 没有 settings.json 或写不了：config 已经清掉，运行时会以后者为准 */ }
+
+  reloadRuntimeConfig(runtime);
+  runtime.logger?.info?.('清除了密钥：' + list.join('、'));
+  return { cleared: list };
 }
 
 /** 默认值：按点号路径从 DEFAULT_CONFIG 里取（没有这一项就返回 undefined） */
@@ -336,12 +475,8 @@ function watchConfigFile(runtime) {
       timer = setTimeout(() => {
         timer = null;
         try {
-          const raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
-          JSON.parse(raw); // 先确认是合法 JSON，写坏了就别覆盖内存里的好配置
+          readRawConfig(file, false); // 文件损坏或消失都不能覆盖内存里的好配置。
           reloadRuntimeConfig(runtime);
-          runtime.moments?.startAutoRead?.();
-          runtime.stickerService?.reconcile();
-                  if (runtime.llm && typeof runtime.llm.reload === 'function') runtime.llm.reload();
           runtime.logger.info('config.json 已重新加载（改动已生效，不用重启）');
         } catch (err) {
           runtime.logger.warn('config.json 改了但没读成功，先按老配置跑：' + describeError(err));
@@ -372,38 +507,11 @@ function saveConfigPatch(config, patch) {
   if (!isPlainObject(config)) throw new Error('缺少 config 对象');
   const file = config.paths && config.paths.configFile;
   if (!file) throw new Error('找不到 config.json 路径');
-  patch = flattenPatch(patch || {});
-  const pending = [];
-  const errors = [];
-  for (const [dotted, value] of Object.entries(patch)) {
-    const spec = configSchema.FIELDS[dotted];
-    const next = normalizeBySpec(coerceValue(config, dotted, value), spec);
-    if (spec) {
-      const message = configSchema.checkValue(next, spec);
-      if (message) { errors.push(dotted + '：' + message); continue; }
-    }
-    pending.push([dotted, next]);
-  }
-  if (errors.length) throw Object.assign(new Error('配置没保存：' + errors.join('；')), { statusCode: 400 });
+  const pending = prepareConfigPatch(config, patch || {});
   if (!pending.length) return [];
-  let raw = {};
-  try {
-    raw = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')) || {};
-  } catch (err) {
-    // 只有「文件不存在」（首次运行）才从 {} 起步；JSON 坏了 / 没权限一律拒绝写入，
-    // 否则启动器每点一次保存就把整份 config.json 覆盖成「只有本次改的字段」。
-    if (err && err.code === 'ENOENT') raw = {};
-    else {
-      throw Object.assign(
-        new Error(`config.json 读不出来（${(err && err.message) || err}），已拒绝保存，免得把整份配置覆盖掉。先手工修好 config.json 再改设置。`),
-        { statusCode: 500 }
-      );
-    }
-  }
-  for (const [dotted, next] of pending) setByPath(raw, dotted, next);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const raw = readRawConfig(file);
   // 先落盘成功，再改进程内存；磁盘失败时不能留下“内存新值、磁盘旧值”。
-  fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+  writeConfigPatch(file, raw, pending);
   for (const [dotted, next] of pending) setByPath(config, dotted, next);
   return pending.map(([dotted]) => dotted);
 }
@@ -420,6 +528,7 @@ module.exports = {
   clearSettingsShadow,
   mergeConfigInPlace,
   applyConfigPatch,
+  clearSecrets,
   saveConfigPatch,
   defaultOf,
   resetConfig,

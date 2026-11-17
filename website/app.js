@@ -1,54 +1,23 @@
 'use strict';
 
 const root = document.documentElement;
-const themeButton = document.querySelector('#theme-toggle');
-const themeMedia = matchMedia('(prefers-color-scheme: light)');
-let explicitTheme = false;
-try { explicitTheme = ['light', 'dark'].includes(localStorage.getItem('whale-theme')); } catch (_) { /* 存储不可用不影响切换。 */ }
-function updateThemeLabel() {
-  themeButton.setAttribute('aria-label', root.dataset.theme === 'dark' ? '切换到浅色主题' : '切换到深色主题');
-  document.querySelector('meta[name="theme-color"]').content = root.dataset.theme === 'dark' ? '#070b13' : '#ffffff';
-}
-themeButton.addEventListener('click', () => {
-  root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
-  explicitTheme = true;
-  try { localStorage.setItem('whale-theme', root.dataset.theme); } catch (_) { /* 当前页面仍保留选择。 */ }
-  updateThemeLabel();
-});
-themeMedia.addEventListener('change', event => {
-  if (!explicitTheme) { root.dataset.theme = event.matches ? 'light' : 'dark'; updateThemeLabel(); }
-});
-updateThemeLabel();
-
-const menuButton = document.querySelector('.menu-toggle');
-const navLinks = document.querySelector('.nav-links');
-function closeMenu() {
-  menuButton.setAttribute('aria-expanded', 'false');
-  navLinks.classList.remove('open');
-}
-menuButton.addEventListener('click', () => {
-  const open = menuButton.getAttribute('aria-expanded') !== 'true';
-  menuButton.setAttribute('aria-expanded', String(open));
-  navLinks.classList.toggle('open', open);
-});
-navLinks.addEventListener('click', event => { if (event.target.closest('a')) closeMenu(); });
-document.addEventListener('keydown', event => {
-  if (event.key === 'Escape' && navLinks.classList.contains('open')) { closeMenu(); menuButton.focus(); }
-});
-document.addEventListener('click', event => { if (!event.target.closest('.nav')) closeMenu(); });
-matchMedia('(min-width: 901px)').addEventListener('change', closeMenu);
 
 const dialog = document.querySelector('#article-dialog');
-document.querySelector('[data-article="report"]').addEventListener('click', () => dialog.showModal());
-document.querySelector('#close-dialog').addEventListener('click', () => dialog.close());
+function toggleReport(open) {
+  if (window.WhaleSiteMotion) window.WhaleSiteMotion.dialog(dialog, open);
+  else if (open) dialog.showModal();
+  else dialog.close();
+}
+document.querySelector('[data-article="report"]').addEventListener('click', () => toggleReport(true));
+document.querySelector('#close-dialog').addEventListener('click', () => toggleReport(false));
 dialog.addEventListener('click', event => {
   const rect = dialog.getBoundingClientRect();
-  if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close();
+  if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) toggleReport(false);
 });
 
 const motionMedia = matchMedia('(prefers-reduced-motion: reduce)');
 const motionButton = document.querySelector('#motion-toggle');
-let motionPaused = motionMedia.matches;
+let motionPaused = window.WhaleSiteMotion?.paused ?? motionMedia.matches;
 function updateMotion() {
   root.dataset.motion = motionPaused ? 'paused' : 'running';
   motionButton.setAttribute('aria-pressed', String(motionPaused));
@@ -58,8 +27,12 @@ function updateMotion() {
   // 下一帧重新计算当前位置，恢复动画时不会停留在暂停前的章节。
   requestAnimationFrame(() => updateProgress());
 }
-motionButton.addEventListener('click', () => { motionPaused = !motionPaused; updateMotion(); });
-motionMedia.addEventListener('change', event => { motionPaused = event.matches; updateMotion(); });
+if (window.WhaleSiteMotion) {
+  window.addEventListener('whale:motion-change', event => { motionPaused = event.detail.paused; updateMotion(); });
+} else {
+  motionButton.addEventListener('click', () => { motionPaused = !motionPaused; updateMotion(); });
+  motionMedia.addEventListener('change', event => { motionPaused = event.matches; updateMotion(); });
+}
 updateMotion();
 
 const revealElements = [...document.querySelectorAll('.reveal')];

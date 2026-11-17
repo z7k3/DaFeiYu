@@ -45,12 +45,17 @@ class SenderMixin:
         self.BG_STATS['tried'] += 1
         self.BG_STATS['last'] = why
         self.BG_STATS['lastAt'] = G.time.time()
+        G.log('[delivery] stage=background result=%s reason=%s' % ('submitted' if ok else 'failed', why))
         if why == 'chat_mismatch':
             raise G.ChatIdentityError('后台通道：当前会话不是目标 %s' % G.safe_name(chat_display_name))
         if why == 'content_mismatch':
             raise G.DraftDirtyError('正文回读校验未通过，本次输入已清理，未发送（%s）' % why)
-        if why in ('input_dirty', 'residue_left', 'input_not_empty'):
-            raise G.DraftDirtyError('输入框存在草稿或正文校验失败，请检查草稿后再试（%s）' % why)
+        if why == 'input_not_empty':
+            raise G.DraftDirtyError('目标输入框已有草稿，本条未输入也未发送，请先手动处理草稿（input_not_empty）')
+        if why == 'input_dirty':
+            raise G.DraftDirtyError('本次输入中断或清理未确认，已暂停发送，请检查目标输入框（input_dirty）')
+        if why == 'residue_left':
+            raise G.DraftDirtyError('已尝试点击发送但输入框未清空，请先核对微信是否已收到，避免重复补发（residue_left）')
         if ok:
             self.BG_STATS['ok'] += 1
             self.BG_STATS['treeFails'] = 0
@@ -345,6 +350,29 @@ class SenderMixin:
         finally:
             restore_clip(saved_clip)
 
+    # 连续发送失败只是暂时停发：以前一旦停掉就永久跳过，要重启桥接才恢复。
+    def chat_paused(self, chat_username):
+        """这个会话要不要停发：被移出群是长期失效，连续失败只停一会儿。"""
+        if not chat_username:
+            return False
+        if chat_username in self.dead_chats:
+            return True
+        until = (self.dead_chat_until or {}).get(chat_username) or 0
+        if until and G.time.time() < until:
+            return True
+        if until:
+            self.dead_chat_until.pop(chat_username, None)
+            G.log('重新尝试发送（停发时间已到）：', G.safe_name(chat_username))
+        return False
+
+    def pause_chat(self, chat_username, display):
+        retry_sec = 300
+        if not chat_username:
+            return
+        self.dead_chat_until[chat_username] = G.time.time() + retry_sec
+        G.log('连续发送失败，先停掉这个会话 %d 分钟：%s'
+              % (retry_sec // 60, G.safe_name(display)))
+
     def send_policy_allows(self, chat_username, chat_display_name):
         # 排队、模型生成或语音合成期间都可能改名单，发送前向内核核对当前规则。
         base = self.bot_url.rsplit('/webhook', 1)[0]
@@ -365,7 +393,7 @@ class SenderMixin:
         return False
 
     def send_text(self, text, chat_display_name, chat_username='', force=False, quote_latest=False):
-        if chat_username and chat_username in self.dead_chats:
+        if chat_username and self.chat_paused(chat_username):
             G.log('跳过已失效的会话：', G.safe_name(chat_display_name))
             return False
         if chat_username and (not self.group_is_alive(chat_username)):
@@ -379,6 +407,7 @@ class SenderMixin:
         # 现在不管调用方是谁，都先换成昵称/备注；换不出来就放弃，别让 open_chat 空转。
         resolved = self.ui_chat_name(chat_username, chat_display_name)
         if not resolved:
+            G.log('[delivery] stage=resolve_target result=failed reason=chat_name_unresolved chat=%s' % G.safe_id(chat_username or chat_display_name))
             G.log_throttled('send-no-name-' + str(chat_username or chat_display_name)[:18],
                             '发送跳过：%s 只拿到了内部 id，微信会话列表和搜索框都不认，先给 TA 加个备注再试' % G.safe_id(chat_username or chat_display_name),
                             ttl=600)
@@ -519,8 +548,8 @@ class SenderMixin:
                     return False
                 self.fail_streak[chat_username] = self.fail_streak.get(chat_username, 0) + 1
                 if self.fail_streak[chat_username] >= 2:
-                    self.dead_chats.add(chat_username)
-                    G.log('连续发送失败，先停掉这个会话：', display)
+                    self.fail_streak[chat_username] = 0
+                    self.pause_chat(chat_username, chat_display_name)
             G.log_error('发送最终失败，请把微信窗口保持在桌面、别最小化（这条 %d 字，正文不写日志）' % len(text))
             return False
 
@@ -532,7 +561,7 @@ class SenderMixin:
         chat_display_name = self.ui_chat_name(chat_username, chat_display_name)
         if not chat_display_name:
             return False
-        if chat_username and (chat_username in self.dead_chats or not self.group_is_alive(chat_username)):
+        if chat_username and (self.chat_paused(chat_username) or not self.group_is_alive(chat_username)):
             return False
         if not self.account_send_allowed('@ 成员'):
             return False

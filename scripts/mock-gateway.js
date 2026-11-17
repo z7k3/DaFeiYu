@@ -76,7 +76,7 @@ function postJson(urlString, payload, headers = {}) {
 
 async function main() {
   const opts = parseArgs(process.argv);
-  const config = readJson(path.join(ROOT, 'config.json'), {});
+  const config = readJson(require('../src/infra/configPath').configPath(ROOT), {});
   const port = opts.port || (config.server && config.server.port) || 8787;
   const baseUrl = opts.url || `http://127.0.0.1:${port}`;
   const gw = (config.gateway && config.gateway[opts.platform]) || {};

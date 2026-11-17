@@ -6,7 +6,7 @@
  * 更新只由启动器的「检查更新」下载官方安装包：
  *   · 安装包资产来自 Release 的 whale-girl-*-setup.exe 和 SHA256SUMS.txt；
  *   · 不再保留源码版 update.ps1 分支；
- *   · Release 里没有 release-manifest.json，客户端靠 raw 分支兜底。
+ *   · Release 同时包含安装包、SHA256SUMS.txt 与候选更新清单。
  *
  * 这里只读文件、不联网：更新落地方式或资产名一改错，测试直接红。
  */
@@ -31,7 +31,9 @@ test('UpdateService：更新只下载安装包，不再依赖源码版脚本', (
   assert.equal(fs.existsSync(path.join(root, 'scripts/update.ps1')), false, 'scripts/update.ps1 应该已经删除');
 });
 
-test('UpdateService：从 releases/latest/download 取安装包和校验清单', () => {
+test('UpdateService：安装包和校验清单固定到目标版本标签', () => {
+  assert.ok(service.includes('"/releases/download/v" + latest'), '必须固定目标标签，不能跟随 latest 切换');
+  assert.ok(service.includes('FetchSumsAsync(name, assetBases)'), '哈希必须与包使用相同的目标源');
   assert.ok(service.includes('releases/latest/download'), '没有走 releases/latest/download');
   assert.ok(service.includes('SHA256SUMS.txt'), '没有下载 SHA256SUMS.txt');
   assert.ok(service.includes('Banan1cee/whale_girl'), '仓库地址不对');
@@ -40,6 +42,8 @@ test('UpdateService：从 releases/latest/download 取安装包和校验清单',
 });
 
 test('UpdateService：静默安装参数是 /SILENT，带 /CLOSEAPPLICATIONS', () => {
+  assert.ok(service.includes('/DIR='), '更新必须安装回当前目录，不能依赖注册表旧路径');
+  assert.ok(service.includes('$result.ExitCode'), '安装失败不能当成功重启');
   assert.ok(service.includes("'/SILENT'"), '安装参数不是 /SILENT（/VERYSILENT 会让用户看不到进度）');
   assert.ok(!service.includes("'/VERYSILENT'"), '用了 /VERYSILENT，用户看不到安装进度');
   assert.ok(service.includes('/CLOSEAPPLICATIONS'), '没有 /CLOSEAPPLICATIONS，启动器自己占着 exe 会装不上');
@@ -107,7 +111,9 @@ test('发版步骤会写 latest / released_at / manifest_version', () => {
     // force_after_hours 由仓库里的清单原样带过去（只读不改）
     assert.ok(block.includes(needle) || read('release-manifest.json').includes('force_after_hours'), `发版步骤没有处理 ${needle}`);
   }
-  assert.ok(block.includes('$manifest.manifest_version = [int]$manifest.manifest_version + 1'), 'manifest_version 没有递增');
+  assert.ok(block.includes("./scripts/make-manifest.ps1 -Version $env:version -OutFile $manifestPath -TemplateFile 'release-manifest.json'"), 'CI 必须只写候选清单');
+  assert.ok(read('scripts/make-manifest.ps1').includes('$policy.manifest_version = $oldVer + 1'), 'manifest_version 没有递增');
+  assert.doesNotMatch(block, /\$manifest\.manifest_version\s*=/, 'CI 不能重复分配序号');
 });
 
 test('更新浮层先显示摘要，展开才显示另存的详细说明', () => {
@@ -120,8 +126,19 @@ test('更新浮层先显示摘要，展开才显示另存的详细说明', () =>
   assert.match(manifestCode, /release_details = m\.ReleaseDetails/);
 });
 
+test('可选桥接更新在浮层及确认框用红字显示版本限定警告', () => {
+  assert.match(read('launcher/MainWindow.xaml'), /x:Name="UpdateToastWarning"[^>]*Foreground="\{DynamicResource Bad\}"/s);
+  const window = read('launcher/MainWindow.xaml.cs');
+  assert.match(window, /UpdateToastWarning\.Text = UpdateManifestService\.ReleaseWarning\(manifest\)/);
+  assert.match(window, /warningText: UpdateManifestService\.ReleaseWarning\(chk\.Manifest\)/);
+  assert.match(read('launcher/AppDialog.cs'), /warning\.SetResourceReference\(TextBlock\.ForegroundProperty, "Bad"\)/);
+  for (const field of ['update_warning', 'update_warning_version']) assert.ok(manifestCode.includes('"' + field + '"'));
+  assert.match(manifestCode, /update_warning = m\.UpdateWarning/);
+  assert.match(manifestCode, /update_warning_version = m\.UpdateWarningVersion/);
+});
+
 test('release-manifest.json 的字段与 UpdateManifest.Parse 一一对应', () => {
-  const fields = ['latest', 'released_at', 'force_after_hours', 'force', 'force_from', 'kill_below', 'message', 'manifest_version'];
+  const fields = ['latest', 'released_at', 'force_after_hours', 'force', 'force_from', 'force_versions', 'kill_below', 'message', 'manifest_version'];
   for (const f of fields) {
     assert.ok(Object.prototype.hasOwnProperty.call(manifest, f), `release-manifest.json 缺字段 ${f}`);
     assert.ok(manifestCode.includes(`"${f}"`), `UpdateManifest.cs 没有解析 ${f}`);
@@ -154,7 +171,7 @@ test('UpdateService：资产（安装包 / 校验清单）有镜像回退，直�
 });
 
 test('UpdateService：校验清单多源并行，哈希对不上就中止而不是挑一个用', () => {
-  assert.match(service, /Task\.WhenAll\(AssetBases\.Select/, '校验清单没有多源并行拉取');
+  assert.match(service, /Task\.WhenAll\(assetBases\.Select/, '校验清单没有多源并行拉取');
   assert.match(service, /不一致，已中止/, '多个源的哈希冲突时没有中止（会装到被篡改的包）');
   assert.match(service, /hash\.Length == 64/, '没有校验哈希格式，镜像的错误页会被当成哈希');
 });
@@ -173,7 +190,7 @@ test('UpdateService：安装包最多 32 段并发，服务端不支持 Range �
 });
 
 test('UpdateService：单个源失败不影响整体——换源，并把每个源的原因汇总报出来', () => {
-  assert.match(service, /foreach \(var baseUrl in AssetBases\)/, '没有逐源尝试');
+  assert.match(service, /foreach \(var baseUrl in assetBases\)/, '没有逐源尝试');
   assert.match(service, /tried\.Add\(/, '没有记录每个源的失败原因');
   assert.ok(service.includes('的 SHA256 对不上'), '哈希不符时直接判死，没有换下一个源');
   assert.match(service, /string\.Join\("；", tried\)/, '全部失败时没有把原因汇总给用户');

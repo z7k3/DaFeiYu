@@ -2,15 +2,19 @@
 
 const personaStore = require('../../persona/store');
 const presets = require('../../persona/presets');
-const { applyPersonaPatch } = require('../../services/persona');
+const { applyPersonaPatch, savePersonaPreset, deletePersonaPreset, renamePersonaPreset } = require('../../services/persona');
 const { checkPersonaTokens } = require('../../persona/tokenCheck');
 const { json, readBody } = require('../util');
+const { saveSettings } = require('../../infra/config');
 
 module.exports = function register(router) {
   router.get('/api/persona', (runtime, req, res) => {
+    const persona = personaStore.summary(runtime.config);
     return json(res, 200, {
       ok: true,
-      persona: personaStore.summary(runtime.config),
+      persona,
+      // 内置/市场预设锁住人设编辑，只能复制成自建预设；手写和自建预设可以改
+      presetSource: presets.sourceOf(runtime.config, persona.sourcePreset),
       llm: {
         provider: runtime.llm.provider,
         providerLabel: runtime.llm.providerLabel,
@@ -29,6 +33,12 @@ module.exports = function register(router) {
   // 人设预设：assets/personas/ 下每个版本一个文件
   router.get('/api/persona/presets', (runtime, req, res) => {
     return json(res, 200, { ok: true, presets: presets.list(runtime.config) });
+  });
+
+  router.post('/api/persona/export', (runtime, req, res) => {
+    const persona = presets.fromConfig(runtime.config);
+    if (persona.customPrompt.length > 24000) return json(res, 400, { ok: false, error: '可分享包的自定义提示词最多 24000 字符，请先精简；当前人设未修改。' });
+    return json(res, 200, { ok: true, persona });
   });
 
   // 预览：只回内容、不写盘 —— 页面选到哪版就先把那版填进输入框，
@@ -69,6 +79,7 @@ module.exports = function register(router) {
       });
     }
     personaStore.save(runtime.config, patch);
+    if (patch.ownerName !== undefined) saveSettings(runtime.config, { userName: runtime.config.persona.ownerName });
     runtime.logger.info(`人设预设：已导入 ${preset.id}（${preset.version || '无版本号'}，${tokenCheck.tokens} token）`);
     return json(res, 200, {
       ok: true,
@@ -76,5 +87,32 @@ module.exports = function register(router) {
       persona: personaStore.summary(runtime.config),
       tokenCheck,
     });
+  });
+
+  router.post('/api/persona/preset/reset-market', async (runtime, req, res) => {
+    const body = await readBody(req);
+    const result = presets.resetMarketCopy(runtime.config, body && body.id);
+    return json(res, result.ok ? 200 : 400, result);
+  });
+
+  // 另存为 / 更新自建预设
+  router.post('/api/persona/preset/save', async (runtime, req, res) => {
+    const body = await readBody(req);
+    const result = await savePersonaPreset(runtime, body);
+    return json(res, result && result.ok ? 200 : 400, result);
+  });
+
+  // 删除预设：自建物理删，内置/市场隐藏；正在使用的不许删
+  router.post('/api/persona/preset/delete', async (runtime, req, res) => {
+    const body = await readBody(req);
+    const result = deletePersonaPreset(runtime, body);
+    return json(res, result && result.ok ? 200 : 400, result);
+  });
+
+  // 重命名自建预设
+  router.post('/api/persona/preset/rename', async (runtime, req, res) => {
+    const body = await readBody(req);
+    const result = renamePersonaPreset(runtime, body);
+    return json(res, result && result.ok ? 200 : 400, result);
   });
 };

@@ -53,6 +53,49 @@ test('完整人设页保存顺序不会把新名字覆盖；热重载与重启�
   assert.equal(restarted.runtime.config.persona.ownerName, '老大');
 });
 
+test('交流偏好按启动器保存链路下一轮更新，热重载和重启后保留', async (t) => {
+  const app = await boot(t);
+  const msg = { platform: 'web', chatType: 'private', chatId: 'preferences-test', senderId: 'tester', text: '你好' };
+  for (const customPrompt of ['', '你是温和的图书管理员。']) {
+    await post(app, '/api/persona', { customPrompt, proactive: false, opinions: false });
+    await post(app, '/api/settings', { userName: '老大' });
+    await post(app, '/api/config', { patch: { 'chat.emojiChance': 0.1 } });
+    const decision = await app.runtime.bot.decide(msg);
+    assert.match(decision.system, /不主动引出新话题/);
+    assert.match(decision.system, /少主动发表主观立场/);
+    assert.match(decision.system, /仍须纠正事实错误/);
+    await post(app, '/api/persona', { proactive: true, opinions: true });
+    const next = await app.runtime.bot.decide({ ...msg, chatId: msg.chatId + '-on' });
+    assert.match(next.system, /可以自然追问或延伸相关话题/);
+    assert.match(next.system, /可以主动表达偏好或独立判断/);
+  }
+  const restarted = await startServer({ root: app.root, env: { WHALE_LOG_FILE: '' }, port: 0 });
+  t.after(() => restarted.close());
+  const decision = await restarted.runtime.bot.decide({ ...msg, chatId: 'preferences-restarted' });
+  assert.match(decision.system, /可以自然追问或延伸相关话题/);
+  assert.match(decision.system, /可以主动表达偏好或独立判断/);
+});
+
+test('旧人设顶嘴存档不覆盖开关，下一轮、热重载和重启一致', async (t) => {
+  const app = await boot(t);
+  await post(app, '/api/persona', { customPrompt: '你是温和的图书管理员。' });
+  const file = path.join(app.root, 'data', 'persona.json');
+  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...data, masterRoast: false }));
+  const make = runtime => persona.buildPromptParts({ config: runtime.config, msg: { isMaster: true, chatType: 'private', text: '在吗' } });
+  await post(app, '/api/config', { patch: { 'persona.masterRoast': true } });
+  assert.match(make(app.runtime).system, /顶嘴人格：刀子嘴豆腐心/);
+  await post(app, '/api/persona', { opinions: false });
+  await post(app, '/api/settings', { userName: '老大' });
+  await delay(450);
+  assert.match(make(app.runtime).system, /顶嘴人格：刀子嘴豆腐心/);
+  const restarted = await startServer({ root: app.root, env: { WHALE_LOG_FILE: '' }, port: 0 });
+  t.after(() => restarted.close());
+  assert.match(make(restarted.runtime).system, /顶嘴人格：刀子嘴豆腐心/);
+  await post(app, '/api/config', { patch: { 'persona.masterRoast': false } });
+  assert.doesNotMatch(make(app.runtime).system, /顶嘴人格：/);
+});
+
 test('自定义人设中的旧名字不盖过当前设置，主人称呼不授予陌生人身份', async (t) => {
   const app = await boot(t);
   await post(app, '/api/persona', { name: '小鱼', customPrompt: '你叫鲸鲸，称呼主人为主人。' });

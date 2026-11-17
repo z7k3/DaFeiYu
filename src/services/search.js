@@ -3,13 +3,39 @@
 const web = require('../adapters/websearch');
 const weather = require('../adapters/search/weather');
 const router = require('../adapters/searchRouter');
+const apiSearch = require('../adapters/search/apiSearch');
 const policy = require('../core/search/policy');
+const { resolveSearchConfig } = require('../infra/config');
 const { effectiveMaxAgeDays } = require('../core/search/quality');
 const { result, formatResult } = require('../core/search/result');
 const { remaining, errorInfo, report, searchError } = require('../adapters/search/transport');
 
+/** 本地结果和 API 结果合并：API 在前，按 URL 去重，最多保留 limit 条。 */
+function mergeResults(local, api, limit = 4) {
+  const items = [];
+  const seen = new Set();
+  for (const item of [...(api?.items || []), ...(local?.items || [])]) {
+    const url = String(item?.url || '').trim();
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    items.push(item);
+  }
+  const attempts = [...(api?.attempts || []), ...(local?.attempts || [])];
+  const failed = local?.status === 'failed' || api?.status === 'failed';
+  return result(items.slice(0, Math.max(1, limit)), {
+    status: items.length ? 'ok' : failed ? 'failed' : 'empty',
+    reason: items.length ? 'available'
+      : api?.reason === 'quota_exceeded' ? 'quota_exceeded'
+        : local?.reason || api?.reason || 'no_results',
+    attempts,
+    staleItems: local?.staleItems || [],
+    elapsedMs: Math.max(Number(local?.elapsedMs) || 0, Number(api?.elapsedMs) || 0),
+  });
+}
+
 /** 单轮搜索的唯一入口；只返回证据，不读写会话存储或决定聊天回复。 */
-async function search({ text = '', history = [], llm, config = {}, now = new Date(), timeZone = '', signal, trace } = {}, deps = {}) {
+async function search({ text = '', history = [], llm, config = {}, now = new Date(), timeZone = '', signal, trace, force = false, dataDir = 'data' } = {}, deps = {}) {
+  if (llm?.config && config.api?.followChat === true) config = resolveSearchConfig({ ...llm.config, websearch: config });
   const providers = deps.providers || web;
   const places = deps.places || weather;
   const routeSearch = deps.route || router.route;
@@ -59,8 +85,8 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
   };
   const run = async () => {
     const gate = policy.gate(text, config.semanticRoute);
-    let route = { failed: true, need: false };
-    if (gate.route && active()) {
+    let route = force ? { failed: false, need: true, query: text } : { failed: true, need: false };
+    if (!force && gate.route && active()) {
       const routeStarted = Date.now();
       try {
         route = await routeSearch(llm, text, { ...options(), now, timeZone,
@@ -108,9 +134,28 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
     }
     if (!active()) throw searchError(controller.signal.aborted ? 'aborted' : 'deadline_exceeded');
     if (policy.DOMAINS[intent.site]) q = q.replace(/\bsite:[a-z0-9.-]+/gi, '').trim() + ' site:' + policy.DOMAINS[intent.site];
-    const value = await call('web', () => providers.searchResult(q, { ...options(), limit: 4,
+    // API 搜索开启时先走 API；API 失败或没有结果才回退本地。
+    // 这样启用付费/限额 API 后，本地搜索不会和它重复跑一遍。
+    const apiOn = config?.api?.enabled === true
+      && Array.isArray(config.api.providers) && config.api.providers.length > 0;
+    let api = null;
+    if (apiOn) {
+      // 自动服务可能较慢，给本地兜底保留预算，避免 API 一次耗尽整轮搜索时间。
+      const apiDeadline = config.api.followChat === true
+        ? Math.min(deadline, Date.now() + Math.floor(options().timeoutMs * 0.6)) : deadline;
+      api = await apiSearch.apiSearch({
+        query: q, text, websearch: config, dataDir,
+        deadline: apiDeadline, signal: controller.signal, timeoutMs: Math.max(0, apiDeadline - Date.now()), trace: say,
+      }).catch((err) => {
+        const info = errorInfo(err);
+        say('api_failed', info);
+        return result([], { status: 'failed', reason: info.code });
+      });
+      if (api?.items?.length) return finish(api);
+    }
+    const local = await call('web', () => providers.searchResult(q, { ...options(), limit: 4,
       maxAgeDays: effectiveMaxAgeDays(`${text} ${q}`, intent.fresh, intent.timeRange) }));
-    return finish(value);
+    return finish(api ? mergeResults(local, api, 4) : local);
   };
   let timer, abort;
   try {

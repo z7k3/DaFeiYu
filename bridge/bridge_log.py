@@ -4,11 +4,13 @@
 原来这些函数混在 engine.py 里，和启动流程、配置解析互相看见。拆出来后：
 
 - 只依赖 `configure()` 传进来的日志路径和级别；
-- `log_throttled` 仍留在 engine（它要读调用方的节流表），这里只提供最底层的
+- `log_throttled` 兼容入口仍留在 engine，有界抑制规则由 runtime_log_throttle 共享；
+  这里只提供最底层的
   `log` / `log_warn` / `log_error` / `boot` / `log_window_problem`；
 - warn/error 继续带「文件:行」调用点，拆模块后也不会丢。
 """
 
+import faulthandler
 import hashlib
 import os
 import json
@@ -128,7 +130,7 @@ def configure(log_file=None, boot_log=None, level=None):
     if log_file:
         LOG_FILE = log_file
         data = os.path.dirname(os.path.abspath(log_file))
-        _secret_files[:] = [os.path.join(os.path.dirname(data), 'config.json'), os.path.join(data, 'settings.json')]
+        _secret_files[:] = [os.path.join(os.path.dirname(data), 'config.json'), os.path.join(data, 'config.json'), os.path.join(data, 'settings.json')]
     if boot_log:
         BOOT_LOG = boot_log
     set_level(level)
@@ -155,6 +157,19 @@ def boot(msg):
             f.write("%s [pid %s] %s\n" % (time.strftime("%H:%M:%S"), os.getpid(), scrub(redact_secrets(msg))))
     except Exception:
         pass
+
+
+def dump_hang_trace():
+    """由检测到超时的 Python 线程持有 GIL 同步记录堆栈。"""
+    if not BOOT_LOG:
+        return
+    try:
+        path = os.path.join(os.path.dirname(BOOT_LOG), 'bridge-hang.log')
+        with open(path, 'a', encoding='utf-8') as hang_file:
+            hang_file.write('\n==== %s 处理超时（pid=%d）====\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), os.getpid()))
+            faulthandler.dump_traceback(file=hang_file, all_threads=True)
+    except (OSError, RuntimeError) as exc:
+        boot('超时堆栈记录失败 type=%s' % type(exc).__name__)
 
 
 def _log_allowed(level, text):
@@ -264,11 +279,12 @@ def log_window_problem(where, err):
     挪不动/置顶不了窗口不该让整条发送失败（UIA 还能把字打进去），
     更不该让看门狗以为“发送卡住”把桥接反复重启——那会一直弹「拒绝访问」。
     """
-    now = time.time()
-    if now - _win_problem_ts.get(where, 0) < 120:
-        return
-    _win_problem_ts[where] = now
-    log_warn(where + "：", repr(err))
+    try:
+        from runtime_log_throttle import log_throttled as bounded_log
+    except ImportError:
+        from .runtime_log_throttle import log_throttled as bounded_log
+    bounded_log(_win_problem_ts, where, where + "：", repr(err),
+                ttl=120, emit=log_warn, folded=log, clock=time.monotonic)
 
 
 for _fn in (log, log_debug, log_warn, log_error, _emit_log):

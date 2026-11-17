@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { render } = require('../scripts/render-website-releases');
+const { render, notesFrom } = require('../scripts/render-website-releases');
 
 const root = path.join(__dirname, '..');
 const template = fs.readFileSync(path.join(root, 'website/index.html'), 'utf8');
@@ -42,13 +42,28 @@ assert.match(html, /微信账号窗口识别修复 &lt;示例&gt;/);
 assert.match(html, /修复窗口识别。 保留双开账号校验。/);
 assert.match(html, /<time datetime="2026-11-08">2026\.11\.08<\/time>/, '日期按北京时间显示');
 assert.doesNotMatch(html, /v4\.0\.9|v4\.1\.0-rc1|v4\.2\.0|内部注释|<!-- release:/);
-assert.match(html, /<a href="#updates">更新<\/a>/);
+assert.match(html, /href="\.\/downloads\/">下载中心<\/a>/);
 assert.throws(() => render(template, unpublished[0], stable), /正式发行数据无效/);
+
+/* 发布说明清理：标签和注释不能穿过，残余片段也不能留下 "<script"。 */
+assert.deepEqual(notesFrom('## 修复\n- <b>加粗</b> 保持可读'), ['加粗 保持可读']);
+assert.deepEqual(notesFrom('- <<script>script>alert(2)</script>'), ['script>alert(2)']);
+assert.deepEqual(notesFrom('<!-- <script>x</script> -->\n- 正常说明'), ['正常说明']);
+assert.ok(notesFrom('## 修复\n- a < b 的写法').every(note => !note.includes('<')),
+  '孤立尖括号要丢掉，后面的文字保留');
+
+const harsh = release('v4.1.4', {
+  name: '鲸鲸 4.1.4 · <script>alert(1)</script>',
+  body: '## 修复\n- <script>alert(3)</script>\n- <<script>script>alert(4)</script>',
+});
+const harshHtml = render(template, harsh, stable);
+const harshRow = harshHtml.match(/<a class="release-row"[\s\S]*?<\/a>/)[0];
+assert.doesNotMatch(harshRow, /<script/i, '标签片段不能进到页面里');
 
 const pages = fs.readFileSync(path.join(root, '.github/workflows/pages.yml'), 'utf8');
 assert.match(pages, /release:\s*types:\s*\[[^\]]*published/);
 assert.match(pages, /gh workflow run pages\.yml --ref main/);
-assert.match(pages, /releases\/latest/);
-assert.match(pages, /render-website-releases\.js/);
+assert.match(pages, /fetch-website-data\.js/);
+assert.match(pages, /build-website\.js/);
 
 console.log('website releases: stable selection, date, escaped HTML and Pages triggers passed');

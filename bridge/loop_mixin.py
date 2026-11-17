@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Bridge runtime mixin: LoopMixin."""
 import engine as G
+from bridge_log import dump_hang_trace
 
 
 class LoopMixin:
@@ -24,11 +25,8 @@ class LoopMixin:
 
         def save_state(st):
             try:
-                G.os.makedirs(G.os.path.dirname(state_file), exist_ok=True)
-                tmp = state_file + '.tmp'
-                with open(tmp, 'w', encoding='utf-8') as f:
-                    G.json.dump(st, f, ensure_ascii=False)
-                G.os.replace(tmp, state_file)
+                from runtime_json import atomic_write_json
+                atomic_write_json(state_file, st)
             except Exception as e:
                 G.log_warn('主动搭话状态保存失败：', repr(e))
         while True:
@@ -85,6 +83,27 @@ class LoopMixin:
             try:
                 ok = self.send_text(text, name, u)
                 save_state({'lastTs': G.time.time(), 'day': today, 'count': sent + (0 if ok is False else 1)})
+                if ok is True:
+                    # 回传失败只重试记账，不重发微信正文；相同 id 由内核去重。
+                    import uuid
+                    receipt = {'id': uuid.uuid4().hex, 'chat': u, 'text': text, 'group': bool(target.get('isGroup'))}
+                    headers = {'x-whale-bridge': '1', 'x-bot-token': self.token or ''}
+                    try:
+                        recorded = None
+                        for attempt in range(3):
+                            try:
+                                recorded = G.LOCAL_HTTP.post(base + '/api/care/sent', json=receipt, headers=headers, timeout=15)
+                                if recorded.ok and (recorded.json() or {}).get('ok'):
+                                    break
+                            except Exception:
+                                if attempt == 2:
+                                    raise
+                            if attempt < 2:
+                                G.time.sleep(0.5)
+                        if not recorded.ok or not (recorded.json() or {}).get('ok'):
+                            G.log_warn('主动搭话已发送，但写入上下文失败')
+                    except Exception as e:
+                        G.log_warn('主动搭话已发送，但写入上下文失败：type=%s detail=%s' % (type(e).__name__, repr(e)[:160]))
             except Exception as e:
                 G.log('主动搭话发送失败：', repr(e))
                 save_state({'lastTs': G.time.time(), 'day': today, 'count': sent})
@@ -127,6 +146,8 @@ class LoopMixin:
         """
         if G.uia_boot is None:
             return self._UIA_READY
+        if self.foreground_is_moments():
+            return {'ok': False, 'reason': 'moments_foreground'}
         prefer = int(self.ACCOUNT.get('hwnd') or 0) if self.ACCOUNT.get('verified') else 0
         now = G.time.time()
         if not force and now - self._UIA_READY['ts'] < 30:
@@ -251,6 +272,7 @@ class LoopMixin:
             _budget = float(G.SEND_STATE.get('budget') or 40)
             if G.SEND_STATE['active'] and G.time.time() - G.SEND_STATE['start'] > _budget:
                 G.log('发送卡住超过 %.0f 秒，强制重启桥接进程…' % _budget)
+                dump_hang_trace()
                 G.time.sleep(0.3)
                 G.os._exit(7)
 
@@ -301,12 +323,18 @@ class LoopMixin:
         misses = 0
         gate_logged = False
         hb_misses = 0
+        background_uia_paused = False
         while True:
             try:
                 resting = False
                 uia_now = None
-                if not resting and G.SEND_STATE.get('active'):
+                if self.foreground_is_moments():
+                    uia_now = self.UIA_CACHE.get('u') is not None
+                elif not resting and G.SEND_STATE.get('active'):
                     G.log('心跳跳过预热（正在发送中）')
+                    uia_now = self.UIA_CACHE.get('u') is not None
+                elif background_uia_paused:
+                    # 只停止心跳线程的自动探测；实际发送仍执行原有账号校验及恢复。
                     uia_now = self.UIA_CACHE.get('u') is not None
                 elif not resting:
                     try:
@@ -314,7 +342,7 @@ class LoopMixin:
                             with self.gui_lock:
                                 self.gui = None
                                 self.UIA_CACHE['u'] = None
-                            misses = 0
+                            misses += 1
                             uia_now = False
                             if not gate_logged:
                                 G.log_warn('[!] 等待微信主窗可用，请打开已选账号的主窗口')
@@ -335,6 +363,7 @@ class LoopMixin:
                                 if _u is None:
                                     misses += 1
                                 if _u is None and misses >= 3:
+                                    background_uia_paused = True
                                     G.log_warn('[!] UIA 连续 %d 次拿不到，重建窗口驱动再试…' % misses)
                                     with self.gui_lock:
                                         self.gui = self.new_window_driver()
@@ -347,7 +376,11 @@ class LoopMixin:
                             self.UIA_CACHE['u'] = _u
                             uia_now = _u is not None
                     except Exception:
+                        misses += 1
                         uia_now = self.UIA_CACHE.get('u') is not None
+                    if background_uia_paused or misses >= 3:
+                        background_uia_paused = True
+                        G.log_warn('[!] UIA 后台检查连续失败，已暂停后台预热和重建，避免反复触碰微信；实际发送仍按原流程检查，重连桥接后恢复后台检查')
                 payload = {'platform': 'wechat', 'uia': uia_now, 'rest': resting, 'listener': self.listener_alive(), 'ffmpeg': self.ffmpeg_available(), 'account': self.db.account, 'account_wxid': self.db.wxid, 'account_nick': self._self_nick, 'account_ok': bool(self.ACCOUNT.get('verified')), 'account_why': str(self.ACCOUNT.get('why') or ''), 'account_guard': bool(G.ACCOUNT_GUARD), 'window': self.wechat_window_state()}
                 headers = {'x-whale-bridge': '1'}
                 if self.token:
@@ -391,18 +424,32 @@ class LoopMixin:
                 continue
             if mt == last:
                 continue
-            last = mt
-            current = G.read_config()
-            if str(((current.get('gateway') or {}).get('wechat') or {}).get('inboundToken') or '') != str(self.token or '') or str((current.get('wechat') or {}).get('dbDir') or '') != str((self.cfg.get('wechat') or {}).get('dbDir') or '') or G.build_bot_url(current) != self.bot_url:
-                G.log('桥接连接设置变了，重新连接微信与内核…')
-                G.os._exit(7)
-            if G.reload_config():
+            try:
+                current = G.read_config(strict=True)
+                before = getattr(G, 'CONFIG_SNAPSHOT', None) or G.bridge_config.runtime_snapshot(self.cfg)
+                after = G.bridge_config.runtime_snapshot(current)
+                current_url = G.build_bot_url(current)
+            except Exception as exc:
+                G.log('重读配置失败（继续用旧值）：', type(exc).__name__)
+                continue
+            changed = G.bridge_config.restart_fields(before, after)
+            if changed or current_url != self.bot_url:
+                G.log('桥接连接或调度设置变了，重新连接微信与内核…')
+                G.restart_for_config_change()
+                return
+            if G.reload_config(config=current):
+                last = mt
                 # 人设名/别名也可能刚被改过；同步给群聊 @ 判定，并清掉 60 秒缓存，
                 # 否则用户改完称呼还要等下一轮刷新才生效。
                 self.cfg = current
                 persona = (current.get('persona') or {})
                 self.aliases = list(persona.get('aliases') or []) + [persona.get('name') or '鲸鲸']
                 self._mention_cache = None
+                # 新时间设置要作用到已经攒着的批次；不能等它们按旧值到点。
+                try:
+                    self.settle.reconcile()
+                except Exception:
+                    pass
                 G.log('配置已热更新（启动器改完即时生效，不用重启桥接）')
 
     def contacts_sync_once(self):
@@ -433,36 +480,16 @@ class LoopMixin:
 
         ReminderRunner（bridge/reminder_watch.py）依赖全部注入：
           fetch → GET  /api/reminders/due（到点的 + 下一条时间）
-          send  → send_text 发到提醒所属会话
+          send  → 共享适配器保留群 @、会话身份、插件授权和语音取消复核
           ack   → POST /api/reminders/ack（回执；失败由服务端 5 分钟后重试）
         实例存模块级 REMINDER_RUNNER，退出分支（KeyboardInterrupt）能拿到它。
         """
         try:
-            try:
-                from reminder_watch import ReminderRunner
-            except Exception:
-                from .reminder_watch import ReminderRunner
             base = self.bot_url.rsplit('/webhook', 1)[0]
-            headers = {'x-whale-bridge': '1'}
-            if self.token:
-                headers['x-bot-token'] = self.token
-
-            def _fetch_due():
-                r = G.LOCAL_HTTP.get(base + '/api/reminders/due', headers=headers, timeout=10)
-                return r.json() if getattr(r, 'status_code', 0) == 200 else {}
-
-            def _send_due(item, text):
-                wxid = str(item.get('wxid') or '').strip()
-                name = str(item.get('name') or '').strip() or self.display_name(wxid)
-                return bool(self.send_text(text, name, wxid))
-
-            def _ack_due(item, ok, err):
-                try:
-                    G.LOCAL_HTTP.post(base + '/api/reminders/ack', json={'id': item.get('id'), 'ok': bool(ok), 'error': str(err or '')}, headers=headers, timeout=10)
-                except Exception as e:
-                    G.log('提醒回执没送到（服务端会自己重试）：', repr(e))
-            G.REMINDER_RUNNER = ReminderRunner(fetch=_fetch_due, send=_send_due, ack=_ack_due, log=G.log)
-            G.threading.Thread(target=G.REMINDER_RUNNER.run, daemon=True, name='reminder-watch').start()
+            G.REMINDER_RUNNER = G.start_reminder_watch(
+                http=G.LOCAL_HTTP, base=base, token=self.token,
+                send_text=self.send_text, send_at=self.send_at,
+                send_voice=self.send_voice_reply, display_name=self.display_name, log=G.log)
             G.log('提醒调度已启动（到点准点发）')
             return G.REMINDER_RUNNER
         except Exception as e:

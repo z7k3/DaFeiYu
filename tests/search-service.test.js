@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { search } = require('../src/services/search');
+const apiSearch = require('../src/adapters/search/apiSearch');
 const { result, formatResult } = require('../src/core/search/result');
 const { parseRoute, systemFor } = require('../src/adapters/searchRouter');
 const { weatherSnippet } = require('../src/adapters/search/weather');
@@ -35,6 +36,29 @@ test('路由完整意图直接驱动数据源，旧格式仍能回退规则', as
   assert.equal(f.calls[0].method, 'weatherResult');
   assert.equal(value.status, 'ok');
   assert.match(value.text, /open|weatherResult/);
+});
+
+test('API 开启时先走 API，成功就不再跑本地', async (t) => {
+  const f = fixture();
+  const api = t.mock.method(apiSearch, 'apiSearch', async () => evidence('deepseek'));
+  const value = await f.run('查一下最新消息', {
+    config: { semanticRoute: true, timeoutMs: 1000, api: { enabled: true, providers: ['deepseek'] } },
+  });
+  assert.equal(api.mock.callCount(), 1);
+  assert.deepEqual(f.calls.map(x => x.method), []);
+  assert.equal(value.status, 'ok');
+  assert.equal(value.items[0].provider, 'deepseek');
+});
+
+test('API 开启但没有结果时回退本地', async (t) => {
+  const f = fixture();
+  const api = t.mock.method(apiSearch, 'apiSearch', async () => result([], { status: 'failed', reason: 'no_results' }));
+  const value = await f.run('查一下最新消息', {
+    config: { semanticRoute: true, timeoutMs: 1000, api: { enabled: true, providers: ['deepseek'] } },
+  });
+  assert.equal(api.mock.callCount(), 1);
+  assert.deepEqual(f.calls.map(x => x.method), ['searchResult']);
+  assert.equal(value.status, 'ok');
 });
 
 test('空气质量、台风、远期和指定日期不拿今明天气冒充答案', async () => {
