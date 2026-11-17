@@ -92,7 +92,7 @@ STICKER_TEST_ON = False
 STICKER_COLLECT = False
 ACCOUNT_WANTED = ''
 REMINDER_RUNNER = None
-from send_state import SEND_STATE, ChatIdentityError, DraftDirtyError, _chat_identity_level, _SendStateScope
+from send_state import SEND_STATE, ChatIdentityError, DraftDirtyError, _chat_identity_level, _SendStateScope, note_raised
 BG_SEND = {'enabled': True, 'charGap': 0.04, 'verify': True, 'charMode': 'auto', 'fallback': True, 'strip': True, 'unhide': True}
 PIPELINE_WORKERS = 4
 PIPELINE_QUEUE_LIMIT = 8
