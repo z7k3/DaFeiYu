@@ -298,6 +298,10 @@ class Bot {
     const uid = String(msg.senderId || '').trim();
     if (!text || !uid) return null;
     const isMaster = msg.isMaster === true;
+    // 全局条目（跨会话生效）只认 ID 验证过的主人：昵称兜底也能让她在聊天里认主，
+    // 但微信里谁都能把昵称改成主人同名——放行昵称主人写全局，等于任何群成员都能
+    // 往所有会话的知识库里投毒。未验证时降级 person 域（只在 TA 自己的会话生效）。
+    const masterVerified = isVerifiedOwner(this.config, msg);
     // 群聊只认「明确叫到她」或主人的教学：普通群聊句里 "叫我看看/别叫我等太久"
     // 这类口语会命中教学正则，写出垃圾条目还回一句莫名其妙的确认。私聊对象
     // 唯一（对面就是在教自己），不受此限。
@@ -308,7 +312,7 @@ class Bot {
     const forget = text.match(/^(?:忘掉|忘了|别记了|删掉)[：:]\s*(.{1,80})$/);
     if (forget) {
       const content = forget[1].trim();
-      let removed = isMaster ? (kbStore.masterForget({ scope: 'global', text: content }).removed || 0) : 0;
+      let removed = masterVerified ? (kbStore.masterForget({ scope: 'global', text: content }).removed || 0) : 0;
       removed += kbStore.forget({ uid, text: content }).removed || 0;
       return { action: 'reply', key, msg, atMe, canned: removed ? `好，忘掉了 ${removed} 条。` : '我本来就没记住这条啊。', reason: 'kb_forget' };
     }
@@ -338,7 +342,7 @@ class Bot {
     const remember = text.match(/^记住[：:](.{1,280})$/);
     if (remember) {
       const content = remember[1].trim();
-      const out = isMaster
+      const out = masterVerified
         ? kbStore.teach({ scope: 'global', text: content, by: 'master' })
         : kbStore.teach({ scope: 'person', uid, text: content, by });
       if (!out.ok) {
@@ -1493,6 +1497,9 @@ class Bot {
         /^(?:管理帮助|管理状态|查看状态|状态|重置记忆|清空所有记忆|恢复默认|恢复人设|清空设定|退出管理|结束管理|关闭管理|收起魔咒)$/.test(text) ||
         /^(?:改名|改名为|改名成|改名字|名字改成|上下文|记忆长度|记忆条数|主动|主动关心|主动找话题|观点|立场|主见|互怼|骂主人|顶嘴|允许顶嘴|长度|字数|颜文字|能力|主动接话|群聊主动接话|演示模式|改模型|换模型|禁言列表|群聊禁言|禁言名单|黑名单)(?:\s|$|[:：])/.test(text);
       if (looksControl) {
+        // 管理机制的存在方式（魔咒、解锁流程）只讲给已验证的主人听；
+        // 对没验证过的发送者不泄露「有魔咒可解锁」这件事——防社会工程试探。
+        if (!isMaster) return say('管理命令仅限主人使用。', 'admin_hint');
         return say(spell
           ? '管理命令需要先在本微信私聊发送管理员魔咒。'
           : '还没有配置管理员魔咒，请先在启动器「设置」里设置后再用管理命令。', 'admin_hint');
