@@ -269,7 +269,9 @@ class WindowMixin:
         """
         # 表情包开启时走前台发送（上游 4.1.7：发图需要真实焦点）；文字路径
         # STICKER_TEST_ON 不影响——表情包专用路径在 sticker_mixin 自己处理。
-        force_front = G.STICKER_TEST_ON
+        # fork：文字通道保持「先零焦点、失败才前台」——表情包开关不劫持文字路径
+        # （send_sticker 自己处理前台，见 sticker_mixin.py）。
+        force_front = False
         restore_after = G.BACKGROUND_SEND
         snap = self.snapshot_win_state() if restore_after else None
         try:

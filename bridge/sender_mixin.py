@@ -97,7 +97,9 @@ class SenderMixin:
             u = self.UIA_CACHE['u']
         if u is None:
             return False
-        if G.BACKGROUND_SEND and (not G.STICKER_TEST_ON):
+        # fork：表情包开关不劫持文字通道——文字静默后台发送与表情包实验并存，
+        # 互斥由 sticker_quarantine_allows 在发送时机上处理。
+        if G.BACKGROUND_SEND:
             self.install_quiet_uia(u)
         keys = self.aliases_for(username, who) if username else [who]
         try:
@@ -423,7 +425,7 @@ class SenderMixin:
                 return False
             t_start = G.time.time()
             allow_mark_dead = True
-            if not G.STICKER_TEST_ON and G.BG_SEND.get('enabled', True):
+            if G.BG_SEND.get('enabled', True):
                 G.SEND_STATE['start'] = G.time.time()
                 try:
                     if self.bg_send(text, chat_display_name, chat_username):
