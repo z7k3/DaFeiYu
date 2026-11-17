@@ -5,7 +5,7 @@ const path = require('node:path');
 const stickers = require('../adapters/stickers');
 
 function run(root, action, key) {
-  const file = path.join(root, 'config.json');
+  const file = require('../infra/configPath').configPath(root);
   let config = { root };
   try {
     config = { ...JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')), root };

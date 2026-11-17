@@ -1,4 +1,4 @@
-"""Execute actual reply delivery branches with fake HTTP and no WeChat/UI."""
+﻿"""Execute actual reply delivery branches with fake HTTP and no WeChat/UI."""
 import ast
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +31,10 @@ class ReplyStickerCancelTests(unittest.TestCase):
         if kind == 'text':
             node = next(n for n in ast.walk(tree) if isinstance(n, ast.For)
                         and isinstance(n.iter, ast.Name) and n.iter.id == 'bubbles')
+        elif kind == 'rate':
+            node = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
+                        and isinstance(n.test, ast.UnaryOp) and isinstance(n.test.operand, ast.Call)
+                        and isinstance(n.test.operand.func, ast.Attribute) and n.test.operand.func.attr == 'rate_guard')
         else:
             node = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
                         and isinstance(n.test, ast.Call) and isinstance(n.test.func, ast.Attribute)
@@ -52,9 +56,7 @@ class ReplyStickerCancelTests(unittest.TestCase):
             headers=self.env['sticker_headers'], timeout=3)
 
     def test_voice_handled_reply_also_releases_unused_sticker(self):
-        # 本地 fork：语音回执走 outcome 字典 + 证据核对。run_branch 只从源码里抽出
-        # if send_voice_reply(...) 节点，outcome/started 的赋值在节点外，由 env 提供；
-        # Status=sent_unconfirmed 走「已确认」路径 → 取消预留表情包后整条 return。
+        # fork：receiver 语音块的 voice_outcome/started/explicit 在 if 节点外，env 提供
         self.env.update(send_voice_reply=Mock(return_value=True), spoken='test voice',
                         voice_outcome={'Status': 'sent_unconfirmed'}, voice_started=1, voice_explicit=True)
         self.run_branch('voice')
@@ -83,6 +85,13 @@ class ReplyStickerCancelTests(unittest.TestCase):
         self.env['sticker_config_now'].return_value = None
         self.assertFalse(self.env['cancel_reply_sticker'](self.item, 'peer-test'))
         self.http.assert_not_called()
+
+    def test_rate_limit_releases_reserved_sticker_without_sending(self):
+        self.env['rate_guard'] = Mock(return_value=False)
+        self.env['safe_name'] = lambda value: value
+        self.run_branch('rate')
+        self.http.assert_called_once()
+        self.env['send_text'].assert_not_called()
 
     def test_text_failure_without_sticker_never_calls_sticker_api(self):
         self.env['data'] = {}

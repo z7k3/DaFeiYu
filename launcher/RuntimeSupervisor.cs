@@ -75,6 +75,8 @@ namespace WhaleLauncher
     public sealed class RuntimeSupervisor : IDisposable
     {
         public string BaseDir { get; }
+        // 启动检查完成前及强制态禁止所有业务启动入口，不能只靠主窗口按钮拦截。
+        public bool UpdateBlocked { get; set; }
         private LocalConfiguration _localConfiguration;
         private readonly System.Threading.SemaphoreSlim _configurationWrites = new(1, 1);
         private ContactDirectory _contacts;
@@ -129,6 +131,8 @@ namespace WhaleLauncher
         public RuntimeSupervisor(string baseDir)
         {
             BaseDir = baseDir;
+            try { ConfigurationPath.Migrate(baseDir); }
+            catch (Exception) { /* 迁移失败保留原文件，加载器继续兼容旧路径。 */ }
             DataDir = Path.Combine(baseDir, "data");
             RotateLogs();
             LogPath = Path.Combine(DataDir, "launcher.log");
@@ -303,6 +307,7 @@ namespace WhaleLauncher
 
         public void StartNode()
         {
+            if (UpdateBlocked) { SayWarn("正在检查更新或当前版本必须更新，暂不能启动服务"); return; }
             if (NodeRunning) return;
             var exe = Path.Combine(BaseDir, "runtime", "node.exe");
             if (!File.Exists(exe)) exe = "node";
@@ -329,6 +334,7 @@ namespace WhaleLauncher
 
         public void StartBridge()
         {
+            if (UpdateBlocked) { SayWarn("正在检查更新或当前版本必须更新，暂不能启动桥接"); return; }
             lock (_processLock)
             {
                 if (_disposed || BridgeRunning) return;
@@ -376,6 +382,7 @@ namespace WhaleLauncher
 
         public async Task StartAllAsync(bool clearRestartHistory = true)
         {
+            if (UpdateBlocked) { SayWarn("正在检查更新或当前版本必须更新，请先完成更新"); return; }
             // 主窗口原来不清零，诊断入口原来清零；复用启动顺序不能顺带改变重启刹车。
             if (clearRestartHistory)
             {

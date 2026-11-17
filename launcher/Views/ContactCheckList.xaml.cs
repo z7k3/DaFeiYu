@@ -227,13 +227,6 @@ namespace WhaleLauncher.Views
 
         private async Task SaveAsync()
         {
-            if (!_sup.NodeRunning)
-            {
-                Revert();
-                SetError("内核没起，改动没保存。点顶栏 ⏻ 启动后再选。");
-                return;
-            }
-
             var res = await _saver.SaveAsync(BuildPatch);
             if (!res.Ok)
             {

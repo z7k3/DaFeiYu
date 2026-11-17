@@ -10,7 +10,7 @@ const presets = require('../persona/presets');
 const features = require('../infra/features');
 const { ReminderService } = require('./reminderService');
 
-const { applyPersonaPatch } = require('./persona');
+const { applyPersonaPatch, savePersonaPreset, deletePersonaPreset, renamePersonaPreset } = require('./persona');
 const { DiaryService } = require('./diary');
 const { MomentsPublisher } = require('./momentsPublisher');
 const { prepareFeatureCommand, momentsSettings, prepareMomentsSettingsPatch, prepareMomentsPublishPatch } = require('./configCommands');
@@ -32,6 +32,15 @@ async function saveLocalConfiguration(root, { path, body }, env = process.env) {
     }
     case '/api/settings': return applySettings(runtime, body);
     case '/api/persona': return applyPersonaPatch(runtime, body);
+    case '/api/persona/preset/save': return savePersonaPreset(runtime, body);
+    case '/api/persona/preset/delete': return deletePersonaPreset(runtime, body);
+    case '/api/persona/preset/rename': return renamePersonaPreset(runtime, body);
+    case '/api/persona/preset/reset-market': return presets.resetMarketCopy(config, body.id);
+    case '/api/persona/export': {
+      const document = presets.fromConfig(config);
+      return document.customPrompt.length <= 24000 ? { ok: true, persona: document }
+        : { ok: false, error: '可分享包的自定义提示词最多 24000 字符，请先精简。' };
+    }
     case '/api/persona/preset': {
       const patch = presets.toPatch(presets.load(config, body.id));
       return patch ? applyPersonaPatch(runtime, { ...patch, sourcePreset: body.id })
@@ -79,7 +88,10 @@ function readSnapshot(root, env = process.env) {
     '/api/moments/publish-settings': { ok: true, ...publisher.settings(), ...publisher.status() },
     '/api/config': { ok: true, config: pub.config, secrets: pub.secrets },
     '/api/settings': getSettings(runtime),
-    '/api/persona': { ok: true, persona: persona.summary(config) },
+    '/api/persona': (() => {
+      const p = persona.summary(config);
+      return { ok: true, persona: p, presetSource: presets.sourceOf(config, p.sourcePreset) };
+    })(),
     '/api/persona/presets': { ok: true, presets: presets.list(config) },
     '/api/features': { ok: true, features: features.list(config) },
     '/api/reminders': { ok: true, items: reminders.list(), rules: {

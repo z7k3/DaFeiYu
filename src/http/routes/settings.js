@@ -4,6 +4,15 @@ const { getSettings, applySettings } = require('../../services/settings');
 const { json, readBody } = require('../util');
 
 module.exports = function register(router) {
+  router.post('/api/settings/test-service', async (runtime, req, res) => {
+    const body = await readBody(req, 4 * 1024 * 1024);
+    try {
+      return json(res, 200, await require('../../services/apiProbe').probe(runtime.config, body));
+    } catch (err) {
+      const { errorMessage } = require('../../infra/errors');
+      return json(res, 400, { ok: false, error: errorMessage(err) });
+    }
+  });
   router.get('/api/settings', (runtime, req, res) => json(res, 200, getSettings(runtime)));
 
   router.post('/api/settings', async (runtime, req, res) => {

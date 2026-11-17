@@ -56,8 +56,6 @@ class BridgeStartupReadyTests(unittest.TestCase):
                    time=SimpleNamespace(time=lambda: 2000), log=Mock(), safe_text=lambda _: 'len=4',
                    batches=SimpleNamespace(push=Mock(return_value=True)),
                    pipeline=SimpleNamespace(submit=Mock(return_value=True)), flush_chat=Mock())
-        # 本地 fork：on_message 投递走 submit_flush（改批 + 失败放回待处理），挂真实实现
-        env['submit_flush'] = load_function('submit_flush', env)
         receive = load_function('on_message', env)
         receive({'username': 'test-peer', 'create_time': 1987, 'content': 'test'}, None)
         env['batches'].push.assert_called_once()

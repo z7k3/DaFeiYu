@@ -23,6 +23,31 @@ const launcher = path.join(root, 'launcher');
 const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8').replace(/^\uFEFF/, '');
 const readLauncher = (rel) => fs.readFileSync(path.join(launcher, rel), 'utf8').replace(/^\uFEFF/, '');
 
+test('统一提示、确认、输入和文本弹层不创建独立窗口', () => {
+  const dialog = readLauncher('AppDialog.cs');
+  assert.doesNotMatch(dialog, /new\s+Window\s*\{|\.ShowDialog\s*\(/);
+  assert.match(dialog, /root\.Children\.Add\(overlay\)/);
+  assert.match(dialog, /root\.Children\.Remove\(overlay\)/);
+  assert.match(dialog, /window\.Closed\s*\+=/);
+  assert.match(dialog, /new BlurEffect/);
+  assert.match(dialog, /SetCurrentValue\(UIElement\.IsEnabledProperty, false\)/);
+  assert.match(dialog, /KeyboardNavigationMode\.Cycle/);
+  assert.match(dialog, /Keyboard\.FocusedElement == input/);
+  assert.match(dialog, /SetName\(close, "关闭弹窗"\)/);
+  for (const file of ['Views/SettingsPage.xaml.cs', 'Views/StickerPage.xaml.cs',
+    'Views/PersonaPage.xaml.cs', 'Views/PluginMarketPage.xaml.cs', 'Views/DiagPage.xaml.cs',
+    'Views/BridgePage.xaml.cs', 'Views/ReminderPage.xaml.cs', 'ColorPickerWindow.cs']) {
+    assert.doesNotMatch(readLauncher(file), /ShowDialog\s*\(|new\s+(?:Microsoft\.Win32\.)?(?:OpenFileDialog|SaveFileDialog|Window)\b|:\s*Window\b/, file);
+  }
+  assert.match(readLauncher('AppFilePicker.cs'), /确认覆盖/);
+  const picker = readLauncher('AppFilePicker.cs');
+  assert.match(picker, /if \(!save\) name\.Clear\(\)/);
+  assert.match(picker, /path\.PreviewKeyDown/);
+  assert.match(picker, /Directory\.Exists\(file\)/);
+  assert.match(dialog, /DockPanel\.SetDock\(header, Dock\.Top\)/);
+  assert.match(dialog, /DockPanel\.SetDock\(row, Dock\.Bottom\)/);
+});
+
 const THEME_KEYS = [
   'Bg', 'BgDeep', 'BgNav', 'BgTop', 'CardBg', 'CardBorder', 'Line', 'LineSoft',
   'Text', 'Text2', 'Muted', 'Dim', 'Accent', 'AccentDim', 'AccentSoft',
@@ -34,6 +59,18 @@ const THEME_KEYS = [
 const appXaml = readLauncher('App.xaml');
 const appearance = readLauncher('Appearance.cs');
 const resources = new Set([...appXaml.matchAll(/x:Key="([^"]+)"/g)].map((m) => m[1]));
+
+test('人设读取不覆盖编辑、失败或并发保存；普通滑块保护待保存值', () => {
+  const persona = readLauncher('Views/PersonaPage.xaml.cs');
+  const settings = readLauncher('Views/SettingsPage.xaml.cs');
+  assert.match(persona, /field\.TextChanged \+= OnPersonaTextChanged/);
+  assert.match(persona, /_savedRevision != _editRevision/);
+  assert.match(persona, /revision != _editRevision/);
+  assert.match(persona, /if \(_loadInProgress\) return/);
+  assert.match(persona, /状态定时器每两秒调用此方法，不能反复回填表单/);
+  assert.doesNotMatch(persona, /if \(_locked\) _saveTimer\.Stop\(\)/);
+  assert.match(settings, /if \(sliderPending\) return/);
+});
 
 test('App.xaml 里定义了全部主题画刷', () => {
   for (const key of THEME_KEYS) {
@@ -105,6 +142,19 @@ test('顶栏有太阳/月亮开关，背景图有独立图层和模糊', () => {
   assert.ok(main.includes('<BlurEffect'), '背景图应该做模糊，避免抢文字');
 });
 
+test('侧栏有官网和赞助入口，链接直连公开地址', () => {
+  const main = readLauncher('MainWindow.xaml');
+  const code = readLauncher('MainWindow.xaml.cs');
+  for (const name of ['BtnWebsite', 'BtnSponsor']) {
+    assert.ok(main.includes('x:Name="' + name + '"'), '侧栏缺少按钮：' + name);
+  }
+  assert.ok(main.includes('Click="OnOpenWebsite"'), '官网按钮没接事件');
+  assert.ok(main.includes('Click="OnOpenSponsor"'), '赞助按钮没接事件');
+  assert.match(code, /OfficialSite\s*=\s*"https:\/\/bot\.zyyc\.cc\/"/, '官网地址应为正式域名');
+  assert.match(code, /SponsorPage\s*=\s*"https:\/\/afdian\.com\/a\/Banan1ce"/, '赞助地址应为团队爱发电主页');
+  assert.match(code, /ProcessStartInfo\(url\)\s*\{\s*UseShellExecute\s*=\s*true\s*\}/, '链接应交给系统默认浏览器');
+});
+
 test('背景模糊与透明度可调，玻璃面板 + 自动蒙版保证文字可读', () => {
   const main = readLauncher('MainWindow.xaml');
   const code = readLauncher('MainWindow.xaml.cs');
@@ -135,13 +185,69 @@ test('背景模糊与透明度可调，玻璃面板 + 自动蒙版保证文字�
   assert.ok(settings.includes('SetBackdropBlur') && settings.includes('SetBackdropOpacity') && settings.includes('SetSurfaceOpacity'), '滑块没接到 Appearance');
 });
 
-test('人设页左侧身份/说话方式子导航已移除，分区直接铺满', () => {
+test('人设页按四层分组，维护与能力开关不再混入角色设置', () => {
   const xaml = readLauncher('Views/PersonaPage.xaml');
   const code = readLauncher('Views/PersonaPage.xaml.cs');
   assert.doesNotMatch(xaml, /\bSubNav\b/, 'PersonaPage.xaml 里还留着 SubNav');
   assert.doesNotMatch(code, /\bSubNav\b/, 'PersonaPage.xaml.cs 里还引用 SubNav');
-  assert.ok(xaml.includes('x:Name="SecIdentity"'), '身份分区不该被误删');
+  for (const name of ['SecPreset', 'SecRelation', 'SecExpression', 'SecMemory']) {
+    assert.ok(xaml.includes(`x:Name="${name}"`));
+  }
+  assert.doesNotMatch(xaml, /OnJumpSection|Tag="Sec/);
+  assert.doesNotMatch(code, /OnJumpSection/);
+  assert.doesNotMatch(xaml, /FlagsHost|SecFlags|实验开关|ChkLinks/);
+  assert.doesNotMatch(code, /LoadFlagsAsync|OnFlagClick|HiddenFlags|ChkLinks|\/api\/features/);
+  assert.match(xaml, /Header="自定义补充提示词"/);
+  assert.match(xaml, /Header="清空指定对话记忆"/);
+  assert.match(xaml, /AutomationProperties.Name="搜索主人联系人"/);
+  assert.match(xaml, /昵称或自称不能授予权限/);
   assert.ok(xaml.includes('x:Name="Body"'), '主体滚动区还在');
+});
+
+test('实现开关唯一收纳到设置高级组，已有专页能力不再重复', () => {
+  const settings = readLauncher('Views/SettingsPage.xaml.cs');
+  for (const key of ['envContext', 'relations', 'groupAddressGuard', 'fightQuoteCheck', 'staticSystem', 'memorySnapshot', 'mediaCleanup']) {
+    assert.equal(settings.split(`Path = "features.${key}"`).length - 1, 1);
+  }
+  assert.doesNotMatch(settings, /Path = "features\.(stickers|javascriptPlugins)"/);
+});
+
+test('人设预设可打包分享，内置只读，安装人设可直接修改', () => {
+  const xaml = readLauncher('Views/PersonaPage.xaml');
+  const code = readLauncher('Views/PersonaPage.xaml.cs');
+  const dialog = readLauncher('AppDialog.cs');
+  for (const text of ['另存为预设', '复制为自建预设', '更新此预设', '重命名', '删除预设']) {
+    assert.ok(xaml.includes(text), '预设区缺少按钮：' + text);
+  }
+  for (const handler of ['OnSavePreset', 'OnCopyPreset', 'OnUpdatePreset', 'OnRenamePreset', 'OnDeletePreset']) {
+    assert.ok(xaml.includes('Click="' + handler + '"'), '按钮没接事件：' + handler);
+    assert.ok(code.includes(handler), '代码里没有处理函数：' + handler);
+  }
+  assert.match(code, /\/api\/persona\/preset\/save/, '另存/复制要走预设保存接口');
+  assert.match(code, /\/api\/persona\/preset\/rename/, '改名要走预设重命名接口');
+  assert.match(code, /\/api\/persona\/preset\/delete/, '删除要走预设删除接口');
+  assert.match(code, /presetSource/, '要用服务端返回的预设来源决定是否锁定');
+  assert.match(code, /ApplyPersonaEditState/, '要有人设锁定/解锁逻辑');
+  const lockBody = code.slice(code.indexOf('private void ApplyPersonaEditState()'), code.indexOf('private sealed class MemoryChatItem'));
+  assert.doesNotMatch(lockBody, /string\.Equals\(_presetSource, "market"/);
+  assert.match(xaml, /Content="打包分享".*Click="OnExportPersona"/);
+  assert.match(xaml, /Content="仅分享提示词".*Click="OnExportPrompt"/);
+  assert.match(code, /OnExportPrompt[\s\S]*ExportPersonaAsync\(true\)/);
+  assert.match(code, /\/api\/persona\/export/);
+  assert.match(code, /PersonaPackage\.Export/);
+  assert.match(code, /if \(!await SaveAllAsync/);
+  const lockStart = code.indexOf('var field in new Control[]');
+  const lockEnd = code.indexOf('}', lockStart);
+  assert.ok(lockStart >= 0 && lockEnd > lockStart, '找不到锁定字段列表');
+  const locked = code.slice(lockStart, lockEnd);
+  for (const name of ['TxtName', 'TxtAge', 'TxtJob', 'TxtLook', 'TxtPerson', 'TxtBack', 'TxtPrompt']) {
+    assert.ok(locked.includes(name), '身份/提示词字段应被锁定：' + name);
+  }
+  for (const name of ['TxtPrivate', 'TxtGroup', 'TxtTurns', 'TxtGroupTurns', 'TxtBubbles', 'SldEmoji', 'ChkProactive', 'ChkLinks', 'ChkOpinions']) {
+    assert.ok(!locked.includes(name), '长度/颜文字/开关不能被锁：' + name);
+  }
+  assert.match(dialog, /public static string Prompt\(/, '另存和改名需要输入框');
+  assert.doesNotMatch(xaml, /全部保存/, '人设改为热保存后不该再有保存按钮');
 });
 
 test('设置页去掉侧栏和标题，单列铺开，模型/高级模式/外观', () => {
@@ -182,6 +288,9 @@ test('设置页去掉侧栏和标题，单列铺开，模型/高级模式/外观
 
   // 语音不再单独占一个 Specs 分区
   const specs = code.slice(code.indexOf('private static List<SectionSpec> Specs()'), code.indexOf('private void BuildOnce'));
+  // 连续消息收集的两个时间在群聊分组里，保存后由内核热更新
+  assert.ok(specs.includes('chat.messageSettleMs'), '缺少连续消息等待设置');
+  assert.ok(specs.includes('chat.groupMaxBatchWaitMs'), '缺少群聊最大等待设置');
   const titles = [...specs.matchAll(/Title = "([^"]+)"/g)].map((m) => m[1]);
   assert.ok(titles.length >= 4, `Specs 里应该有多个分组，实际 ${titles.length} 个`);
   assert.ok(!titles.includes('语音'), '语音已并进模型卡，不该再占 Specs 分组');

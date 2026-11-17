@@ -121,7 +121,8 @@ foreach ($pat in @('wechatauto_ocr_tmp.png', '*.tmp')) {
 Say ''
 Say '[4/5] 用出厂配置重建 config.json…' 'Cyan'
 $example = Join-Path $root 'config\config.example.json'
-$configPath = Join-Path $root 'config.json'
+$configPath = Join-Path $root 'data\config.json'
+New-Item -ItemType Directory -Path (Split-Path -Parent $configPath) -Force | Out-Null
 if (Test-Path $example) {
   Copy-Item -LiteralPath $example -Destination $configPath -Force
   Say '  · 已从 config\config.example.json 重建（主人名单为空、网关令牌为 change-me-*）' 'Green'

@@ -200,3 +200,24 @@ test('没有记忆时导出会明确报错，而不是生成空文件', () => {
   assert.throws(() => backup.exportTo(root, path.join(root, 'x.json')), /还没有记忆/);
   cleanup(root);
 });
+
+test('备份/恢复：自建人设预设和隐藏标记一起带走', () => {
+  const { root, store } = seed();
+  const personas = path.join(root, 'data', 'personas');
+  fs.mkdirSync(personas, { recursive: true });
+  const userId = 'user-abc-1234';
+  fs.writeFileSync(path.join(personas, userId + '.json'), JSON.stringify({ id: userId, name: '我的预设', customPrompt: '正文' }));
+  fs.writeFileSync(path.join(personas, '_hidden.json'), JSON.stringify({ version: 1, items: { 'persona-standard': { source: 'builtin', at: 1 } } }));
+  const dest = path.join(root, 'mem.json');
+  backup.exportTo(root, dest);
+  store.close();
+
+  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), 'whale-mem-personas-'));
+  fs.mkdirSync(path.join(fresh, 'data'), { recursive: true });
+  const info = backup.restoreFromFile(fresh, dest);
+  assert.ok(info.restored.includes('personas/'));
+  assert.ok(fs.existsSync(path.join(fresh, 'data', 'personas', userId + '.json')));
+  assert.ok(fs.existsSync(path.join(fresh, 'data', 'personas', '_hidden.json')));
+  cleanup(root);
+  cleanup(fresh);
+});

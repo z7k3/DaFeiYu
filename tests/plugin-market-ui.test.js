@@ -30,7 +30,8 @@ test('市场右侧可打开随启动器打包的规范', () => {
 test('本地安装提示来源和替换版本，人设页应用市场预设须确认', () => {
   const market = read('launcher/Views/PluginMarketPage.xaml.cs');
   const persona = read('launcher/Views/PersonaPage.xaml.cs');
-  assert.match(market, /InstallLocal\(picker.FileName,[\s\S]*ConfirmLocalInstall\(info, current\)/);
+  // 文件选择已收进主窗口弹层（AppFilePicker），安装入口仍要保持确认回调。
+  assert.match(market, /AppFilePicker\.Open\([^)]*\)[\s\S]*InstallLocal\(file,[\s\S]*ConfirmLocalInstall\(info, current\)/);
   assert.match(market, /本地 ZIP 未经鲸鲸插件市场审核或签名/);
   assert.match(market, /将替换已安装/);
   assert.match(market, /作者已变化/);
@@ -40,18 +41,29 @@ test('本地安装提示来源和替换版本，人设页应用市场预设须�
   assert.match(persona, /StartsWith\("market-", StringComparison\.Ordinal\)[\s\S]*AppDialog\.Confirm\([\s\S]*\) return;\s+var res/);
 });
 
-test('签名可选：有就验、没有就按未签名加载', () => {
+test('市场签名暂时隐藏，验签代码、公钥和签名工具保留', () => {
   const market = read('launcher/PluginMarket.cs');
   const trust = read('launcher/PluginTrust.cs');
-  assert.match(market, /ParseSignedCatalog/);
-  assert.match(market, /PluginTrust\.Verify\(bytes, listing\.Signature\)/);
+  const page = read('launcher/Views/PluginMarketPage.xaml.cs');
+  // 隐藏开关是唯一入口：恢复时改 true 并重发 EXE，不需要重新接入。
+  assert.match(market, /MarketSignatureEnabled = false/);
+  // 隐藏期间目录不拉 .sig、插件包不验 Signature，两处都必须先看开关，避免偷偷恢复验签。
+  assert.match(market, /if \(!MarketSignatureEnabled\) return ParseCatalog\(bytes, expectedApi, expectedKind\)/);
+  assert.match(market,
+    /MarketSignatureEnabled && !string\.IsNullOrWhiteSpace\(listing\.Signature\)[\s\S]*?PluginTrust\.Verify\(bytes, listing\.Signature\)/);
   assert.match(market, /url \+ "\.sig"/);
   // 回归：目录没有 .sig 时整份拒绝的话，未签名市场永远打不开。
   assert.match(market, /DownloadMissingException/);
   assert.doesNotMatch(market, /目录缺少 \.sig 签名，已拒绝加载/);
   assert.doesNotMatch(market, /!string\.IsNullOrWhiteSpace\(i\.Signature\)/);
+  // 验签能力本身不能删：目录验签、内置公钥和签名工具都要留着。
+  assert.match(market, /ParseSignedCatalog/);
   assert.match(trust, /ECDsa/);
   assert.match(trust, /ImportSubjectPublicKeyInfo/);
+  assert.ok(fs.existsSync(path.join(__dirname, '..', 'scripts', 'plugin-market-sign.js')));
+  assert.ok(fs.existsSync(path.join(__dirname, '..', 'docs', '插件市场签名.md')));
+  // 隐藏后卡片不再展示已签名 / 未签名状态。
+  assert.doesNotMatch(page, /来源：市场目录（已签名）|来源：未签名目录/);
 });
 
 test('插件市场下载带 GitHub 直连 / jsDelivr / 反代回退', () => {

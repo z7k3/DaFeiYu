@@ -1,41 +1,37 @@
 using System;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Effects;
+using System.Windows.Threading;
+using System.Collections.Generic;
 
 namespace WhaleLauncher
 {
-    /// <summary>
-    /// 启动器统一的应用内弹窗。
-    ///
-    /// 为什么不用 MessageBox：系统弹窗是白底、系统字体、系统按钮，和启动器的
-    /// 深色/浅色主题完全脱节，用户看到的就是「应用里突然弹出一块 Windows 框」。
-    /// 这里只做三件事：一段说明、一个主按钮、一个可选取消按钮，样式全部走主题资源。
-    /// </summary>
+    /// <summary>在主窗口内容上显示模态弹层，不创建系统窗口。</summary>
     public static class AppDialog
     {
         public static bool Show(Window owner, string message, string title = "鲸鲸", bool danger = false)
-        {
-            return OnUi(() =>
-            {
-                var win = Build(ResolveOwner(owner), message, title, danger, "知道了", null);
-                win.ShowDialog();
-                return true;
-            });
-        }
+            => OnUi(() => ShowCore(owner, message, title, danger, "知道了", null, null, null, null));
 
-        /// <summary>确认框：确定返回 true，取消/关闭返回 false。</summary>
         public static bool Confirm(Window owner, string message, string title = "鲸鲸",
             bool danger = false, string okText = "确定", string cancelText = "取消", string warningText = null)
+            => OnUi(() => ShowCore(owner, message, title, danger, okText, cancelText, warningText, null, null));
+
+        public static string Prompt(Window owner, string message, string title = "鲸鲸", string initial = "",
+            string okText = "保存", string cancelText = "取消")
         {
             return OnUi(() =>
             {
-                var win = Build(ResolveOwner(owner), message, title, danger, okText, cancelText, warningText);
-                return win.ShowDialog() == true;
+                var box = new TextBox { Text = initial ?? string.Empty, Margin = new Thickness(0, 12, 0, 0), Padding = new Thickness(8, 5, 8, 5), MinWidth = 200 };
+                box.SetResourceReference(Control.BackgroundProperty, "FieldBg");
+                box.SetResourceReference(Control.ForegroundProperty, "Text");
+                return ShowCore(owner, message, title, false, okText, cancelText, null, box, box)
+                    ? box.Text.Trim() : null;
             });
         }
 
-        /// <summary>长文本查看器（UIA 自检、日志导出等）。</summary>
         public static void ShowText(string title, string text)
         {
             OnUi(() =>
@@ -43,37 +39,20 @@ namespace WhaleLauncher
                 var box = new TextBox
                 {
                     Text = string.IsNullOrEmpty(text) ? "（没有输出）" : text,
-                    IsReadOnly = true,
-                    BorderThickness = new Thickness(1),
-                    Padding = new Thickness(12),
-                    FontFamily = new FontFamily("Cascadia Mono, Consolas, monospace"),
-                    FontSize = 12,
-                    TextWrapping = TextWrapping.Wrap,
-                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                    VerticalContentAlignment = VerticalAlignment.Top,
-                    MinHeight = 320,
+                    IsReadOnly = true, BorderThickness = new Thickness(1), Padding = new Thickness(12),
+                    FontFamily = new FontFamily("Cascadia Mono, Consolas, monospace"), FontSize = 12,
+                    TextWrapping = TextWrapping.Wrap, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                    VerticalContentAlignment = VerticalAlignment.Top, Height = 320, Margin = new Thickness(0, 12, 0, 0),
                 };
                 box.SetResourceReference(Control.BackgroundProperty, "FieldBg");
                 box.SetResourceReference(Control.ForegroundProperty, "Text");
-                var win = new Window
-                {
-                    Title = string.IsNullOrWhiteSpace(title) ? "鲸鲸" : title,
-                    Width = 760,
-                    Height = 540,
-                    Owner = ResolveOwner(null),
-                    WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                    Content = box,
-                };
-                win.SetResourceReference(Window.BackgroundProperty, "Bg");
-                win.ShowDialog();
+                ShowCore(null, null, title, false, "关闭", null, null, box, null, 760);
                 return true;
             });
         }
 
-        private static Window ResolveOwner(Window owner)
-        {
-            return owner ?? Application.Current?.MainWindow;
-        }
+        public static bool ShowContent(string title, UIElement content, double width = 620, string okText = "关闭", string cancelText = null)
+            => OnUi(() => ShowCore(null, null, title, false, okText, cancelText, null, content, null, width));
 
         private static T OnUi<T>(Func<T> action)
         {
@@ -82,99 +61,94 @@ namespace WhaleLauncher
             return app.Dispatcher.Invoke(action);
         }
 
-        private static Window Build(Window owner, string message, string title, bool danger,
-            string okText, string cancelText, string warningText = null)
+        private static bool ShowCore(Window owner, string message, string title, bool danger,
+            string okText, string cancelText, string warningText, UIElement extra, TextBox input, double width = 480)
         {
-            var win = new Window
-            {
-                Title = string.IsNullOrWhiteSpace(title) ? "鲸鲸" : title,
-                Width = 480,
-                SizeToContent = SizeToContent.Height,
-                ResizeMode = ResizeMode.NoResize,
-                WindowStartupLocation = owner != null
-                    ? WindowStartupLocation.CenterOwner
-                    : WindowStartupLocation.CenterScreen,
-                ShowInTaskbar = false,
-                Owner = owner,
-            };
-            win.SetResourceReference(Window.BackgroundProperty, "Bg");
+            var window = Application.Current?.MainWindow ?? owner;
+            if (window?.Content is not Grid root || !window.IsVisible) return false;
 
+            var frame = new DispatcherFrame();
+            bool result = false;
+            var overlay = new Grid { Background = new SolidColorBrush(Color.FromArgb(150, 0, 0, 0)), Focusable = true };
+            KeyboardNavigation.SetTabNavigation(overlay, KeyboardNavigationMode.Cycle);
+            Grid.SetRowSpan(overlay, Math.Max(1, root.RowDefinitions.Count));
+            Grid.SetColumnSpan(overlay, Math.Max(1, root.ColumnDefinitions.Count));
+            Panel.SetZIndex(overlay, int.MaxValue);
+            var card = new Border { Width = width, MaxWidth = Math.Max(200, window.ActualWidth - 48), MaxHeight = Math.Max(200, window.ActualHeight - 48), CornerRadius = new CornerRadius(14), BorderThickness = new Thickness(1), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+            card.SetResourceReference(Border.BackgroundProperty, "Bg");
+            card.SetResourceReference(Border.BorderBrushProperty, "Line");
             var panel = new StackPanel { Margin = new Thickness(22, 20, 22, 18) };
-            var primary = Application.Current?.TryFindResource("Primary") as Style;
-            var ghost = Application.Current?.TryFindResource("Ghost") as Style;
-            var textBrush = Application.Current?.TryFindResource("Text") as Brush;
-            var bodyBrush = Application.Current?.TryFindResource("Text2") as Brush;
-
-            var head = new TextBlock
-            {
-                Text = win.Title,
-                FontSize = 15,
-                FontWeight = FontWeights.SemiBold,
-                TextWrapping = TextWrapping.Wrap,
-                Foreground = textBrush,
-            };
-            panel.Children.Add(head);
-
+            var layout = new DockPanel();
+            card.Child = layout;
+            var scroll = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+            overlay.Children.Add(card);
+            var header = new DockPanel { Margin = new Thickness(22, 16, 22, 0) };
+            DockPanel.SetDock(header, Dock.Top);
+            layout.Children.Add(header);
+            var close = new Button { Content = "×", FontSize = 20, Padding = new Thickness(8, 0, 8, 0), Style = Application.Current?.TryFindResource("Ghost") as Style, ToolTip = "关闭" };
+            System.Windows.Automation.AutomationProperties.SetName(close, "关闭弹窗");
+            DockPanel.SetDock(close, Dock.Right);
+            header.Children.Add(close);
+            var head = new TextBlock { Text = string.IsNullOrWhiteSpace(title) ? "鲸鲸" : title, FontSize = 15, FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center };
+            head.SetResourceReference(TextBlock.ForegroundProperty, "Text");
+            header.Children.Add(head);
             if (!string.IsNullOrWhiteSpace(warningText))
             {
-                var warning = new TextBlock
-                {
-                    Text = warningText,
-                    FontSize = 14,
-                    FontWeight = FontWeights.Bold,
-                    TextWrapping = TextWrapping.Wrap,
-                    Margin = new Thickness(0, 12, 0, 0),
-                    Foreground = Brushes.IndianRed,
-                };
+                var warning = new TextBlock { Text = warningText, FontSize = 14, FontWeight = FontWeights.Bold, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 12, 0, 0) };
                 warning.SetResourceReference(TextBlock.ForegroundProperty, "Bad");
                 panel.Children.Add(warning);
             }
-
-            var body = new TextBlock
+            if (!string.IsNullOrEmpty(message))
             {
-                Text = message ?? string.Empty,
-                TextWrapping = TextWrapping.Wrap,
-                Margin = new Thickness(0, 10, 0, 0),
-                LineHeight = 21,
-                Foreground = bodyBrush,
-            };
-            panel.Children.Add(body);
-
-            var row = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                Margin = new Thickness(0, 18, 0, 0),
-            };
-
+                var body = new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 10, 0, 0), LineHeight = 21 };
+                body.SetResourceReference(TextBlock.ForegroundProperty, "Text2");
+                panel.Children.Add(body);
+            }
+            if (extra != null) panel.Children.Add(extra);
+            var row = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 18, 0, 0) };
+            void Finish(bool accepted) { result = accepted; frame.Continue = false; }
+            close.Click += (_, _) => Finish(false);
             if (cancelText != null)
             {
-                var cancel = new Button
-                {
-                    Content = cancelText,
-                    Style = ghost,
-                    Padding = new Thickness(16, 5, 16, 5),
-                    IsCancel = true,
-                };
-                cancel.Click += (_, _) => win.DialogResult = false;
+                var cancel = new Button { Content = cancelText, Style = Application.Current?.TryFindResource("Ghost") as Style, Padding = new Thickness(16, 5, 16, 5) };
+                cancel.Click += (_, _) => Finish(false);
                 row.Children.Add(cancel);
             }
-
-            var ok = new Button
-            {
-                Content = okText,
-                Style = primary,
-                Padding = new Thickness(16, 5, 16, 5),
-                Margin = new Thickness(cancelText == null ? 0 : 10, 0, 0, 0),
-                IsDefault = true,
-            };
+            var ok = new Button { Content = okText, Style = Application.Current?.TryFindResource("Primary") as Style, Padding = new Thickness(16, 5, 16, 5), Margin = new Thickness(cancelText == null ? 0 : 10, 0, 0, 0) };
             if (danger) ok.SetResourceReference(Control.ForegroundProperty, "Bad");
-            ok.Click += (_, _) => win.DialogResult = true;
+            ok.Click += (_, _) => Finish(true);
             row.Children.Add(ok);
-
-            panel.Children.Add(row);
-            win.Content = panel;
-            return win;
+            row.Margin = new Thickness(22, 12, 22, 18);
+            DockPanel.SetDock(row, Dock.Bottom);
+            layout.Children.Add(row);
+            layout.Children.Add(scroll);
+            overlay.PreviewKeyDown += (_, e) =>
+            {
+                if (e.Key == Key.Escape) { Finish(false); e.Handled = true; }
+                else if (e.Key == Key.Enter && input != null && Keyboard.FocusedElement == input) { Finish(true); e.Handled = true; }
+            };
+            EventHandler closed = (_, _) => Finish(false);
+            window.Closed += closed;
+            var previousFocus = Keyboard.FocusedElement;
+            var previous = new List<(UIElement element, bool enabled, Effect effect)>();
+            foreach (UIElement child in root.Children)
+            {
+                previous.Add((child, child.IsEnabled, child.Effect));
+                child.SetCurrentValue(UIElement.IsEnabledProperty, false);
+                child.SetCurrentValue(UIElement.EffectProperty, new BlurEffect { Radius = 8 });
+            }
+            root.Children.Add(overlay);
+            overlay.Loaded += (_, _) => { if (input != null) { input.Focus(); input.SelectAll(); } else ok.Focus(); };
+            try { Dispatcher.PushFrame(frame); }
+            finally
+            {
+                root.Children.Remove(overlay);
+                if (extra != null) panel.Children.Remove(extra);
+                foreach (var item in previous) { item.element.SetCurrentValue(UIElement.EffectProperty, item.effect); item.element.SetCurrentValue(UIElement.IsEnabledProperty, item.enabled); }
+                window.Closed -= closed;
+                if (previousFocus is IInputElement focus) Keyboard.Focus(focus);
+            }
+            return result;
         }
     }
 }

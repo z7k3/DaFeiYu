@@ -1,6 +1,7 @@
 'use strict';
 
 const vision = require('../../adapters/vision');
+const { errorMessage } = require('../../infra/errors');
 const { json, readBody } = require('../util');
 
 module.exports = function register(router) {
@@ -21,7 +22,7 @@ module.exports = function register(router) {
       });
       return json(res, 200, { ok: true, sample: String(text || '').slice(0, 60), vision: vision.status(runtime.config) });
     } catch (err) {
-      return json(res, 500, { ok: false, error: String((err && err.message) || err), vision: vision.status(runtime.config) });
+      return json(res, 500, { ok: false, error: errorMessage(err), vision: vision.status(runtime.config) });
     }
   });
 
@@ -36,7 +37,7 @@ module.exports = function register(router) {
       return json(res, 200, { ok: true, text });
     } catch (err) {
       runtime.logger.warn('图片识别失败：' + (err && err.message));
-      return json(res, err.statusCode || 500, { ok: false, error: String((err && err.message) || err) });
+      return json(res, err.statusCode || 500, { ok: false, error: errorMessage(err) });
     }
   });
 };

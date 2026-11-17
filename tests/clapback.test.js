@@ -68,11 +68,11 @@ test('真人模型模式下不再念台词库，交给模型现编', async () =>
   cleanup();
 });
 
-test('没被骂的时候也有这条核心性格，但不会触发开骂', async () => {
+test('没被骂时不常驻暴躁性格与火力档', async () => {
   const llm = { isMock: false, model: 'qwen-plus', reload() {}, async complete() { return '嗯' } };
   const { bot, cleanup } = makeBot({ llm });
   const r = await bot.decide(groupMsg('@鲸鲸 今天吃什么', { atMe: true }));
-  assert.match(r.system, /核心性格/, '核心性格要常驻');
+  assert.doesNotMatch(r.system, /核心性格：温吞外表/);
   assert.doesNotMatch(r.system, /第二条人格/, '没被冒犯时不塞火力档');
   cleanup();
 });

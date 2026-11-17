@@ -66,7 +66,9 @@ if ($serviceIds.Count -gt 0) {
   try {
     $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/healthz" -TimeoutSec 3 -ErrorAction Stop
     if ($health.service -ne 'whale-girl' -or $serviceIds -notcontains $health.pid) { throw '无法确认本目录的内核身份' }
-    $settings = Get-Content -LiteralPath (Join-Path $root 'config.json') -Encoding UTF8 -Raw -ErrorAction Stop | ConvertFrom-Json
+    $configPath = Join-Path $root 'data\config.json'
+    if (-not (Test-Path -LiteralPath $configPath)) { $configPath = Join-Path $root 'config.json' }
+    $settings = Get-Content -LiteralPath $configPath -Encoding UTF8 -Raw -ErrorAction Stop | ConvertFrom-Json
     $token = if ($null -ne $settings.gateway.wechat.inboundToken) { [string]$settings.gateway.wechat.inboundToken } else { 'change-me-wechat' }
     $headers = @{}
     if ($token) { $headers['x-bot-token'] = $token }

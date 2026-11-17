@@ -60,7 +60,7 @@ test('WM_CHAR 编码：auto 模式真的打一个字回读实测', () => {
   assert.match(BG, /_DETECT_DIRTY/, '清不干净要能拦住发送');
   assert.match(
     BG,
-    /if _DETECT_DIRTY:\s*\n(?:\s*#.*\n)*\s*_DETECT_DIRTY\.clear\(\)\s*\n\s*return False, "input_dirty"/
+    /if _DETECT_DIRTY:\s*\r?\n(?:\s*#.*\r?\n)*\s*_DETECT_DIRTY\.clear\(\)\s*\r?\n\s*return False, "input_dirty"/
   );
 });
 

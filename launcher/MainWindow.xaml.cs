@@ -36,6 +36,10 @@ namespace WhaleLauncher
         private bool _refreshing;
         private bool _memoryNoticeChecked;
 
+        // 官网和赞助入口固定在侧栏底部；链接写死，不依赖内核或网络配置，断网时浏览器自行提示。
+        private const string OfficialSite = "https://bot.zyyc.cc/";
+        private const string SponsorPage = "https://afdian.com/a/Banan1ce";
+
         private static readonly NavEntry[] NavKeys =
         {
             new NavEntry { Key = "状态", Label = "状态", Icon = Geometry.Parse("M4 4h7v7H4z M13 4h7v4h-7z M13 10h7v10h-7z M4 13h7v7H4z") },
@@ -55,6 +59,7 @@ namespace WhaleLauncher
 
             var dir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
             _sup = new RuntimeSupervisor(dir);
+            _sup.UpdateBlocked = true;
             _pluginMarket = new PluginMarket(dir);
 
             // 正式版不该显示成 v4.0-alpha：那会让用户以为自己装的是测试版，
@@ -82,7 +87,7 @@ namespace WhaleLauncher
             Loaded += async (_, __) =>
             {
                 Nav.SelectedIndex = 0;
-                _ = SilentUpdateCheckAsync();
+                await SilentUpdateCheckAsync(allowBlocking: true);
                 await RefreshAsync();
             };
             Closing += OnClosingDuringUpdate;
@@ -132,7 +137,7 @@ namespace WhaleLauncher
 
         private void OnToastUpdateClick(object sender, RoutedEventArgs e)
         {
-            if (_lastManifest != null && _lastManifest.HasUpdate) _ = RunUpdateAsync(_lastManifest, askFirst: true);
+            if (_lastManifest != null && _lastManifest.HasUpdate) ApplyManifestPolicy(_lastManifest, interactive: true);
             else OnCheckUpdate(sender, null);
             e.Handled = true;
         }
@@ -210,7 +215,7 @@ namespace WhaleLauncher
         /// 拿清单结果决定界面形态。这里只做「提示 / 强制 / 禁止启动」的判定，
         /// 不下载；真下载交给 UpdateService 下载官方安装包。
         /// </summary>
-        private async Task SilentUpdateCheckAsync()
+        private async Task SilentUpdateCheckAsync(bool allowBlocking = false)
         {
             if (_updating || _checkingUpdates) return;
             _checkingUpdates = true;
@@ -218,7 +223,7 @@ namespace WhaleLauncher
             try
             {
                 var chk = await UpdateManifestService.FetchAsync(_sup.BaseDir);
-                ApplyManifestPolicy(chk, false, allowBlocking: false);
+                ApplyManifestPolicy(chk, false, allowBlocking);
             }
             finally { _checkingUpdates = false; }
         }
@@ -237,6 +242,7 @@ namespace WhaleLauncher
 
         private void ApplyManifestPolicy(ManifestCheck chk, bool interactive, bool allowBlocking = true)
         {
+            if (allowBlocking) _sup.UpdateBlocked = chk.Policy == UpdatePolicy.Force || chk.Policy == UpdatePolicy.Kill;
             switch (chk.Policy)
             {
                 case UpdatePolicy.Kill:
@@ -556,6 +562,22 @@ namespace WhaleLauncher
         }
 
         private void OnSettings(object sender, RoutedEventArgs e) => GoTo("设置");
+
+        private void OnOpenWebsite(object sender, RoutedEventArgs e) => OpenExternal(OfficialSite, "打开官网失败");
+
+        private void OnOpenSponsor(object sender, RoutedEventArgs e) => OpenExternal(SponsorPage, "打开赞助页面失败");
+
+        private void OpenExternal(string url, string failureTitle)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                AppDialog.Show(this, failureTitle + "：\n" + ex.Message + "\n\n可以手动在浏览器打开：" + url, failureTitle);
+            }
+        }
 
         // ── 顶栏动作 ────────────────────────────────────────────
         private bool AnythingRunning => _sup.NodeRunning || _sup.BridgeRunning;

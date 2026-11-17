@@ -3,8 +3,10 @@
 const web = require('../adapters/websearch');
 const weather = require('../adapters/search/weather');
 const router = require('../adapters/searchRouter');
+const apiSearch = require('../adapters/search/apiSearch');
 const policy = require('../core/search/policy');
 const quality = require('../core/search/quality');
+const { resolveSearchConfig } = require('../infra/config');
 const { effectiveMaxAgeDays } = quality;
 const { result, formatResult } = require('../core/search/result');
 const { remaining, errorInfo, report, searchError } = require('../adapters/search/transport');
@@ -16,8 +18,32 @@ const links = require('../adapters/links');
 // 的摘要只给前三），不抓结果页正文就只能报半截名单。
 const ORIGINAL_TEXT_RE = /(歌词|副歌|台词|原文|全文|诗文|攻略|步骤|教程|说明书|玩法|怎么玩|怎么弄|怎么做|名单|榜单|排行|排名|top\s*\d+)/i;
 
+/** 本地结果和 API 结果合并：API 在前，按 URL 去重，最多保留 limit 条。 */
+function mergeResults(local, api, limit = 4) {
+  const items = [];
+  const seen = new Set();
+  for (const item of [...(api?.items || []), ...(local?.items || [])]) {
+    const url = String(item?.url || '').trim();
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    items.push(item);
+  }
+  const attempts = [...(api?.attempts || []), ...(local?.attempts || [])];
+  const failed = local?.status === 'failed' || api?.status === 'failed';
+  return result(items.slice(0, Math.max(1, limit)), {
+    status: items.length ? 'ok' : failed ? 'failed' : 'empty',
+    reason: items.length ? 'available'
+      : api?.reason === 'quota_exceeded' ? 'quota_exceeded'
+        : local?.reason || api?.reason || 'no_results',
+    attempts,
+    staleItems: local?.staleItems || [],
+    elapsedMs: Math.max(Number(local?.elapsedMs) || 0, Number(api?.elapsedMs) || 0),
+  });
+}
+
 /** 单轮搜索的唯一入口；只返回证据，不读写会话存储或决定聊天回复。 */
-async function search({ text = '', history = [], llm, config = {}, now = new Date(), timeZone = '', signal, trace, force = false } = {}, deps = {}) {
+async function search({ text = '', history = [], llm, config = {}, now = new Date(), timeZone = '', signal, trace, force = false, dataDir = 'data' } = {}, deps = {}) {
+  if (llm?.config && config.api?.followChat === true) config = resolveSearchConfig({ ...llm.config, websearch: config });
   const providers = deps.providers || web;
   // 抓正文默认走真实 links 适配器；测试注入 deps.describeLink 以免出网。
   const describeLink = deps.describeLink || links.describeLink;
@@ -191,14 +217,30 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
     }
     if (!active()) throw searchError(controller.signal.aborted ? 'aborted' : 'deadline_exceeded');
     if (policy.DOMAINS[intent.site]) q = q.replace(/\bsite:[a-z0-9.-]+/gi, '').trim() + ' site:' + policy.DOMAINS[intent.site];
+    // API 搜索（DeepSeek/知乎，上游 4.1.5）开启时先走 API；失败或没有结果才回退本地。
+    const apiOn = config?.api?.enabled === true
+      && Array.isArray(config.api.providers) && config.api.providers.length > 0;
+    let api = null;
+    if (apiOn) {
+      const apiDeadline = config.api.followChat === true
+        ? Math.min(deadline, Date.now() + Math.floor(options().timeoutMs * 0.6)) : deadline;
+      api = await apiSearch.apiSearch({
+        query: q, text, websearch: config, dataDir,
+        deadline: apiDeadline, signal: controller.signal, timeoutMs: Math.max(0, apiDeadline - Date.now()), trace: say,
+      }).catch((err) => {
+        const info = errorInfo(err);
+        say('api_failed', info);
+        return result([], { status: 'failed', reason: info.code });
+      });
+      if (api?.items?.length) return finish(api);
+    }
     const value = await call('web', () => providers.searchResult(q, { ...options(), limit: 4,
       tavilyApiKey: config.tavilyApiKey, tavilyBaseUrl: config.tavilyBaseUrl, tavilyMaxResults: config.tavilyMaxResults,
       maxAgeDays: effectiveMaxAgeDays(`${text} ${q}`, intent.fresh, intent.timeRange) }));
     // deadline 先到时 race 会整体 reject——已经拿到的结果不能跟着丢，先留在这里。
     if (value && value.items && value.items.length) partial = value;
-    // 原文类查询：搜索摘要经常只剩「歌名页/目录页」（用户看到的「都是链接没正文」就是
-    // 这个）。抓前两条非百科结果页的正文补进资料——复用读链接的 SSRF 防护和缓存；
-    // 死链/失效页的「正文」是站点提示语，必须剔除，不然反而污染资料。
+    // 原文类查询：搜索摘要经常只剩「歌名页/目录页」。抓前两条非百科结果页的正文补进
+    // 资料；来源已带全文（Tavily rawContent）时跳过。死链/失效页必须剔除。
     const hasProviderFullText = value.items?.some((item) => String(item.rawContent || '').trim());
     if (value.status === 'ok' && value.items?.length && !hasProviderFullText
         && ORIGINAL_TEXT_RE.test(text + ' ' + q) && active()) {
@@ -206,13 +248,10 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
       for (const top of candidates) {
         const page = await locate('page-reader', () => describeLink(top.url,
           { timeoutMs: Math.max(0, Math.min(6000, Math.floor(options().timeoutMs * 0.6))) }));
-        // 三道闸：站点失效提示 → 死链；正文不含查询关键词 → JS 渲染页抓到的页脚垃圾；
-        // 都过不了就不收，宁可只有摘要列表也不往资料里塞噪音。
         const dead = page && page.ok
           && /失效|已删除|被删除|不存在|查无此页|您访问的页面|找不到页面|404 Not Found/.test(page.article.slice(0, 120));
         const relevant = page && page.ok && !dead
           && page.article.length > 60
-          // 只给抓回来的正文打分（title 来自搜索结果，本来就含关键词，凑进去会放过页脚垃圾）。
           && quality.relevanceScore(q, { title: '', snippet: page.article }) > 0;
         if (relevant) {
           value.items = [{ title: (page.title || top.title) + '（正文摘录）', url: page.url || top.url,
@@ -221,7 +260,7 @@ async function search({ text = '', history = [], llm, config = {}, now = new Dat
         }
       }
     }
-    return finish(value);
+    return finish(api ? mergeResults(value, api, 4) : value);
   };
   let timer, abort;
   let partial = null;   // run() 里已经成功拿到、但整体 deadline 先到的部分结果

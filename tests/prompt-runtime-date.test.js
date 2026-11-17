@@ -54,14 +54,14 @@ test('私聊提示词带完整年月日 + 星期（问「今天几号」有据�
   assert.match(system, /今天是 2026年10月31日 周六/, 'system 里必须有日期行');
   assert.match(system, /时间怎么看/, '要告诉她时间看哪里、别自己编');
   assert.match(system, /按下面那行「今天是…」回答/, '日期按 system 那行答');
-  assert.match(prompt, /\[10-31 18:05\]/, '拼装后的提示词里要有这条消息的时间戳');
+  assert.doesNotMatch(prompt, /\[10-31 18:05\]/, '消息时间留在内部，不注入模型正文');
   assert.doesNotMatch(system, /18:05/, '具体时刻只在消息时间戳里，system 不再每轮变');
 });
 
 test('群聊提示词同样带年月日（两条分支不能只改一条）', () => {
   const { system, prompt } = buildAt(new Date(2026, 0, 1, 9, 30, 0), { chatType: 'group' });
   assert.match(system, /今天是 2026年1月1日 周四/);
-  assert.match(prompt, /\[01-01 09:30\]/);
+  assert.doesNotMatch(prompt, /\[01-01 09:30\]/);
 });
 
 test('年份来自运行时，不是写死的 2026', () => {
@@ -75,5 +75,5 @@ test('自定义人设也带时间（换成自定义提示词不能把时间弄�
   const { system, prompt } = buildAt(new Date(2027, 2, 15, 8, 0, 0), { customPrompt: '你就是鲸鲸，说话俏皮一点。' });
   assert.ok(system.startsWith('你就是鲸鲸'), '自定义人设原文要在最前面');
   assert.match(system, /今天是 2027年3月15日 周一/, '自定义人设分支漏了运行日期');
-  assert.match(prompt, /\[03-15 08:00\]/, '自定义人设分支漏了消息时间戳');
+  assert.doesNotMatch(prompt, /\[03-15 08:00\]/, '自定义人设也不注入消息时间戳');
 });

@@ -17,18 +17,43 @@ function shortText(text, max) {
   return characters.length > max ? characters.slice(0, max - 1).join('') + '…' : text;
 }
 
+/**
+ * 去掉 HTML 注释和标签片段，只留文字。
+ *
+ * 为什么不用 `/<[^>]*>/g`：这种「多字符替换」在扫描器看来不完整（重叠的
+ * `<scr<script>ipt>` 一类输入可能留下能拼回的片段），所以改成逐字符扫描，
+ * 扫完文本里不会再有任何尖括号。真正的注入防护仍然是输出前的 escapeHtml()，
+ * 这一层只负责把发布说明变成好看的纯文本。
+ */
+function stripMarkupSpans(text) {
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    if (text.startsWith('<!--', i)) {
+      const end = text.indexOf('-->', i + 4);
+      i = end < 0 ? text.length : end + 3;
+      continue;
+    }
+    if (text[i] === '<') {
+      const end = text.indexOf('>', i + 1);
+      i = end >= 0 ? end + 1 : i + 1;      // 孤立的尖括号直接丢掉，后面的文字保留
+      continue;
+    }
+    out += text[i];
+    i += 1;
+  }
+  return out;
+}
+
 function notesFrom(body) {
-  return String(body || '')
-    .replace(/<!--[^]*?-->|^```[^]*?^```[^\n]*/gm, '')
+  return stripMarkupSpans(String(body || ''))
+    .replace(/^```[^]*?^```[^\n]*/gm, '')
     .split(/\r?\n/)
     .filter(line => !/^\s*(?:#|>|!\[|[-*_]{3,}\s*$)/.test(line))
     .map(line => line
       .replace(/^\s*(?:[-*+]|\d+\.)\s+/, '')
       .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-      .replace(/<[^>]*>|[`*_]/g, '')
-      // 上面只去掉成对的标签；残缺的 "<script" 片段会把尖括号留在文本里，
-      // 后续如果拼进 HTML 就可能被当成元素。剩下的尖括号一律去掉。
-      .replace(/[<>]/g, '')
+      .replace(/[`*_]/g, '')
       .trim())
     .filter(Boolean)
     .slice(0, 5);
@@ -94,4 +119,4 @@ if (require.main === module) {
   fs.writeFileSync(path.join(output, 'index.html'), html);
 }
 
-module.exports = { render };
+module.exports = { render, notesFrom };

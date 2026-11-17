@@ -13,6 +13,7 @@
 import ast
 import copy
 import glob
+import html
 import os
 import re
 import sys
@@ -74,6 +75,31 @@ def init(env):
     return env
 
 
+# 从 mixin 旁边抽出来的模块级纯函数：执行 handle_message 这类方法时它们必须先在
+# env 里，否则会在调用处 NameError。按依赖顺序加载，已有的不覆盖。
+_MODULE_HELPERS = ('_nested_quote_text', 'parse_quote_content', 'quote_content_text',
+                   'run_media_with_timeout', 'image_key_note', 'image_dir_note')
+
+
+def _load_module_helpers(env):
+    env.setdefault('html', html)
+    env.setdefault('re', re)
+    env.setdefault('os', os)
+    env.setdefault('threading', __import__('threading'))
+    # 模块级常量（如识别超时表）单函数抽取时不会自动带上，先按名字补进 env。
+    for const in ('MEDIA_TIMEOUTS', '_MEDIA_TIMEOUT_FALLBACK'):
+        if const in env:
+            continue
+        try:
+            path, node = find_assignment(const)
+        except AssertionError:
+            continue
+        env[const] = eval(compile(ast.Expression(node), path, 'eval'), env)
+    for helper in _MODULE_HELPERS:
+        if helper not in env:
+            load_function(helper, env)
+
+
 def _functions(name):
     for path, tree in _TREES:
         for node in ast.walk(tree):
@@ -83,6 +109,8 @@ def _functions(name):
 
 def load_function(name, env):
     init(env)
+    if name not in _MODULE_HELPERS:
+        _load_module_helpers(env)
     for path, node in _functions(name):
         node = copy.deepcopy(node)
         # 类方法去掉 self；保留原参数表。

@@ -41,10 +41,11 @@ async function getJson(url, token) {
 
 async function fetchData(token = process.env.GH_TOKEN) {
   const api = name => `https://api.github.com/repos/${name}`;
-  const [latest, releases, head] = await Promise.all([
+  const [latest, releases, head, repository] = await Promise.all([
     getJson(`${api(APP)}/releases/latest`, token),
     collectPages(page => getJson(`${api(APP)}/releases?per_page=100&page=${page}`, token)),
     getJson(`${api(MARKET)}/commits/main`, token),
+    getJson(api(APP), token),
   ]);
   if (!/^[a-f0-9]{40}$/.test(head.sha)) throw new Error('插件市场源码 commit 无效');
   const catalogs = await Promise.all(INDEXES.map(async index => {
@@ -52,7 +53,8 @@ async function fetchData(token = process.env.GH_TOKEN) {
     if (!Array.isArray(items)) throw new Error(`插件目录格式无效：${index}`);
     return items.map(item => ({ ...item, SourceIndex: index }));
   }));
-  return { latest, releases, plugins: catalogs.flat(), sourceCommit: head.sha, fetchedAt: new Date().toISOString() };
+  if (!Number.isSafeInteger(repository.stargazers_count) || repository.stargazers_count < 0) throw new Error('GitHub Star 数量无效');
+  return { latest, releases, stars: repository.stargazers_count, plugins: catalogs.flat(), sourceCommit: head.sha, fetchedAt: new Date().toISOString() };
 }
 
 if (require.main === module) {

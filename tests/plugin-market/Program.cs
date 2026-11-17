@@ -6,7 +6,7 @@ using WhaleLauncher;
 
 using var signingKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
 
-var dir = Directory.CreateTempSubdirectory("whale-market-checks-").FullName;
+var dir = Directory.CreateDirectory(Path.Combine(Environment.GetEnvironmentVariable("WHALE_TEST_TMP") ?? Path.GetTempPath(), "whale-market-checks-" + Guid.NewGuid().ToString("N"))).FullName;
 try
 {
     var module = Convert.FromHexString("0061736d010000000105016000017f021401057768616c650a696e7075745f73697a650000030201000707010372756e00010a0601040010000b");
@@ -30,6 +30,37 @@ try
         throw new Exception("预期拒绝无效插件");
     }
 
+    var releaseInfo = info with { AppEpoch = 2, MinAppVersion = "1.0.0", MaxAppVersion = "1.0.9" };
+    Check(!PluginMarket.Compatible(releaseInfo, "4.1.6.1", 1));
+    Check(PluginMarket.Compatible(releaseInfo, "1.0.0", 2));
+    Check(!PluginMarket.Compatible(releaseInfo, "0.9.9", 2));
+    Check(!PluginMarket.Compatible(releaseInfo, "1.1.0", 2));
+    Check(!PluginMarket.Compatible(info, "5.0.0", 2));
+    Check(PluginMarket.Compatible(info, "4.1.6.1", 0));
+    Check(PluginMarket.Compatible(info with { AppEpoch = 1 }, "4.1.6.1", 1));
+    Check(PluginMarket.ReadPackage(Pack(releaseInfo)).Info.AppEpoch == 2);
+    Check(JsonSerializer.Serialize(releaseInfo).Contains("\"appEpoch\":2"));
+    Check(releaseInfo.CompatibilityLabel.Contains("正式版"));
+    Reject(() => PluginMarket.ReadPackage(Pack(info with { AppEpoch = -1 })));
+    Reject(() => PluginMarket.ReadPackage(Pack(info with { AppEpoch = 3 })));
+    File.WriteAllBytes(Path.Combine(dir, "wrong-epoch.zip"), Pack(releaseInfo));
+    Reject(() => new PluginMarket(dir).InstallLocal(Path.Combine(dir, "wrong-epoch.zip")));
+    var bothInfo = info with { AppCompatibility = [
+        new PluginAppRange(1, "4.1.0", "4.1.6.1"),
+        new PluginAppRange(2, "1.0.0", "1.0.9")
+    ] };
+    Check(PluginMarket.Compatible(bothInfo, "4.1.6.1", 1));
+    Check(PluginMarket.Compatible(bothInfo, "1.0.0", 2));
+    Check(!PluginMarket.Compatible(bothInfo, "4.1.7", 1));
+    Check(!PluginMarket.Compatible(bothInfo, "1.1.0", 2));
+    Check(!PluginMarket.Compatible(bothInfo, "4.1.6.1", 2));
+    Check(!PluginMarket.Compatible(bothInfo, "1.0.0", 1));
+    Check(PluginMarket.ReadPackage(Pack(bothInfo)).Info.AppCompatibility.Length == 2);
+    Check(bothInfo.CompatibilityLabel.Contains("正式版") && bothInfo.CompatibilityLabel.Contains("旧版"));
+    Reject(() => PluginMarket.ReadPackage(Pack(bothInfo with { AppCompatibility = [] })));
+    Reject(() => PluginMarket.ReadPackage(Pack(bothInfo with { AppCompatibility = [new(1, "4.1.0"), new(1, "4.1.2")] })));
+    Reject(() => PluginMarket.ReadPackage(Pack(bothInfo with { AppCompatibility = [new(2, "1.1.0", "1.0.0")] })));
+
     // 先确认内置公钥能验证 Node crypto.sign 生成的 DER 签名。
     PluginTrust.ResetForTests();
     Check(PluginTrust.Verify(Encoding.UTF8.GetBytes("node-signed payload"),
@@ -40,6 +71,8 @@ try
     var signed = Convert.ToBase64String(signingKey.SignData(signedBytes, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence));
     Check(PluginTrust.Verify(signedBytes, signed));
     Check(!PluginTrust.Verify(signedBytes, signed + "x"));
+    // 市场签名暂时隐藏：开关保持 false，但验签能力本身必须还在，恢复后无需重写。
+    Check(!PluginMarket.MarketSignatureEnabled);
     Check(PluginMarket.SafeText("正常\n伪造", 80) == "正常 伪造");
     Check(!PluginMarket.SafeText("A\u202EB", 80).Contains('\u202E'));
     Check(PluginMarket.SafeMultiline("第一行\n第二行\u0000") == "第一行\n第二行");
@@ -119,6 +152,7 @@ try
     Check(PluginMarket.Compatible(persona, "4.1.9"));
     Check(!PluginMarket.Compatible(persona, "4.2.0"));
     Check(!PluginMarket.Compatible(persona, "4.0.8"));
+    persona = persona with { MaxAppVersion = null };
     File.WriteAllBytes(package, Pack(persona, "persona.json",
         System.Text.Encoding.UTF8.GetBytes("""{"customPrompt":"温和自然","personaName":"不可覆盖"}""")));
     market.InstallLocal(package);
@@ -128,12 +162,75 @@ try
     using (var json = JsonDocument.Parse(File.ReadAllBytes(preset)))
     {
         Check(json.RootElement.GetProperty("customPrompt").GetString() == "温和自然");
-        Check(!json.RootElement.TryGetProperty("personaName", out _));
+        Check(json.RootElement.GetProperty("personaName").GetString() == "不可覆盖");
     }
     market.SetEnabled(persona.Id, false);
     Check(!File.Exists(preset) && market.Installed().Length == 1);
     market.Uninstall(persona.Id);
     Check(market.Installed().Length == 0);
+    var share = Path.Combine(dir, "shared-persona.zip");
+    using (var document = JsonDocument.Parse("""
+        {"schemaVersion":1,"personaName":"小鱼","customPrompt":"","personality":"沉静","ownerName":"老大",
+         "aliases":["小鱼儿"],"masterRoast":true,"proactive":false,"opinions":false,
+         "emoji":"少","emojiChance":0.8,"historyTurns":350,"maxBubbles":4,
+         "master":{"wxids":["must-not-share"]},"apiKey":"must-not-share","permissions":["system.full"]}
+        """))
+    {
+        PersonaPackage.Export(share, document.RootElement, "完整小鱼", "分享者", "portable-fish", "1.0.0");
+    }
+    using (var zip = ZipFile.OpenRead(share))
+    {
+        Check(zip.Entries.Count == 2);
+        Check(zip.GetEntry("plugin.json") != null && zip.GetEntry("persona.json") != null);
+    }
+    var portablePackage = PluginMarket.ReadPackage(File.ReadAllBytes(share));
+    Check(portablePackage.Info.MinAppVersion == "4.1.5" && portablePackage.Info.Kind == "persona");
+    Check(PluginMarket.Compatible(portablePackage.Info, "4.1.5", 1));
+    Check(PluginMarket.Compatible(portablePackage.Info, "1.0.0", 2));
+    Check(!portablePackage.Persona.Contains("must-not-share") && !portablePackage.Persona.Contains("permissions"));
+    Check(market.InstallLocal(share));
+    market.SetEnabled("portable-fish", true);
+    var installedPersona = Path.Combine(dir, "data/plugins/portable-fish.persona.json");
+    using (var json = JsonDocument.Parse(File.ReadAllBytes(installedPersona)))
+    {
+        Check(json.RootElement.GetProperty("masterRoast").GetBoolean());
+        Check(!json.RootElement.GetProperty("proactive").GetBoolean());
+        Check(json.RootElement.GetProperty("emojiChance").GetDouble() == 0.8);
+        Check(json.RootElement.GetProperty("historyTurns").GetInt32() == 350);
+        Check(json.RootElement.GetProperty("customPrompt").GetString() == "");
+        Check(json.RootElement.GetProperty("ownerName").GetString() == "老大");
+    }
+    market.SetEnabled("portable-fish", false);
+    Check(!File.Exists(installedPersona));
+    market.Uninstall("portable-fish");
+    var promptShare = Path.Combine(dir, "prompt-only.zip");
+    using (var document = JsonDocument.Parse("""
+        {"customPrompt":"你是温和的图书管理员。","personaName":"不应分享","masterRoast":true,"emojiChance":0.8}
+        """))
+    {
+        PersonaPackage.Export(promptShare, document.RootElement, "图书管理员", "分享者", "prompt-librarian", "1.0.0", promptOnly: true);
+    }
+    using (var zip = ZipFile.OpenRead(promptShare))
+    {
+        Check(zip.Entries.Count == 2 && zip.GetEntry("persona.json").Length <= 65536);
+        using var json = JsonDocument.Parse(zip.GetEntry("persona.json").Open());
+        Check(json.RootElement.EnumerateObject().Count() == 1);
+        Check(json.RootElement.GetProperty("customPrompt").GetString() == "你是温和的图书管理员。");
+    }
+    Check(PluginMarket.ReadPackage(File.ReadAllBytes(promptShare)).Info.MinAppVersion == "4.1.0");
+    market.InstallLocal(promptShare);
+    market.SetEnabled("prompt-librarian", true);
+    Check(File.Exists(Path.Combine(dir, "data/plugins/prompt-librarian.persona.json")));
+    market.Uninstall("prompt-librarian");
+    var previousZip = File.ReadAllBytes(promptShare);
+    using (var emptyPrompt = JsonDocument.Parse("""{"customPrompt":"  "}"""))
+        Reject(() => PersonaPackage.Export(promptShare, emptyPrompt.RootElement, "空", "分享者", "prompt-empty", "1.0.0", promptOnly: true));
+    using (var largePrompt = JsonDocument.Parse(JsonSerializer.Serialize(new { customPrompt = new string('鱼', 24000) })))
+        Reject(() => PersonaPackage.Export(promptShare, largePrompt.RootElement, "太长", "分享者", "prompt-large", "1.0.0", promptOnly: true));
+    Check(File.ReadAllBytes(promptShare).SequenceEqual(previousZip));
+    Reject(() => PluginMarket.ReadPackage(Pack(persona, "persona.json", Encoding.UTF8.GetBytes("""{"customPrompt":"a","masterRoast":"false"}"""))));
+    Reject(() => PluginMarket.ReadPackage(Pack(persona, "persona.json", Encoding.UTF8.GetBytes("""{"customPrompt":"a","emojiChance":2}"""))));
+    Reject(() => PluginMarket.ReadPackage(Pack(persona, "persona.json", Encoding.UTF8.GetBytes("""{"customPrompt":""}"""))));
     if (args.Length > 1 && args[1] != "--live")
     {
         market.InstallLocal(args[1]);
@@ -170,6 +267,8 @@ try
         market.Uninstall(summaryId);
     }
     var messageInfo = info with { Id = "message-demo", Api = 3, Kind = "message", MinAppVersion = "4.1.0", Hooks = ["chat.pre_reply"], Permissions = [] };
+    Check(PluginMarket.ReadPackage(Pack(messageInfo with { AppEpoch = 2, MinAppVersion = "1.0.0" })).Info.AppEpoch == 2);
+    Reject(() => PluginMarket.ReadPackage(Pack(messageInfo with { AppEpoch = 2, MinAppVersion = "0.9.0" })));
     Reject(() => PluginMarket.ReadPackage(Pack(messageInfo with { MinAppVersion = "4.0.8" })));
     Reject(() => PluginMarket.ReadPackage(Pack(messageInfo with { Hooks = ["unknown"] })));
     Reject(() => PluginMarket.ReadPackage(Pack(messageInfo with { Permissions = ["filesystem"] })));
@@ -212,6 +311,7 @@ try
         Hooks = ["tool.run", "chat.search"], Permissions = ["system.full"] };
     var script = Encoding.UTF8.GetBytes("module.exports.run = async () => ({text:'你好😀'});");
     Reject(() => PluginMarket.ReadPackage(Pack(nativeInfo with { MinAppVersion = "4.1.1" }, "plugin.js", script)));
+    Check(PluginMarket.ReadPackage(Pack(nativeInfo with { AppEpoch = 2, MinAppVersion = "1.0.0" }, "plugin.js", script)).Info.AppEpoch == 2);
     Reject(() => PluginMarket.ReadPackage(Pack(nativeInfo with { Permissions = [] }, "plugin.js", script)));
     Reject(() => PluginMarket.ReadPackage(Pack(nativeInfo with { ExecutionTimeoutMs = 0 }, "plugin.js", script)));
     Reject(() => PluginMarket.ReadPackage(Pack(nativeInfo, "plugin.wasm", script)));
@@ -258,6 +358,7 @@ namespace WhaleLauncher
 {
     internal static class UpdateManifestService
     {
-        internal static string LocalVersion(string _) => "4.1.2";
+        internal static string LocalVersion(string _) => "4.1.5";
+        internal static int LocalEpoch(string _) => 1;
     }
 }

@@ -68,15 +68,8 @@ class LoopMixin:
                 continue
             name = self.ui_chat_name(u, name)
             if not name:
-                # 读不到昵称就别去搜 —— 用 wxid 搜会话是纯粹的十几秒空转（曾把每轮
-                # 搭话拖进整条发送通道矩阵，配合看门狗形成重启循环）。
+                # 读不到昵称就别去搜 —— 用 wxid 搜会话是纯粹的十几秒空转。
                 G.log_throttled('care-no-name-' + u[:18], '主动搭话没发：%s 在本地数据库里没有昵称/备注，微信搜不到这个会话（先给 TA 加个备注再试）' % G.safe_id(u), ttl=3600)
-                continue
-            if not hasattr(self, '_care_fail'):
-                # 连续失败冷却记账（内存即可，重启清零）
-                self._care_fail = {}
-                self._care_cooldown = {}
-            if G.time.time() < float(self._care_cooldown.get(u) or 0):
                 continue
             try:
                 r2 = G.LOCAL_HTTP.get(base + '/api/care', params={'chat': u}, timeout=40)
@@ -87,22 +80,33 @@ class LoopMixin:
             if not text:
                 continue
             G.log('主动搭话 →', G.safe_name(name), G.safe_text(text))
-            ok = False
             try:
-                ok = bool(self.send_text(text, name, u))
+                ok = self.send_text(text, name, u)
+                save_state({'lastTs': G.time.time(), 'day': today, 'count': sent + (0 if ok is False else 1)})
+                if ok is True:
+                    # 回传失败只重试记账，不重发微信正文；相同 id 由内核去重。
+                    import uuid
+                    receipt = {'id': uuid.uuid4().hex, 'chat': u, 'text': text, 'group': bool(target.get('isGroup'))}
+                    headers = {'x-whale-bridge': '1', 'x-bot-token': self.token or ''}
+                    try:
+                        recorded = None
+                        for attempt in range(3):
+                            try:
+                                recorded = G.LOCAL_HTTP.post(base + '/api/care/sent', json=receipt, headers=headers, timeout=15)
+                                if recorded.ok and (recorded.json() or {}).get('ok'):
+                                    break
+                            except Exception:
+                                if attempt == 2:
+                                    raise
+                            if attempt < 2:
+                                G.time.sleep(0.5)
+                        if not recorded.ok or not (recorded.json() or {}).get('ok'):
+                            G.log_warn('主动搭话已发送，但写入上下文失败')
+                    except Exception as e:
+                        G.log_warn('主动搭话已发送，但写入上下文失败：type=%s detail=%s' % (type(e).__name__, repr(e)[:160]))
             except Exception as e:
                 G.log('主动搭话发送失败：', repr(e))
-            save_state({'lastTs': G.time.time(), 'day': today, 'count': sent + (1 if ok else 0)})
-            # S2：同一目标连续 2 次发不出去就冷却 6 小时，别每 60 秒硬撞一次
-            if ok:
-                self._care_fail.pop(u, None)
-            else:
-                fails = self._care_fail.get(u, 0) + 1
-                self._care_fail[u] = fails
-                if fails >= 2:
-                    self._care_cooldown[u] = G.time.time() + 6 * 3600
-                    self._care_fail[u] = 0
-                    G.log('主动搭话连续 %d 次发不到 %s，6 小时内先不再试' % (fails, name))
+                save_state({'lastTs': G.time.time(), 'day': today, 'count': sent})
 
     def battery_watch(self):
         while True:
@@ -142,6 +146,8 @@ class LoopMixin:
         """
         if G.uia_boot is None:
             return self._UIA_READY
+        if self.foreground_is_moments():
+            return {'ok': False, 'reason': 'moments_foreground'}
         prefer = int(self.ACCOUNT.get('hwnd') or 0) if self.ACCOUNT.get('verified') else 0
         now = G.time.time()
         if not force and now - self._UIA_READY['ts'] < 30:
@@ -258,12 +264,8 @@ class LoopMixin:
 
         预算不再是「固定 40 秒」（H3）：bg 通道逐字投递，长文本单打字就要一两分钟，
         一刀切会把合法慢发送当卡死杀掉（半截草稿留在输入框、重启后不补发）。
-        预算 = max(40 秒, 0.16 秒 × 文本长度 + 8 秒)，随每次发送在 SEND_STATE 里更新。
-        S1 之后还有两道保险：进入 UIA/键盘/OCR 通道时按通道结构抬预算
-        （send_state.ensure_budget，120s+打字时间、封顶 180s）；通道内部长步骤
-        （open_chat 搜索兜底单次实测 8~20s）推进时用 send_state.touch() 刷新
-        start 当进度心跳——以前两次刷新之间单段就能超 40s，正常发送被误杀。
-        强杀统一走 G.hard_exit()：先还原 SPI_SETSCREENREADER 再 os._exit（S5）。
+        预算 = max(40 秒, 0.12 秒 × 文本长度)，随每次发送在 SEND_STATE 里更新；
+        各通道进入时还会刷新 SEND_STATE["start"] 当进度心跳。
         """
         while True:
             G.time.sleep(5)
@@ -272,7 +274,7 @@ class LoopMixin:
                 G.log('发送卡住超过 %.0f 秒，强制重启桥接进程…' % _budget)
                 dump_hang_trace()
                 G.time.sleep(0.3)
-                G.hard_exit(7)
+                G.os._exit(7)
 
     def listener_alive(self):
         """收消息的轮询线程是否还活着。"""
@@ -321,12 +323,18 @@ class LoopMixin:
         misses = 0
         gate_logged = False
         hb_misses = 0
+        background_uia_paused = False
         while True:
             try:
                 resting = False
                 uia_now = None
-                if not resting and G.SEND_STATE.get('active'):
+                if self.foreground_is_moments():
+                    uia_now = self.UIA_CACHE.get('u') is not None
+                elif not resting and G.SEND_STATE.get('active'):
                     G.log('心跳跳过预热（正在发送中）')
+                    uia_now = self.UIA_CACHE.get('u') is not None
+                elif background_uia_paused:
+                    # 只停止心跳线程的自动探测；实际发送仍执行原有账号校验及恢复。
                     uia_now = self.UIA_CACHE.get('u') is not None
                 elif not resting:
                     try:
@@ -334,7 +342,7 @@ class LoopMixin:
                             with self.gui_lock:
                                 self.gui = None
                                 self.UIA_CACHE['u'] = None
-                            misses = 0
+                            misses += 1
                             uia_now = False
                             if not gate_logged:
                                 G.log_warn('[!] 等待微信主窗可用，请打开已选账号的主窗口')
@@ -355,6 +363,7 @@ class LoopMixin:
                                 if _u is None:
                                     misses += 1
                                 if _u is None and misses >= 3:
+                                    background_uia_paused = True
                                     G.log_warn('[!] UIA 连续 %d 次拿不到，重建窗口驱动再试…' % misses)
                                     with self.gui_lock:
                                         self.gui = self.new_window_driver()
@@ -367,17 +376,12 @@ class LoopMixin:
                             self.UIA_CACHE['u'] = _u
                             uia_now = _u is not None
                     except Exception:
+                        misses += 1
                         uia_now = self.UIA_CACHE.get('u') is not None
-                # I4：心跳是桥接存活的唯一信号。上面 UIA 预热段已有独立的
-                # try/except（失败只是 uia 降级为缓存值，不会跳过本轮上报）；
-                # 这里再兜一层，保证 payload 组装本身出问题也不会漏发心跳——
-                # 服务端把「没心跳」当离线处理。
-                try:
-                    payload = {'platform': 'wechat', 'uia': uia_now, 'rest': resting, 'listener': self.listener_alive(), 'ffmpeg': self.ffmpeg_available(), 'account': self.db.account, 'account_wxid': self.db.wxid, 'account_nick': self._self_nick, 'account_ok': bool(self.ACCOUNT.get('verified')), 'account_why': str(self.ACCOUNT.get('why') or ''), 'account_guard': bool(G.ACCOUNT_GUARD), 'window': self.wechat_window_state()}
-                except Exception:
-                    # degraded 心跳里不能再调任何方法（listener_alive 也可能抛）——全用常量，
-                    # 保证这条 POST 必发：桥接活着比字段精确更重要。
-                    payload = {'platform': 'wechat', 'uia': bool(uia_now), 'rest': resting, 'listener': None, 'degraded': True}
+                    if background_uia_paused or misses >= 3:
+                        background_uia_paused = True
+                        G.log_warn('[!] UIA 后台检查连续失败，已暂停后台预热和重建，避免反复触碰微信；实际发送仍按原流程检查，重连桥接后恢复后台检查')
+                payload = {'platform': 'wechat', 'uia': uia_now, 'rest': resting, 'listener': self.listener_alive(), 'ffmpeg': self.ffmpeg_available(), 'account': self.db.account, 'account_wxid': self.db.wxid, 'account_nick': self._self_nick, 'account_ok': bool(self.ACCOUNT.get('verified')), 'account_why': str(self.ACCOUNT.get('why') or ''), 'account_guard': bool(G.ACCOUNT_GUARD), 'window': self.wechat_window_state()}
                 headers = {'x-whale-bridge': '1'}
                 if self.token:
                     headers['x-bot-token'] = self.token
@@ -435,13 +439,17 @@ class LoopMixin:
                 return
             if G.reload_config(config=current):
                 last = mt
-
                 # 人设名/别名也可能刚被改过；同步给群聊 @ 判定，并清掉 60 秒缓存，
                 # 否则用户改完称呼还要等下一轮刷新才生效。
                 self.cfg = current
                 persona = (current.get('persona') or {})
                 self.aliases = list(persona.get('aliases') or []) + [persona.get('name') or '鲸鲸']
                 self._mention_cache = None
+                # 新时间设置要作用到已经攒着的批次；不能等它们按旧值到点。
+                try:
+                    self.settle.reconcile()
+                except Exception:
+                    pass
                 G.log('配置已热更新（启动器改完即时生效，不用重启桥接）')
 
     def contacts_sync_once(self):

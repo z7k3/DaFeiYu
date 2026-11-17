@@ -54,7 +54,7 @@ namespace WhaleLauncher.Views
             foreach (var chk in new[] { ChkCareEnabled, ChkCareOnlyMaster, ChkCareGroups, ChkCareOthers })
                 chk.Click += async (_, __) => await SaveCareAsync();
 
-            Loaded += async (_, __) => await RefreshAsync(true);   // 页面载入才全量回填（M30）
+            Loaded += async (_, __) => await RefreshAsync(!_formsLoaded);
         }
 
         /// <summary>周期刷新（MainWindow 2 秒定时器驱动）：只刷提醒列表和状态行，不动表单（M30）。</summary>
@@ -155,15 +155,9 @@ namespace WhaleLauncher.Views
 
         private async Task SaveDiaryAsync()
         {
+            if (!_formsLoaded) return;
             // 保存失败时把勾选框退回上一次服务端的值，否则周期刷新不回读 enabled，
             // 界面会一直显示一个实际上没写进配置的开关状态。
-            if (!_sup.NodeRunning)
-            {
-                ChkDiaryEnabled.IsChecked = _diaryEnabled;
-                ChkDiarySend.IsChecked = _diarySendToOwner;
-                DiarySettingsStatus.Text = "请先启动内核，再保存日记设置。";
-                return;
-            }
             if (!TxtDiaryTime.TryRead(out var time))
             {
                 ChkDiaryEnabled.IsChecked = _diaryEnabled;
@@ -276,7 +270,7 @@ namespace WhaleLauncher.Views
         private async void OnSaveCare(object sender, RoutedEventArgs e) => await SaveCareAsync();
 
         private void OnOpenCarePolicy(object sender, RoutedEventArgs e)
-            => new ChatPolicyWindow(_sup) { Owner = Window.GetWindow(this) }.ShowDialog();
+            => AppDialog.ShowContent("微信发言范围", new ChatPolicyWindow(_sup));
 
         private async Task<bool> SaveCareAsync()
         {

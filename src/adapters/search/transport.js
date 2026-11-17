@@ -109,4 +109,62 @@ async function getJson(url, opts) {
   try { return JSON.parse(body); } catch { throw searchError('parse_error'); }
 }
 
-module.exports = { getText, getJson, remaining, searchError, errorInfo, report };
+/** POST JSON：接口统一用 HTTPS，沿用 getText 的超时、取消和响应体上限。 */
+function postJson(url, payload, opts = {}) {
+  const budget = remaining(opts);
+  if (opts.signal?.aborted) return Promise.reject(searchError('aborted'));
+  if (budget <= 0) return Promise.reject(searchError('deadline_exceeded'));
+  const data = Buffer.from(JSON.stringify(payload == null ? {} : payload), 'utf8');
+  return new Promise((resolve, reject) => {
+    let req;
+    let settled = false;
+    const finish = (err, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      opts.signal?.removeEventListener('abort', abort);
+      if (err) {
+        req?.destroy();
+        reject(err);
+      } else resolve(value);
+    };
+    const abort = () => finish(searchError('aborted'));
+    const timer = setTimeout(() => finish(searchError('deadline_exceeded')), Math.max(1, budget));
+    opts.signal?.addEventListener('abort', abort, { once: true });
+    let parsed;
+    try { parsed = new URL(url); } catch { return finish(searchError('bad_url')); }
+    if (parsed.protocol !== 'https:') return finish(searchError('unsupported_protocol'));
+    req = https.request(parsed, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': data.length,
+        'User-Agent': 'whale-girl/4.2',
+        ...(opts.headers || {}),
+      },
+    }, (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on('data', (chunk) => {
+        size += chunk.length;
+        if (size > 2 * 1024 * 1024) return finish(searchError('response_too_large'));
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const err = searchError('http_error', res.statusCode);
+          err.body = raw.slice(0, 500);
+          return finish(err);
+        }
+        try { finish(null, JSON.parse(raw)); } catch { finish(searchError('parse_error')); }
+      });
+      res.on('error', (err) => finish(err));
+    });
+    req.on('error', (err) => finish(err));
+    req.write(data);
+    req.end();
+  });
+}
+
+module.exports = { getText, getJson, postJson, remaining, searchError, errorInfo, report };

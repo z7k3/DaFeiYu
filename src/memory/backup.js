@@ -20,6 +20,7 @@ const SECRET_SETTING_KEYS = ['apiKey', 'keys', 'visionApiKey', 'voiceApiKey'];
 
 const FILES = [
   { key: 'memory', name: 'memory/' },
+  { key: 'personas', name: 'personas/' },
   { key: 'persona', name: 'persona.json' },
   { key: 'settings', name: 'settings.json' },
   { key: 'careState', name: 'care-state.json' },
@@ -71,6 +72,18 @@ function collectMemoryFiles(memoryDir) {
   return out;
 }
 
+/** 只打包一层用户文件（自建人设预设 / 删除标记），不递归子目录 */
+function collectFlatFiles(dir, pattern) {
+  const out = {};
+  try {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !pattern.test(entry.name)) continue;
+      try { out[entry.name] = fs.readFileSync(path.join(dir, entry.name), 'utf8'); } catch { /* 跳过读不了的文件 */ }
+    }
+  } catch { /* 目录不存在 */ }
+  return out;
+}
+
 function collect(root, { withSecrets = false } = {}) {
   const dir = dataDir(root);
   const bundle = {
@@ -82,8 +95,10 @@ function collect(root, { withSecrets = false } = {}) {
   };
   const memory = collectMemoryFiles(path.join(dir, 'memory'));
   if (Object.keys(memory).length) bundle.files.memory = memory;
+  const personas = collectFlatFiles(path.join(dir, 'personas'), /\.json$/i);
+  if (Object.keys(personas).length) bundle.files.personas = personas;
   for (const item of FILES) {
-    if (item.key === 'memory') continue;
+    if (item.key === 'memory' || item.key === 'personas') continue;
     const value = readJson(path.join(dir, item.name));
     if (value === null) continue;
     bundle.files[item.key] = item.key === 'settings' && !withSecrets ? scrubSecrets(value) : value;
@@ -118,8 +133,7 @@ function summarize(bundle) {
 }
 
 function writeSnapshot(root, reason = 'manual') {
-  // 自动/恢复前快照不带 Key：data/backups 经常被用户拷走或上传网盘；
-  // 恢复流程会用当前 settings 合并回填，不含 Key 不影响恢复。
+  // 自动/恢复前快照不带 Key：data/backups 经常被用户拷走或上传网盘。
   // 需要显式含 Key 的备份走 exportTo(root, file, { withSecrets: true })。
   const bundle = collect(root, { withSecrets: false });
   const { sessions, messages } = summarize(bundle);
@@ -186,7 +200,7 @@ function validateBundle(bundle) {
   }
   const files = bundle.files;
   if (!object(files)) throw new Error('备份里的 files 必须是对象');
-  for (const key of ['memory', 'store', 'settings', 'persona', 'careState', 'shareState']) {
+  for (const key of ['memory', 'personas', 'store', 'settings', 'persona', 'careState', 'shareState']) {
     if (Object.hasOwn(files, key) && !object(files[key])) throw new Error('备份里的 ' + key + ' 结构不对，已取消恢复');
   }
   if (!files.memory && !files.store) throw new Error('备份里没有可恢复的记忆');
@@ -194,10 +208,18 @@ function validateBundle(bundle) {
   for (const body of Object.values(files.memory || {})) {
     if (typeof body !== 'string') throw new Error('备份里的记忆文件内容必须是文本，已取消恢复');
   }
+  for (const body of Object.values(files.personas || {})) {
+    if (typeof body !== 'string') throw new Error('备份里的人设预设内容必须是文本，已取消恢复');
+  }
   // 路径穿越防护：记忆包里的 key 只能是相对路径
   for (const rel of Object.keys(files.memory || {})) {
     if (rel.includes('..') || path.isAbsolute(rel) || /^[a-zA-Z]:/.test(rel)) {
       throw new Error('备份里有非法路径，已取消恢复：' + rel);
+    }
+  }
+  for (const rel of Object.keys(files.personas || {})) {
+    if (rel.includes('..') || rel.includes('/') || rel.includes('\\') || path.isAbsolute(rel) || /^[a-zA-Z]:/.test(rel)) {
+      throw new Error('备份里有非法预设路径，已取消恢复：' + rel);
     }
   }
   return files;
@@ -212,6 +234,7 @@ function restoreFrom(root, bundle) {
   fs.mkdirSync(dir, { recursive: true });
   const restored = [];
   const preparedFiles = {};
+  const preparedDirs = {};
 
   if (files.memory) {
     restored.push('memory/');
@@ -220,9 +243,13 @@ function restoreFrom(root, bundle) {
     preparedFiles['store.json'] = JSON.stringify(files.store);
     restored.push('store.json（旧版，启动后自动迁移）');
   }
+  if (files.personas) {
+    preparedDirs.personas = files.personas;
+    restored.push('personas/');
+  }
 
   for (const item of FILES) {
-    if (item.key === 'memory' || !(item.key in files)) continue;
+    if (item.key === 'memory' || item.key === 'personas' || !(item.key in files)) continue;
     let value = files[item.key];
     if (item.key === 'settings') {
       const current = readJson(path.join(dir, item.name)) || {};
@@ -237,7 +264,7 @@ function restoreFrom(root, bundle) {
     preparedFiles[item.name] = JSON.stringify(value, null, 2);
     restored.push(item.name);
   }
-  restoreFiles(dir, files.memory, preparedFiles);
+  restoreFiles(dir, files.memory, preparedFiles, preparedDirs);
   return { restored, ...summarize(bundle) };
 }
 

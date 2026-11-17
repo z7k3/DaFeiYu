@@ -65,9 +65,9 @@ function resolveKey(config) {
   if (vc.auto) {
     try {
       const runtimeKey = String(resolveRuntime(config).apiKey || '').trim();
-      if (runtimeKey) return runtimeKey;
+      return runtimeKey;
     } catch { /* 取不到运行时再退回下面的查找链 */ }
-    if (st.providerKey) return st.providerKey;
+    return '';
   }
   const fromConfig = String(v.apiKey || '').trim();
   if (fromConfig) return fromConfig;
@@ -160,7 +160,9 @@ function status(config) {
     custom,
     provider,
     local,
-    hint,
+    supported: v.supported,
+    capabilityHint: v.capabilityHint,
+    hint: v.capabilityHint ? hint + '。' + v.capabilityHint : hint,
   };
 }
 
@@ -280,6 +282,7 @@ async function describe(config, { imageBase64, mime = 'image/jpeg', prompt = '' 
   const apiKey = resolveKey(config);
   const model = String(v.model || 'glm-4.6v-flash').trim();
   if (!imageBase64) throw new Error('没有图片数据');
+  if (v.supported === false) throw new Error(v.capabilityHint);
   // 本机/内网的看图服务（Ollama、LM Studio、自建）不需要 Key；云端仍然必须有
   const local = isLocalUrl(baseUrl);
   if (!apiKey && !local) {

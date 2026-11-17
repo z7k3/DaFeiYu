@@ -13,7 +13,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { describeError } = require('../src/infra/errors');
+const { describeError, errorMessage } = require('../src/infra/errors');
 const { LlmError, FRIENDLY } = require('../src/llm/client');
 const { extractEpisode } = require('../src/memory/extractor');
 const { Bot } = require('../src/pipeline/chat');
@@ -62,6 +62,21 @@ test('非对象 / 超长 detail 也能安全压成一行', () => {
   assert.match(long, /…$/);
   // 换行必须被压成空格，别把一条日志撑成多行
   assert.ok(!/\n/.test(describeError(new Error('a\nb'))));
+});
+
+/* ───────────────────────── 接口错误文案 ───────────────────────── */
+
+test('errorMessage：只回第一行且限长，不把异常对象交给 String()', () => {
+  const err = Object.assign(new Error('第一行\n    at Object.<anonymous> (src/x.js:1:1)'), { code: 'EIO' });
+  const text = errorMessage(err);
+  assert.equal(text, '第一行');
+  assert.ok(!text.includes('at Object'), '不能带堆栈帧');
+  assert.equal(errorMessage(null, '操作失败'), '操作失败');
+  assert.equal(errorMessage({}, '操作失败'), '操作失败');
+  // 没有 message 的对象不能被 String() 展开成 "[object Object]"
+  assert.equal(errorMessage({ statusCode: 500 }, '操作失败'), '操作失败');
+  assert.equal(errorMessage('纯字符串错误'), '纯字符串错误');
+  assert.equal(errorMessage(new Error('x'.repeat(500))).length, 200);
 });
 
 /* ───────────────────────── 抽取链路 ───────────────────────── */

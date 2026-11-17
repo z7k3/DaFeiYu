@@ -23,7 +23,7 @@ internal static class SecretRedactor
         {
             if (!force && DateTime.UtcNow < nextRefresh) return;
             nextRefresh = DateTime.UtcNow.AddSeconds(1);
-            foreach (var file in new[] { Path.Combine(root, "config.json"), Path.Combine(root, "data", "settings.json") })
+            foreach (var file in new[] { Path.Combine(root, "config.json"), Path.Combine(root, "data", "config.json"), Path.Combine(root, "data", "settings.json") })
             {
                 try { Register(JsonNode.Parse(File.ReadAllText(file))); }
                 catch { /* 配置写入期间保留之前已知的密钥。 */ }

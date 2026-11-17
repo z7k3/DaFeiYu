@@ -68,4 +68,9 @@ runtime/
 /tests/voice-send/obj/
 /tests/plugin-market/bin/
 /tests/plugin-market/obj/
+/tests/config-path/bin/
+/tests/config-path/obj/
 WhaleLauncher.exe.old
+
+# 本地宣传片制作工程（素材体积很大，只留在本机）
+promo-video/

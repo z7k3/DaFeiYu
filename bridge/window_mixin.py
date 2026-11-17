@@ -5,6 +5,14 @@ import engine as G
 
 class WindowMixin:
 
+    def foreground_is_moments(self):
+        # 仅查询原生窗口类，不遍历 UIA；朋友圈切页时控件树可能正被销毁。
+        try:
+            import win32gui
+            return win32gui.GetClassName(win32gui.GetForegroundWindow()) == 'mmui::SNSWindow'
+        except Exception:
+            return False
+
     def foreground_is_fullscreen(self):
         """前台是不是「真全屏」程序（全屏游戏、全屏视频）。
 
@@ -206,8 +214,8 @@ class WindowMixin:
             if hwnd:
                 try:
                     if not win32gui.IsWindowVisible(hwnd):
-                        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                        from window_activation import activate
+                        activate(hwnd)
                         G.log('微信在托盘里，已把主窗口拉出来再发送')
                         G.time.sleep(0.4)
                 except Exception as e:
@@ -226,7 +234,8 @@ class WindowMixin:
                         win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
                     except Exception as e:
                         G.log_window_problem('窗口置顶失败（继续发送）', e)
-                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                    from window_activation import activate
+                    activate(hwnd)
                     G.time.sleep(0.2)
                     # 记录被临时置顶的窗口：看门狗 hard_exit 不执行 finally，
                     # 得靠这份记录在退出前还原，否则微信会永远盖在所有窗口上。
@@ -258,11 +267,9 @@ class WindowMixin:
              这样你在用电脑时最多看到它闪一下。
         把 wechat.backgroundSend 设成 false 就退回以前的「每次先抢前台、发完不管」。
         """
-        # 表情包开关不再劫持文字通道：send_sticker 自己会把微信切到前台并在
-        # 发完还原（sticker_mixin.py），不依赖这里；文字保持「先零焦点、
-        # 失败才前台」的原设计——微信被其他窗口盖住也能正常回文字，
-        # 也不会把盖着它的窗口最小化。
-        force_front = False
+        # 表情包开启时走前台发送（上游 4.1.7：发图需要真实焦点）；文字路径
+        # STICKER_TEST_ON 不影响——表情包专用路径在 sticker_mixin 自己处理。
+        force_front = G.STICKER_TEST_ON
         restore_after = G.BACKGROUND_SEND
         snap = self.snapshot_win_state() if restore_after else None
         try:
@@ -315,66 +322,9 @@ class WindowMixin:
             pass
 
     def force_foreground(self, hwnd):
-        """把微信强制拉到前台，并且**确认真的到位**。
-
-        原来的实现「调用完就 return True」，但 SetForegroundWindow 会被 Windows
-        的前台锁拒绝（你正在浏览器里打字时尤其明显），于是表情包发送时判断
-        「微信不在前台」→ 直接失败。现在每轮都读一次 GetForegroundWindow 复核，
-        并补上两种业界常用的解锁手段：
-          ① 轻点一下 ALT 解除前台锁，再 SwitchToThisWindow；
-          ② AttachThreadInput + BringWindowToTop + SetForegroundWindow。
-        连续几轮都不成功才返回 False，交给调用方明确报错。
-        """
-        try:
-            import ctypes
-            import win32api
-            import win32con
-            import win32gui
-        except Exception:
-            return False
-        hwnd = int(hwnd or 0)
-        if not hwnd:
-            return False
-        user32 = ctypes.windll.user32
-        try:
-            if win32gui.GetForegroundWindow() == hwnd:
-                return True
-        except Exception:
-            return False
-        for _attempt in range(4):
-            try:
-                fg = win32gui.GetForegroundWindow()
-                tid_fg = user32.GetWindowThreadProcessId(fg, None)
-                tid = user32.GetWindowThreadProcessId(hwnd, None)
-                try:
-                    user32.AttachThreadInput(tid_fg, tid, True)
-                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                    user32.BringWindowToTop(hwnd)
-                    win32gui.SetForegroundWindow(hwnd)
-                finally:
-                    try:
-                        user32.AttachThreadInput(tid_fg, tid, False)
-                    except Exception:
-                        pass
-                if win32gui.GetForegroundWindow() == hwnd:
-                    return True
-                win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
-                win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
-                G.time.sleep(0.05)
-                try:
-                    user32.SwitchToThisWindow(hwnd, True)
-                except Exception:
-                    pass
-                G.time.sleep(0.15)
-                if win32gui.GetForegroundWindow() == hwnd:
-                    return True
-            except Exception:
-                pass
-            G.time.sleep(0.15)
-        try:
-            return win32gui.GetForegroundWindow() == hwnd
-        except Exception:
-            return False
+        """前台锁拒绝时返回失败，不合并微信和其他窗口的输入队列。"""
+        from window_activation import activate
+        return activate(hwnd)
 
     def _input_value(self, u):
         """尽量读出输入框当前文字；读不到返回空串。"""

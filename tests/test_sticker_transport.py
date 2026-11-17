@@ -526,27 +526,26 @@ def _referenced_names(definitions):
 
 
 class BridgeContractTest(unittest.TestCase):
-    def test_sticker_switch_does_not_hijack_text_channel(self):
-        """本地 fork：开表情包不再把文字发送拖进前台。
-
-        官方 4.x 的实现是「表情包开关一开，所有文字发送先抢前台」——用户明确要求
-        文字保持零焦点（微信被遮挡也能发），表情包自己走 sticker_mixin 的切前台
-        逻辑。所以这里断言：STICKER_TEST_ON 开/关，with_window_on_top 都先走后台。
-        """
+    def test_sticker_switch_forces_foreground_even_with_background_configured(self):
         action = Mock(return_value=True)
         foreground = Mock(return_value=False)
         restore = Mock()
         scope = bridge_functions({'with_window_on_top'}, {
             'STICKER_TEST_ON': True, 'BACKGROUND_SEND': True,
             'force_send_foreground': foreground,
-            'snapshot_win_state': lambda: 'snapshot',
-            # 清理现在统一走 quiet_restore（内部才调 restore_win_state）
-            'quiet_restore': lambda s: restore(s), 'restore_win_state': restore,
+            'snapshot_win_state': lambda: 'snapshot', 'restore_win_state': restore,
+            # fork：with_window_on_top 的还原收口到 quiet_restore（委托 restore_win_state）
+            'quiet_restore': lambda snap: restore(snap),
         })
+        self.assertFalse(scope['with_window_on_top'](action))
+        action.assert_not_called()
+        foreground.assert_called_once_with(action, require_foreground=True)
+        restore.assert_called_once_with('snapshot')
+        scope['STICKER_TEST_ON'] = False
+        foreground.reset_mock()
         self.assertTrue(scope['with_window_on_top'](action))
         action.assert_called_once()
         foreground.assert_not_called()
-        restore.assert_called_once_with('snapshot')
 
     def setUp(self):
         self.cfg = {'features': {'stickers': True}, 'wechat': {}}
@@ -734,6 +733,16 @@ class BridgeContractTest(unittest.TestCase):
         self.assertEqual(env['send_sticker']('fake.png', 'Peer', 'peer', 'g1', 'one-shot')['status'], 'confirmed')
         env['gui']._uia.open_chat.assert_called_once()
 
+    def test_bridge_initializes_missing_uia_cache_before_attachment(self):
+        env = self.send_environment()
+        ready = env['gui']._uia
+        env['gui']._uia = None
+        env['gui']._get_uia = Mock(return_value=ready)
+        outcome = env['send_sticker']('fake.png', 'Peer', 'peer', 'g1', 'one-shot')
+        self.assertEqual(outcome['status'], 'confirmed')
+        env['gui']._get_uia.assert_called_once()
+        env['guarded_sticker_send'].assert_called_once()
+
     def test_bridge_never_sends_when_open_chat_lands_on_wrong_title(self):
         env = self.send_environment()
         env['gui']._uia = SimpleNamespace(
@@ -781,11 +790,8 @@ class BridgeContractTest(unittest.TestCase):
                    sticker_input_is_blank=transport._is_blank, log_throttled=Mock(),
                    sticker_draft_quarantine={'peer': {'hwnd': 100, 'aliases': {'Peer'},
                                                       'draft_observed': observed}},
-                   acct_dirs=['test-account'], acct='test-account', WINDOW_HWND=0, dead_chats={},
-                   # 本地 fork：dead_chats 改 dict+TTL 后，读路径收口到 chat_dead()
-                   chat_dead=lambda u: False,
-                   # with_window_on_top 的清理抽成了 quiet_restore
-                   quiet_restore=lambda s: None, snapshot_win_state=lambda: {},
+                   acct_dirs=['test-account'], acct='test-account', WINDOW_HWND=0, dead_chats=set(),
+                   chat_paused=lambda username: username in env['dead_chats'],
                    sticker_account_evidence_ok=transport.account_evidence_allowed,
                    group_is_alive=lambda username: True, AWAY={'on': False}, away_active=lambda: False,
                    game_running=lambda: False, foreground_is_fullscreen=lambda: False)

@@ -72,9 +72,12 @@ test('L2/L3：开火要有原话依据，否则降级', () => {
 });
 
 test('L3：群聊提示词要求先判断在跟谁说话', () => {
-  const src = fs.readFileSync(path.join(ROOT, 'src', 'persona', 'index.js'), 'utf8');
+  const { DEFAULT_CONFIG } = require('../src/infra/config');
+  const src = require('../src/persona').buildSystem({
+    config: DEFAULT_CONFIG, msg: { chatType: 'group', senderName: '测试成员' },
+  });
   assert.match(src, /先说清楚在跟谁说话/);
-  assert.match(src, /如果里面没有你，那就是在跟别人说话/);
+  assert.match(src, /判断不出在跟你说，就当他在跟别人说/);
 });
 
 test('功能开关 API：能读、能写、写错 key 报错', async () => {

@@ -82,11 +82,6 @@ def configure(bg_cfg=None, state_file=None):
             TIMING[key] = max(0.0, min(3.0, float(over[key])))
         except (TypeError, ValueError):
             pass
-    # 静默发送（打字期间把窗口挪到屏幕外）：默认开，配置 bgSend.noFlash=false 可关
-    flag = (bg_cfg or {}).get("noFlash", True)
-    if isinstance(flag, str):
-        flag = flag.strip().lower() not in ('false', '0', 'off', 'no')
-    _NOFLASH['on'] = bool(flag)
     return TIMING
 
 __all__ = [
@@ -558,7 +553,8 @@ class WeChatSender:
         直接发 UTF-16 码点会乱码（`鲸` U+9CB8 → `笢`），所以调用方必须
         先 `encode("gbk")` 再逐字节发。
         """
-        _pseudo_focus(self)
+        self._post(WM_SETFOCUS, 0, 0)              # 伪焦点（§4.5）
+        time.sleep(TIMING["focusGap"])
         for b in payload:
             self._post(WM_CHAR, b, 1)
             time.sleep(char_gap)
@@ -566,7 +562,8 @@ class WeChatSender:
 
     def type_units(self, units, char_gap=0.04):
         """逐个投递 UTF-16 码元（微信 4.2+ 的 WM_CHAR 语义）。"""
-        _pseudo_focus(self)
+        self._post(WM_SETFOCUS, 0, 0)
+        time.sleep(TIMING["focusGap"])
         for u in units:
             self._post(WM_CHAR, u, 1)
             time.sleep(char_gap)
@@ -759,6 +756,10 @@ def _remember_char_mode(hwnd, mode, log):
 # 探测收尾没把输入框清干净时置真，send() 看到就按 input_dirty 返回，不再往脏框里打字
 _DETECT_DIRTY = []
 
+# 探测字「鲸」在两种编码语义下的三种可能形态：编码对 = 鲸；GBK 字节被当
+# UTF-16 码元 = ¾¨；UTF-16 码元被按 GBK 解 = 笢。收尾只对这三种内容下手。
+_PROBE_TEXTS = ("鲸", "¾¨", "笢")
+
 
 def _composer_value(hwnd):
     try:
@@ -768,55 +769,16 @@ def _composer_value(hwnd):
 
 
 def _clear_composer(hwnd, edit=None):
-    """清空输入框：先 SetValue("")，清不掉再用 WM_CHAR 退格兜底。
-
-    以前只靠 SetValue("")：那和打字走同一个控件模型接口，微信不吃写入时它同样
-    清不掉，于是残留草稿永远卡在框里（之后每条消息都 input_not_empty）。
-    退格是真正的输入事件，微信一定认，所以这里必须有这一层兜底。
-    """
-    # 先用退格真删（WM_CHAR，不激活窗口）；UIA SetValue("") 会抢前台，只在
-    # 真清不掉的时候兜底一次。
-    value = _composer_value(hwnd)
-    if _is_blank(value):
-        return True
+    """只用已定位的输入框清理本次输入；UIA 不支持时不要盲发退格。"""
     try:
-        count = max(1, min(400, len(str(value or "")) + 8))
-        sender = WeChatSender(hwnd)
-        sender._post(WM_SETFOCUS, 0, 0) if _PSEUDO_FOCUS['on'] else None
-        for _ in range(count):
-            sender._post(WM_CHAR, 8, 1)          # VK_BACK
-            time.sleep(0.008)
-        sender.end_input()
-    except Exception:
-        pass
-    time.sleep(0.3)
-    value = _composer_value(hwnd)
-    if _is_blank(value):
-        return True
-    # 最后兜底：UIA 清空（会抢前台，但这已经是异常路径）
-    try:
-        ctrl = edit if edit is not None else read_ui(hwnd).get("edit")
+        ctrl = edit
+        if ctrl is None:
+            ctrl = read_ui(hwnd).get("edit")
         if ctrl is not None:
             ctrl.GetValuePattern().SetValue("")
     except Exception:
         pass
     time.sleep(0.25)
-    value = _composer_value(hwnd)
-    if _is_blank(value):
-        return True
-    # 控件模型清不掉 → 用退格真删
-    try:
-        count = max(1, min(400, len(str(value or "")) + 8))
-        sender = WeChatSender(hwnd)
-        sender._post(WM_SETFOCUS, 0, 0)
-        time.sleep(TIMING["focusGap"])
-        for _ in range(count):
-            sender._post(WM_CHAR, 8, 1)          # VK_BACK
-            time.sleep(0.008)
-        sender.end_input()
-    except Exception:
-        pass
-    time.sleep(0.3)
     return _is_blank(_composer_value(hwnd))
 
 
@@ -872,12 +834,20 @@ def _target_composer(info, chat):
     return info.get("edit") is not None and (not chat or _chat_is_target(info.get("chat"), chat)[0])
 
 
-def _read_typed_composer(hwnd, chat, expected):
-    """UIA may lag behind posted WM_CHAR. A mismatch must settle before any rewrite."""
+def _read_typed_composer(hwnd, chat, expected, attempts=8, gap=0.15):
+    """UIA may lag behind posted WM_CHAR. A mismatch must settle before any rewrite.
+
+    以前只读 4 次（约 0.4 秒）：微信偶尔还没把 WM_CHAR 落进控件模型，回读到
+    空框且「稳定」，紧接着收尾时又读到刚掉进去的字。结果探测字留在输入框，
+    下一次发送直接报 input_not_empty，这台机器就再也发不出去。
+    现在多等一会儿，并且「期望有字却读到空」不算稳定 —— 空恰恰是延迟的形态。
+    """
     previous = None
-    for attempt in range(4):
+    observed = None
+    info = None
+    for attempt in range(attempts):
         if attempt:
-            time.sleep(0.12)
+            time.sleep(gap)
         info = read_ui(hwnd)
         if not _target_composer(info, chat):
             return info, None, False
@@ -885,53 +855,45 @@ def _read_typed_composer(hwnd, chat, expected):
         observed = _composer_text(value)
         if observed == expected:
             return info, observed, True
-        stable = observed is not None and value == previous
+        # 连续两次读到同一个值才算稳定；空框（期望非空）继续等。
+        if attempt >= 3 and value == previous and not (observed == "" and expected):
+            return info, observed, True
         previous = value
-    return info, observed, stable
+    return info, observed, False
 
 
 def _reset_typed_composer(hwnd, chat, value, input_before):
     """Only replace a stable draft we just typed into the same conversation."""
     current = read_ui(hwnd)
-    if not _target_composer(current, chat) or current.get("value") != value:
+    if not _target_composer(current, chat):
+        return False
+    now = current.get("value")
+    if now is None:
+        # 读不到就不敢动；交给上层按脏框处理（不盲清）。
+        return False
+    if _is_blank(now):
+        # 框已经是空的：没有草稿要清，也不必管用户刚才动没动键鼠。
+        return True
+    if now != value:
+        # 内容还在变（或用户又写了一截）：放弃清理，别覆盖用户的字。
         return False
     # 两次读到相同内容也可能是用户刚写完；发现可能操作过微信就放弃清理。
+    # 用户也可能删掉探测字后重打相同文字；内容相同不能证明仍由本次探测持有。
     if _draft_may_have_changed(hwnd, input_before):
         return False
-    if not _is_blank(value) and not _clear_composer(hwnd, current["edit"]):
+    if not _clear_composer(hwnd, current["edit"]):
         return False
     current = read_ui(hwnd)
-    return (_target_composer(current, chat) and _is_blank(current.get("value"))
-            and not _draft_may_have_changed(hwnd, input_before))
+    return _target_composer(current, chat) and _is_blank(current.get("value"))
 
-
-def _cleanup_probe_char(hwnd, chat, log=None):
-    """编码探测失败路径的兜底清理：测试字「鲸」留在输入框会挡住之后所有发送。
-
-    只清「恰好是测试字本身」的框——其他任何内容（可能是用户草稿）一律不动。
-    实见（2026-11-14）：桥接被强杀打断探测后，「鲸」残留输入框数小时，
-    每条回复都被 input_not_empty 拒掉。"""
-    try:
-        info = read_ui(hwnd)
-        if not _target_composer(info, chat):
-            return False
-        value = _composer_text(info.get("value"))
-        if not value or _is_blank(info.get("value")):
-            return True
-        if value == '鲸':
-            return _clear_composer(hwnd, info.get("edit"))
-        if log:
-            log("编码探测兜底：输入框内容不是测试字（len=%d），不动" % len(value))
-        return False
-    except Exception:
-        return False
 
 def _calibrate_char_mode(sender, chat, modes, log):
     """校验固定的汉字，绝不拿整条回复试编码，也不点击发送。"""
     for mode in modes:
         info = read_ui(sender.hwnd)
         if not _target_composer(info, chat) or not _is_blank(info.get("value")):
-            return "", False
+            # 会话切走了 / 框里本来就有草稿：这次一个字都没写，不算探测留下的脏框。
+            return "", True
         try:
             input_before = _input_snapshot()
             try:
@@ -940,19 +902,13 @@ def _calibrate_char_mode(sender, chat, modes, log):
                 info, got, stable = _read_typed_composer(sender.hwnd, chat, "鲸")
             finally:
                 sender.end_input()
-            if not stable or not _reset_typed_composer(sender.hwnd, chat, info.get("value"), input_before):
-                log("后台通道：编码探测后无法确认输入框已空，停止发送")
-                # 兜底：测试字「鲸」绝不能留在框里（会挡住之后所有发送）；
-                # 只清恰好是「鲸」的框，用户草稿不动。
-                _cleanup_probe_char(sender.hwnd, chat, log)
-                return "", False
+            clean = _reset_typed_composer(sender.hwnd, chat, info.get("value"), input_before)
         except Exception as err:
             log("后台通道：编码探测中断（%s），停止发送" % type(err).__name__)
-            # 中断时测试字可能已经打进去了，同样兜底清理
-            try:
-                _cleanup_probe_char(sender.hwnd, chat, log)
-            except Exception:
-                pass
+            return "", False
+        if not clean:
+            log("后台通道：编码探测后无法确认输入框已空（编码=%s，回读长度=%s，稳定=%s），停止发送"
+                % (mode, len(got) if got is not None else "未知", "是" if stable else "否"))
             return "", False
         if got == "鲸":
             log("后台通道：编码实测 → %s" % mode)
@@ -987,126 +943,6 @@ def encode_gbk(text, strip_unencodable=True):
 
 
 _UIA_WRITE_LOGGED = set()
-# 见过「UIA SetValue 写进去了却发不出去 / 清不掉」的窗口。
-# 上游 4.1.0 为了消灭第二个气泡丢字，把后台打字改成「优先 SetValue，失败才回退
-# WM_CHAR」；但 SetValue 是直接改控件模型，部分微信版本（本机 4.2 实测）会接受
-# 写入却不真正产生输入事件——点了发送不生效，输入框残留草稿，之后每条消息都被
-# input_not_empty 挡住，形成「等 12 秒然后放弃」的死锁。
-# SetValue 的返回值只表示「没抛异常」，不能当成功证据，所以这里按窗口记住教训，
-# 之后一律走 WM_CHAR（逐字投递本来就能发）。
-_UIA_WRITE_BAD = set()
-
-# 每个窗口最近一次「我们自己想写进去的正文」。
-# 输入框里有字时只有两种可能：用户在打字（不能动），或我们上次发送失败留下的残留
-# （必须清掉，否则后面每条都发不出去）。两者在输入框里长得一样，唯一能区分的是
-# 我们认识自己写过的字。
-_LAST_ATTEMPT = {}
-
-# 桥接会被看门狗重启，纯内存记忆一旦重启就失效——而输入框里的残留是留在微信里的，
-# 重启后仍会挡死发送。所以把「最近发出去的正文」落盘（只存正文和秒级时间，
-# 不存会话名/wxid），重启后照样能认出自己的残留。
-_RESIDUE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "bg-recent-sends.json")
-_RESIDUE_TTL = 120 * 60     # 2 小时内的都算「可能是我们的残留」。
-# 为什么放宽：微信会把没发出去的输入框内容存进数据库草稿，重开微信也恢复。
-# 2026-11-14 实见：14:09 发送风暴打进输入框的残留，15:04 才开始挡发送——
-# 旧的 30 分钟 TTL + 8 条窗口双重失效，残留被当成用户草稿，之后每条回复
-# 都被 input_not_empty 拒掉。匹配要求整段一致或前缀（见
-# _looks_like_own_residue），用户草稿恰好逐字撞上我们正文的概率可忽略。
-_RESIDUE_MAX = 32
-_ATTEMPT_LIST = None
-
-
-def _load_attempts():
-    global _ATTEMPT_LIST
-    if _ATTEMPT_LIST is not None:
-        return _ATTEMPT_LIST
-    rows = []
-    try:
-        with open(_RESIDUE_FILE, encoding="utf-8-sig") as f:
-            data = json.load(f)
-        for row in data if isinstance(data, list) else []:
-            try:
-                rows.append((float(row[0]), str(row[1])))
-            except Exception:
-                continue
-    except Exception:
-        rows = []
-    _ATTEMPT_LIST = rows[-_RESIDUE_MAX:]
-    return _ATTEMPT_LIST
-
-
-def _remember_attempt(hwnd, text):
-    text = str(text or "")
-    if not text:
-        return
-    try:
-        _LAST_ATTEMPT[int(hwnd or 0)] = text
-    except Exception:
-        pass
-    rows = _load_attempts()
-    now = time.time()
-    rows.append((now, text))
-    del rows[:-_RESIDUE_MAX]
-    try:
-        os.makedirs(os.path.dirname(_RESIDUE_FILE), exist_ok=True)
-        tmp = _RESIDUE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump([[round(t, 3), x] for t, x in rows], f, ensure_ascii=False)
-        os.replace(tmp, _RESIDUE_FILE)
-    except Exception:
-        pass
-
-
-def _looks_like_own_residue(hwnd, value):
-    """输入框里的内容是不是我们（包括重启前）没发出去的正文。"""
-    cur = str(value or "").strip()
-    if not cur:
-        return False
-    candidates = []
-    try:
-        prev = _LAST_ATTEMPT.get(int(hwnd or 0))
-        if prev:
-            candidates.append(str(prev))
-    except Exception:
-        pass
-    now = time.time()
-    for ts, text in _load_attempts():
-        if now - float(ts) <= _RESIDUE_TTL:
-            candidates.append(str(text))
-    for prev in candidates:
-        prev = prev.strip()
-        if not prev:
-            continue
-        # 完全一致，或只是我们正文的一段（发送中断只写进去一部分）
-        if cur == prev or prev.startswith(cur) or cur.startswith(prev):
-            return True
-    return False
-
-
-def _uia_write_reliable(hwnd):
-    try:
-        return int(hwnd or 0) not in _UIA_WRITE_BAD
-    except Exception:
-        return True
-
-
-def _mark_uia_write_bad(hwnd, log=None, why=""):
-    try:
-        hwnd = int(hwnd or 0)
-    except Exception:
-        hwnd = 0
-    if not hwnd or hwnd in _UIA_WRITE_BAD:
-        return
-    _UIA_WRITE_BAD.add(hwnd)
-    if log:
-        log("后台通道：UIA SetValue 在这台微信上不可靠（%s），改用 WM_CHAR 逐字投递"
-            % (why or "写入后发不出去"))
-
-
-# UIA ValuePattern.SetValue 会激活微信窗口（2026-11-13 实测：把别的窗口放前台后
-# 调 SetValue("")，前台立刻变成微信 → 用户看到「回个消息微信闪一下」）。
-# 它同时还有「写进去了但发不出去」的老毛病，所以默认关掉，只在 WM_CHAR 失败时兜底。
-_USE_SETVALUE = {'on': False}
 
 
 def _uia_write(edit, text):
@@ -1125,204 +961,6 @@ def _uia_write(edit, text):
         return False
 
 
-# 伪焦点 WM_SETFOCUS 默认不再发：2026-11-13 实测（不打伪焦点 WM_CHAR 照样写进
-# 输入框），而它是「发送时窗口自己被激活到最前」的可疑来源之一。万一某台微信
-# 不打焦点就收不到字，send() 的第二次尝试会自动把它打开（见 _PSEUDO_FOCUS）。
-_PSEUDO_FOCUS = {'on': False}
-
-
-def _pseudo_focus(sender):
-    if not _PSEUDO_FOCUS['on']:
-        return
-    sender._post(WM_SETFOCUS, 0, 0)
-    time.sleep(TIMING["focusGap"])
-
-
-# 见过「回車提交无效」的窗口（例如微信设成了 Ctrl+Enter 发送）：记下来，
-# 之后直接点按钮，不再每条都先试一次回车再回退。
-_ENTER_SEND_BAD = set()
-_VK_RETURN = 0x0D
-_WM_KEYDOWN, _WM_KEYUP = 0x0100, 0x0101
-
-
-def _enter_send_ok(hwnd):
-    try:
-        return int(hwnd or 0) not in _ENTER_SEND_BAD
-    except Exception:
-        return True
-
-
-def _post_enter(hwnd, log=None):
-    """给聊天输入框投递一次回车（不抢前台）。
-
-    点击发送按钮是鼠标消息，微信（Qt）收到后会把窗口激活到最前面——用户正在用
-    别的窗口时很打断。回车是键盘消息，提交消息但不激活窗口（实测有效）。
-    """
-    try:
-        user32_ = ctypes.windll.user32
-        h = wintypes.HWND(int(hwnd))
-        lp = 1 | (0x1C << 16)          # repeat=1 + Enter 的扫描码
-        ok1 = user32_.PostMessageW(h, _WM_KEYDOWN, _VK_RETURN, lp)
-        time.sleep(0.06)
-        ok2 = user32_.PostMessageW(h, _WM_KEYUP, _VK_RETURN, lp | (1 << 30) | (1 << 31))
-        return bool(ok1 and ok2)
-    except Exception as e:
-        if log:
-            log("后台通道：回车提交失败 %r" % (e,))
-        return False
-
-
-def _send_by_enter(hwnd, sender, log=None, wait=1.4):
-    """尝试用回车提交；成功（输入框清空）返回 True，失败返回 False。"""
-    if not _enter_send_ok(hwnd):
-        return False
-    if not _post_enter(hwnd, log):
-        return False
-    deadline = time.time() + max(0.4, float(wait))
-    while time.time() < deadline:
-        time.sleep(0.12)
-        if _is_blank(_composer_value(hwnd)):
-            return True
-    # 没清空：可能是这台微信设成了 Ctrl+Enter 发送，回车变成了换行。
-    # 记住这个窗口，把换行删掉再交给点击按钮的路径。
-    try:
-        _ENTER_SEND_BAD.add(int(hwnd or 0))
-    except Exception:
-        pass
-    if log:
-        log("后台通道：回车没有提交（可能设成了 Ctrl+Enter 发送），改用点击发送按钮")
-    try:
-        _clear_composer(hwnd)
-    except Exception:
-        pass
-    return False
-
-
-
-def _foreground_now():
-    try:
-        return int(ctypes.windll.user32.GetForegroundWindow() or 0)
-    except Exception:
-        return 0
-
-
-def _restore_foreground(prev, wechat_hwnd=None, log=None):
-    """把前台还给 prev 那个窗口（微信刚抢过去的）。
-
-    切换会话/点击都会让微信自己激活到最前，而整轮发送要一两秒——用户看到的就是
-    「回个消息微信闪一下」。切完会话立刻还回去，闪烁时间能从 ~2s 压到 ~0.3s。
-    不做激进操作：失败就算了，绝不影响发送本身。
-    """
-    try:
-        prev = int(prev or 0)
-        if not prev or prev == _foreground_now():
-            return False
-        user32_ = ctypes.windll.user32
-        for _ in range(3):
-            # ALT 轻敲一下解除前台锁（Windows 的前台保护）
-            user32_.keybd_event(0x12, 0, 0, 0)
-            user32_.keybd_event(0x12, 0, 2, 0)
-            user32_.SetForegroundWindow(wintypes.HWND(prev))
-            time.sleep(0.12)
-            if _foreground_now() == prev:
-                return True
-        return _foreground_now() == prev
-    except Exception as e:
-        if log:
-            log("后台通道：还原前台失败（不影响发送） %r" % (e,))
-        return False
-
-
-# —— 前台变化追踪（临时诊断用）：只在变化时打一行，定位是哪一步抢了前台 ——
-_FG_TRACE_LAST = {'hwnd': 0}
-
-
-def fg_trace(tag, log=None, force=False):
-    try:
-        now = int(ctypes.windll.user32.GetForegroundWindow() or 0)
-    except Exception:
-        return
-    prev = _FG_TRACE_LAST.get('hwnd', 0)
-    _FG_TRACE_LAST['hwnd'] = now
-    if not force and prev == now:
-        return
-    if log:
-        try:
-            title = ''
-            import win32gui
-            title = win32gui.GetWindowText(now) or ''
-        except Exception:
-            title = ''
-        log('[fgtrace] %s 前台 %s → %s（%s）' % (tag, prev, now, (title or '-')[:20]))
-
-
-
-# —— 屏幕外静默发送 ——
-# 微信输入框收到任何真实输入（WM_CHAR/SetValue）都会把自己激活，这是客户端行为。
-# 但只要窗口在屏幕外，激活就没人看得见——微信自己"隐藏到托盘"用的就是 -21333 这个坐标。
-# 实测（2026-11-13）：窗口挪到屏幕外后打字+回车照样能发，前台虽然变成微信但屏幕上无变化。
-_PARKED = {}          # hwnd -> 原位置 (x, y)
-_NOFLASH = {'on': True}   # 静默发送：打字期间把窗口挪到屏幕外，屏幕上完全看不到
-_PARK_POS = -21333
-
-
-def park_window(hwnd, log=None):
-    """把窗口挪到屏幕外并记住原位置；已经挪过就直接返回。"""
-    try:
-        hwnd = int(hwnd or 0)
-        if not hwnd or hwnd in _PARKED:
-            return False
-        import win32gui
-        import win32con
-        # 防呆：只停靠确认属于微信主窗类名的窗口。窗口句柄会被系统回收后
-        # 重分配给别的应用——错停用户的窗口不仅挡人，进程重启后还会变成
-        # 没人认领的孤儿（2026-11-14 桌面审计发现 5 个无关应用窗口停在
-        # 停靠坐标的疑似来源）。类名不对就跳过停靠，静默发送照常。
-        try:
-            if win32gui.GetClassName(hwnd) != 'mmui::MainWindow':
-                if log:
-                    log('后台通道：目标窗口类名不是微信主窗，跳过屏幕外停靠（防错停）')
-                return False
-        except Exception:
-            pass
-        rect = win32gui.GetWindowRect(hwnd)
-        win32gui.SetWindowPos(hwnd, 0, _PARK_POS, _PARK_POS, 0, 0,
-                              win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
-        _PARKED[hwnd] = (rect[0], rect[1])
-        if log:
-            log("后台通道：已把微信窗口移到屏幕外（静默发送，屏幕上不会有任何闪烁）")
-        return True
-    except Exception as e:
-        if log:
-            log("后台通道：移动到屏幕外失败（不影响发送） %r" % (e,))
-        return False
-
-
-def unpark_window(hwnd, log=None):
-    """把窗口挪回原来的位置（退出/需要前台发送时调用）。"""
-    try:
-        hwnd = int(hwnd or 0)
-        pos = _PARKED.pop(hwnd, None)
-        if not pos:
-            return False
-        import win32gui
-        import win32con
-        win32gui.SetWindowPos(hwnd, 0, int(pos[0]), int(pos[1]), 0, 0,
-                              win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
-        if log:
-            log("后台通道：微信窗口已还原到原来的位置")
-        return True
-    except Exception:
-        return False
-
-
-def is_parked(hwnd):
-    try:
-        return int(hwnd or 0) in _PARKED
-    except Exception:
-        return False
-
-
 def _type_text(sender, edit, text, *, mode, char_gap=0.04,
                strip_unencodable=True, log=None):
     """写正文：优先 UIA SetValue，失败才回退 WM_CHAR。返回 (ok, skipped)。"""
@@ -1333,14 +971,6 @@ def _type_text(sender, edit, text, *, mode, char_gap=0.04,
     skipped = []
     if mode != "utf16":
         _payload, skipped = encode_gbk(text, strip_unencodable)
-    try:
-        hwnd = int(getattr(sender, "hwnd", 0) or 0)
-    except Exception:
-        hwnd = 0
-    if not _uia_write_reliable(hwnd) or not _USE_SETVALUE['on']:
-        # SetValue 会抢前台，而且有「写了发不出去」的老毛病：默认走 WM_CHAR。
-        return sender.type_text(text, char_gap=char_gap,
-                                strip_unencodable=strip_unencodable, mode=mode)
     if _uia_write(edit, expected):
         try:
             hwnd = int(getattr(sender, "hwnd", 0) or 0)
@@ -1805,22 +1435,11 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             if len(info["nodes"]) < MIN_NODES:
                 return False, "tree_not_ready"
 
-            fg_trace('进入后台发送', log, force=True)
-            _parked_here = False
-            if _NOFLASH['on']:
-                _parked_here = park_window(hwnd, log=log)
             # 先切会话，再看输入框：微信可能停在朋友圈 / 通讯录，
             # 这时 edit 不存在，但会话列表行还在，点一下就能回到聊天页。
-            # 切会话要点会话行，微信会把自己激活到最前：记下当前前台，切完立刻还回去。
-            _fg_before = _foreground_now()
             if chat and not open_chat(sender, chat, log=log):
                 return False, "chat_not_found"
 
-            # 切完会话立刻还前台：整轮发送要一两秒，不还的话用户看到的就是微信亮一下。
-            if _fg_before and _foreground_now() != _fg_before:
-                if _restore_foreground(_fg_before, log=log):
-                    log("后台通道：切会话抢了前台，已立刻还回去")
-            fg_trace('切会话/物化后', log)
             info = read_ui(hwnd)                   # 切过会话要重读（按钮位置会变）
             if info["edit"] is None:
                 # 点完会话后微信会重建一次控件树（实测 150 → 81 再回来），补一次物化
@@ -1840,24 +1459,9 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             # 空框 UIA 读出来是 '\n'，按真值判会误报 input_not_empty（M1）；
             # 读不到（None）维持原语义：当作没草稿，继续发。
             if info["value"] is not None and not _is_blank(info["value"]):
-                # 框里有字：先分清是自己的残留还是用户在打字。
-                # - 用户的草稿：一个字都不能动，直接让上层等（原来的行为）。
-                # - 我们上次没发出去的残留：必须清掉，否则后面每条消息都会被
-                #   input_not_empty 挡死（用户看到的现象就是「不回」）。
-                if not _looks_like_own_residue(hwnd, info["value"]):
-                    return False, "input_not_empty"
-                if _clear_composer(hwnd, info["edit"]):
-                    log("后台通道：清掉上次没发出去的残留草稿，继续发送")
-                    info = read_ui(hwnd)
-                    if info["edit"] is None:
-                        return False, "no_input_field"
-                    if info["send_xy"] is None:
-                        return False, "no_send_button"
-                    if info["value"] is not None and not _is_blank(info["value"]):
-                        return False, "input_not_empty"
-                else:
-                    _mark_uia_write_bad(hwnd, log, "残留草稿清不掉")
-                    return False, "input_not_empty"
+                if _composer_text(info["value"]) in _PROBE_TEXTS:
+                    log("后台通道：输入框里是编码探测留下的「鲸」，删掉后再发（不是用户草稿）")
+                return False, "input_not_empty"
             if info["value"] is None:
                 # 还没输入时可以安全退回 Unicode 剪贴板通道；输入之后则不能盲目重发。
                 return False, "input_unreadable"
@@ -1897,9 +1501,6 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
                     return False, "content_mismatch" if attempt else "gbk_unsupported"
                 input_before = _input_snapshot()
                 draft_dirty = True
-                # 记下“这条是我们想发出去的正文”：若发送失败留下残留，下次靠它
-                # 认出“这是自己的字”才敢清掉（用户的草稿不能碰）。
-                _remember_attempt(hwnd, _composer_text(_expected_text(text, mode, strip_unencodable)))
                 ok, skipped = _type_text(sender, current.get("edit"), text,
                                          mode=mode, char_gap=char_gap,
                                          strip_unencodable=strip_unencodable, log=log)
@@ -1921,11 +1522,6 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
                     return False, "input_dirty"
                 if attempt:
                     return False, "content_mismatch"
-                # 第一遍没写进去：很可能是这台微信需要伪焦点才收 WM_CHAR。
-                # 打开伪焦点再试一遍（默认关，因为它可能让窗口自己被激活）。
-                if not _PSEUDO_FOCUS['on']:
-                    _PSEUDO_FOCUS['on'] = True
-                    log("后台通道：第一遍没写进输入框，打开伪焦点 WM_SETFOCUS 再试一次")
                 # 纯 ASCII 或仅有空白差异时，改字节编码解决不了这次回读问题。
                 if expected.isascii() or (observed and observed.split() == expected.split()):
                     return False, "content_mismatch"
@@ -1946,52 +1542,15 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             if skipped:
                 log("后台通道：GBK 编不了 %d 个字符，已跳过" % len(skipped))
             xy = info["send_xy"]
-            if xy is None and not _enter_send_ok(hwnd):
+            if xy is None:
                 sender.end_input()
                 log("后台通道：打完字找不到发送按钮，草稿可能残留在输入框")
                 return False, "input_dirty"
-            # 优先用回车提交：点击发送按钮会让微信（Qt）自己激活窗口，用户看到
-            # 「回个消息微信闪到最前面」。回车是发给输入框的键消息，实测能提交且
-            # 不激活窗口（2026-11-13 实验：PostMessage WM_KEYDOWN/UP VK_RETURN 后
-            # 输入框清空、消息真的发出去了）。
-            fg_trace('打字完成', log)
-            sent_by_enter = _send_by_enter(hwnd, sender, log)
-            fg_trace('回车之后', log)
-            if not sent_by_enter:
-                # 回车没提交（可能这台微信设成了 Ctrl+Enter 发送，回车变成了换行）。
-                # _send_by_enter 已经清过输入框，这里必须把正文重新打进去再点按钮，
-                # 否则会点着空框「发送」——验证看到空框还会误判成功，消息静默丢失。
-                retry_info = read_ui(hwnd)
-                if _composer_text(retry_info.get("value")) != expected:
-                    if retry_info.get("edit") is None:
-                        sender.end_input()
-                        log("后台通道：回车回退时找不到输入框，停止发送")
-                        return False, "input_dirty"
-                    ok2, _sk2 = _type_text(sender, retry_info.get("edit"), text,
-                                           mode=mode, char_gap=char_gap,
-                                           strip_unencodable=strip_unencodable, log=log)
-                    if not ok2:
-                        sender.end_input()
-                        return False, "input_dirty"
-                    time.sleep(TIMING["sendEnabled"])
-                    retry_info = read_ui(hwnd)
-                    if _composer_text(retry_info.get("value")) != expected:
-                        sender.end_input()
-                        log("后台通道：回车回退后正文没打进去，停止发送")
-                        return False, "input_dirty"
-                xy = retry_info.get("send_xy") or xy
-                if xy is None:
-                    sender.end_input()
-                    log("后台通道：回车没发出去且找不到发送按钮，草稿可能残留在输入框")
-                    return False, "input_dirty"
-                sender.click_screen(*xy)
+            sender.click_screen(*xy)
             if not expected.isascii():
                 _remember_char_mode(hwnd, mode, log)
             time.sleep(TIMING["afterClick"])
             sender.end_input()
-            # 回车/点击之后前台若又被抢走，再还一次（兜底，别影响发送结果）
-            if _fg_before and _foreground_now() != _fg_before:
-                _restore_foreground(_fg_before, log=log)
 
             partial = "sent_partial" if skipped else "sent"
             if not verify:
@@ -2000,7 +1559,6 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             # 发出去了没有：输入框清空 = 走了。空框可能是 '\n'，按 _is_blank 判
             # （M1）；读不到（None）按「已发送」处理，免得退回前台通道再打一遍、
             # 聊天里出现两句一样的话。
-            fg_trace('进入发送确认', log)
             deadline = time.time() + 2.0
             while time.time() < deadline:
                 info = read_ui(hwnd)
@@ -2009,17 +1567,8 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
                     log("后台通道：发送后无法确认原会话输入框，按已提交处理（避免重复）")
                     return True, "sent_unverified"
                 if _is_blank(v):
-                    try:
-                        _LAST_ATTEMPT.pop(int(hwnd or 0), None)
-                    except Exception:
-                        pass
                     return True, partial
                 time.sleep(TIMING["verifyPoll"])
-            # 点了发送但框里还有字：这是 SetValue 写入「不产生真实输入事件」的
-            # 典型症状（也可能是真的没点中发送）。先记住这个窗口别再信任 SetValue，
-            # 并把残留清掉，否则下一条消息会被 input_not_empty 直接挡死。
-            _mark_uia_write_bad(hwnd, log, "点了发送但输入框没清空")
-            _clear_composer(hwnd)
             return False, "residue_left"
 
         except UipiDenied as e:
@@ -2096,16 +1645,18 @@ def probe(hwnd=0, log=print, with_send=None, unhide=True):
     return result
 
 
-def self_heal_windows(log=None):
-    """启动自愈：收拾上次进程被强杀留下的窗口副作用。
+def shutdown():
+    """进程退出时还原 `SPI_SETSCREENREADER`。"""
+    _ScreenReader.restore()
 
-    atexit 只在正常退出时跑；桥接被强杀/崩溃时，park_window 挪到屏幕外的窗口
-    与 bring_to_front 设置的置顶都会残留（2026-11-14 实见：鲸鲸微信置顶压住
-    主人微信、资源管理器等窗口被停靠后回不来）。桥接以管理员运行，启动时
-    有权限收拾；只动两类确凿的遗留：
-    1. 整窗停在停靠坐标（x/y ≤ -20000）且宽度 ≥100 的可见窗口 → 拉回屏幕内；
-    2. 微信主窗（mmui::）残留的 TOPMOST → 摘除（用户自己置顶的聊天窗是
-       独立的聊天窗类名，不受影响）。
+
+
+def self_heal_windows(log=None):
+    """启动自愈（fork）：收拾窗口层遗留——屏幕外停靠窗口拉回、微信主窗置顶摘除。
+
+    上游已移除屏幕外停靠，但历史版本（4.1.3-local）停靠过的窗口可能还留在
+    屏幕外没人认领；guia 的 TOPMOST 残留也仍会发生。桥接以管理员运行，
+    启动时有权限收拾一次。
     """
     moved = cleared = 0
     try:
@@ -2116,10 +1667,10 @@ def self_heal_windows(log=None):
             if not win32gui.IsWindowVisible(h):
                 return True
             try:
-                l, t, r, b = win32gui.GetWindowRect(h)
+                l, t_, r, b = win32gui.GetWindowRect(h)
             except Exception:
                 return True
-            if l <= -20000 and t <= -20000 and (r - l) >= 100:
+            if l <= -20000 and t_ <= -20000 and (r - l) >= 100:
                 n = moved
                 try:
                     win32gui.SetWindowPos(h, 0, 140 + (n % 8) * 70, 120 + (n % 8) * 50, 0, 0,
@@ -2145,15 +1696,6 @@ def self_heal_windows(log=None):
         return
     if log and (moved or cleared):
         log('窗口自愈：拉回屏幕外遗留 %d 个，摘除微信主窗置顶 %d 个' % (moved, cleared))
-
-def shutdown():
-    """进程退出时还原 `SPI_SETSCREENREADER`，并把挪到屏幕外的微信窗口放回去。"""
-    _ScreenReader.restore()
-    for hwnd in list(_PARKED.keys()):
-        try:
-            unpark_window(hwnd)
-        except Exception:
-            pass
 
 
 import atexit  # noqa: E402  （放在文件尾部，避免污染上面的常量区）

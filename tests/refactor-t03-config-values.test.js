@@ -137,11 +137,7 @@ for (const [name, write] of Object.entries(writers)) {
     const before = JSON.stringify(f.config);
     const original = fs.writeFileSync;
     t.mock.method(fs, 'writeFileSync', (file, ...args) => {
-      // 本地 fork 用原子写（jsonFile.writeJsonAtomic）：先写 file.{pid}.{ts}.tmp 再 rename。
-      // 失败注入必须连 tmp 一起拦，否则异常走不到调用方。
-      if (file === f.file || String(file).startsWith(f.file + '.')) {
-        throw Object.assign(new Error('isolated write failure'), { code: 'EACCES' });
-      }
+      if (file === f.file) throw Object.assign(new Error('isolated write failure'), { code: 'EACCES' });
       return original(file, ...args);
     });
     assert.throws(() => write(f, { 'group.cooldownSec': 0 }), /isolated write failure/);

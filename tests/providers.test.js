@@ -82,7 +82,8 @@ test('各家预设标出能看图的聊天模型（按官方文档，别瞎标�
   assert.ok(!PROVIDERS.deepseek.visionModels.includes('deepseek-v4-pro'), 'V4 Pro 明确不支持图片输入');
   assert.ok(PROVIDERS.qwen.visionModels.includes('qwen3.8-max'), '百炼「视觉理解」里有 qwen3.8-max');
   assert.ok(PROVIDERS.qwen.visionModels.includes('qwen3.7-plus'), '百炼「视觉理解」里有 qwen3.7-plus');
-  assert.ok(!PROVIDERS.qwen.visionModels.includes('qwen3.8-flash'), 'qwen3.8-flash 只在文本生成列表里');
+  assert.ok(PROVIDERS.qwen.visionModels.includes('qwen3.8-flash'), '百炼当前文档将 qwen3.8-flash 列为多模态模型');
+  assert.ok(PROVIDERS.qwen.visionModels.includes('qwen3.7-flash'), 'qwen3.7-flash 同样使用多模态接口');
   assert.ok(PROVIDERS.siliconflow.visionModels.includes('Qwen/Qwen3.8-27B'), '官方模型页写明是原生视觉语言模型');
   assert.ok(PROVIDERS.opencode.visionModels.includes('kimi-k3.1-pro'), 'Kimi K3.1 Pro 支持视觉输入');
   assert.ok(PROVIDERS.doubao.visionModels.includes('doubao-seed-1-8-251228'), '豆包 Seed 1.8 支持多模态理解');

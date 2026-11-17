@@ -5,7 +5,7 @@ const path = require('node:path');
 
 const PREFIX = '.memory-restore-';
 const KIND = 'whale-memory-restore';
-const TARGETS = new Set(['memory', 'store.json', 'persona.json', 'settings.json', 'care-state.json', 'share-state.json']);
+const TARGETS = new Set(['memory', 'personas', 'store.json', 'persona.json', 'settings.json', 'care-state.json', 'share-state.json']);
 function exists(file) {
   try { fs.lstatSync(file); return true; } catch (error) {
     if (error.code === 'ENOENT') return false;
@@ -87,8 +87,8 @@ function recoverRestore(dir) {
 }
 
 /** 整棵记忆和附属文件先准备验证，再按固定清单交换；不改变原磁盘布局。 */
-function restoreFiles(dir, memory, files) {
-  const names = [...(memory ? ['memory'] : []), ...Object.keys(files)];
+function restoreFiles(dir, memory, files, dirs = {}) {
+  const names = [...(memory ? ['memory'] : []), ...Object.keys(dirs), ...Object.keys(files)];
   if (names.some(name => !TARGETS.has(name)) || new Set(names).size !== names.length) throw new Error('非法恢复目标');
   const transaction = fs.mkdtempSync(path.join(dir, PREFIX));
   const plan = { kind: KIND, version: 1, entries: names.map(name => ({ name, existed: exists(path.join(dir, name)) })) };
@@ -107,6 +107,14 @@ function restoreFiles(dir, memory, files) {
         const target = path.join(preparedMemory, name);
         fs.cpSync(source, target, { recursive: true, verbatimSymlinks: true });
         verifyCopy(source, target);
+      }
+    }
+    for (const [name, entries] of Object.entries(dirs)) {
+      const preparedDir = path.join(transaction, 'prepared', name);
+      fs.mkdirSync(preparedDir, { recursive: true });
+      for (const [rel, body] of Object.entries(entries || {})) {
+        if (!rel || rel.includes('/') || rel.includes('\\') || rel.includes('..')) throw new Error('恢复里的文件名不合法：' + rel);
+        writeVerified(path.join(preparedDir, rel), body);
       }
     }
     for (const [name, body] of Object.entries(files)) writeVerified(path.join(transaction, 'prepared', name), body);

@@ -43,6 +43,7 @@ class PluginHost {
       const out = await this.search({ text: hint ? `${hint} ${query}` : query, force: true, llm: r.llm,
         config: { ...(r.config.websearch || {}), enabled: true,
           timeoutMs: Math.min(flow.executionTimeoutMs, Math.max(500, Number(args.timeoutMs) || 10000)) },
+        dataDir: r.config.paths?.dataDir || 'data',
         now: new Date(context.now || Date.now()), timeZone: String(args.timeZone || ''), signal });
       return { ...out, items: (out.items || []).map(item => ({ ...item,
         publishedAt: item.publishedAt || null, fetchedAt: item.fetchedAt || null })),

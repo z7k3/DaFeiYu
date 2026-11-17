@@ -97,13 +97,11 @@ class SenderMixin:
             u = self.UIA_CACHE['u']
         if u is None:
             return False
-        # quiet 补丁与表情包开关解耦：开着表情包时，文字发送同样不该抢前台
-        if G.BACKGROUND_SEND:
+        if G.BACKGROUND_SEND and (not G.STICKER_TEST_ON):
             self.install_quiet_uia(u)
         keys = self.aliases_for(username, who) if username else [who]
         try:
             cur = None
-            G.touch()
             try:
                 cur = u.current_chat()
             except Exception:
@@ -112,22 +110,12 @@ class SenderMixin:
             if not hit_cur and username:
                 hit_cur = bool(cur) and self.open_cache.get(username) == cur
             if not hit_cur:
-                # S1：open_chat 走搜索兜底时单次 8~20s，进出各 touch 一次进度；
-                # 失败要记账（连续 2 次后 send_text 本轮放弃整条通道矩阵）。
-                G.touch()
-                _opened = bool(u.open_chat(keys))
-                G.touch()
-                self._note_open_chat(username or who, _opened)
-                if not _opened:
+                if not u.open_chat(keys):
                     try:
                         u.back_to_chat_tab()
                     except Exception:
                         pass
-                    G.touch()
-                    _opened = bool(u.open_chat(keys))
-                    G.touch()
-                    self._note_open_chat(username or who, _opened)
-                    if not _opened:
+                    if not u.open_chat(keys):
                         return False
                 if username:
                     try:
@@ -136,7 +124,6 @@ class SenderMixin:
                     except Exception:
                         pass
             self._require_chat_identity(u, who, keys, 'UIA')
-            G.touch()
             t_open = G.time.time()
             sent_ok = False
             try:
@@ -148,12 +135,10 @@ class SenderMixin:
             if not sent_ok:
                 try:
                     u.back_to_chat_tab()
-                    G.touch()
                     if not u.open_chat(keys):
                         sent_ok = False
                     else:
                         self._require_chat_identity(u, who, keys, 'UIA 重试')
-                        G.touch()
                         sent_ok = bool(u.send_text(text))
                 except G.ChatIdentityError:
                     raise
@@ -210,8 +195,6 @@ class SenderMixin:
         """
         if not self.account_send_allowed('键盘通道'):
             return False
-        # S1：抢前台 + 搜索 + 回库确认一整套最久 ~10s，定期 touch 防误判
-        G.touch()
         try:
             import ctypes
             import win32api
@@ -345,7 +328,6 @@ class SenderMixin:
             want = str(text).strip()
             for _ in range(8):
                 G.time.sleep(0.5)
-                G.touch()
                 try:
                     msgs = self.db.get_messages(chat_username or chat_display_name, limit=5) or []
                 except Exception:
@@ -368,48 +350,28 @@ class SenderMixin:
         finally:
             restore_clip(saved_clip)
 
-    def chat_dead(self, chat_username):
-        """会话是否仍在拉黑期（S3）。
-
-        dead_chats 现在是 {username: 拉黑时间}：普通失败拉黑 10 分钟，到点自动
-        放行一条探测（微信重启/窗口抖两下就能自愈，不用重启桥接）；
-        「移出群聊」这类确定性证据写 inf，表示永久拉黑（age 为负一样命中）。
-        """
+    # 连续发送失败只是暂时停发：以前一旦停掉就永久跳过，要重启桥接才恢复。
+    def chat_paused(self, chat_username):
+        """这个会话要不要停发：被移出群是长期失效，连续失败只停一会儿。"""
         if not chat_username:
             return False
-        ts = self.dead_chats.get(chat_username)
-        if ts is None:
-            return False
-        try:
-            if G.time.time() - float(ts) < 600:
-                return True
-        except (TypeError, ValueError):
+        if chat_username in self.dead_chats:
             return True
-        self.dead_chats.pop(chat_username, None)
-        G.log('失效会话已到放行时间，重试一次：', chat_username)
+        until = (self.dead_chat_until or {}).get(chat_username) or 0
+        if until and G.time.time() < until:
+            return True
+        if until:
+            self.dead_chat_until.pop(chat_username, None)
+            G.log('重新尝试发送（停发时间已到）：', G.safe_name(chat_username))
         return False
 
-    def _note_open_chat(self, key, ok):
-        """记录同一目标连续几次打不开会话（S1 快速失败用）。
-
-        只配合「bg 通道已说目标不在会话列表」使用：UIA open_chat（含搜索兜底）
-        也连着打不开，说明这个目标真搜不到，再跑键盘/OCR 只会白烧看门狗预算。
-        打开成功即清零。
-        """
-        if not key:
-            return
-        if ok:
-            self.open_chat_fail.pop(key, None)
-        else:
-            self.open_chat_fail[key] = self.open_chat_fail.get(key, 0) + 1
-
-    def _mark_send_ok(self, chat_username):
-        """发送成功：清失败计数、解除会话拉黑、清打不开会话记录（S1/S3）。"""
+    def pause_chat(self, chat_username, display):
+        retry_sec = 300
         if not chat_username:
             return
-        self.fail_streak.pop(chat_username, None)
-        self.dead_chats.pop(chat_username, None)
-        self.open_chat_fail.pop(chat_username, None)
+        self.dead_chat_until[chat_username] = G.time.time() + retry_sec
+        G.log('连续发送失败，先停掉这个会话 %d 分钟：%s'
+              % (retry_sec // 60, G.safe_name(display)))
 
     def send_policy_allows(self, chat_username, chat_display_name):
         # 排队、模型生成或语音合成期间都可能改名单，发送前向内核核对当前规则。
@@ -431,13 +393,11 @@ class SenderMixin:
         return False
 
     def send_text(self, text, chat_display_name, chat_username='', force=False, quote_latest=False):
-        # dead_chats 用「{username: 拉黑时间}」：普通失败拉黑 10 分钟后自动放行探测，
-        # 「移出群聊」这类确定性证据写 inf 永久拉黑（上游仍是 set 永久拉黑）。
-        if self.chat_dead(chat_username):
+        if chat_username and self.chat_paused(chat_username):
             G.log('跳过已失效的会话：', G.safe_name(chat_display_name))
             return False
         if chat_username and (not self.group_is_alive(chat_username)):
-            self.dead_chats[chat_username] = float('inf')
+            self.dead_chats.add(chat_username)
             G.log('群里已经没有我了（被移出？），以后跳过：', G.safe_name(chat_display_name))
             return False
         if chat_username and self.is_self_chat(chat_username):
@@ -456,18 +416,6 @@ class SenderMixin:
         display = G.safe_name(chat_display_name)
         if not self.account_send_allowed('发送'):
             return False
-        # 连续相同回复折叠：两条并行会话同时撞上 LLM 超时/失败时，固定兜底文案会
-        # 一字不差地发两遍，群里看就是复读。90 秒内同会话同文本只发第一遍，
-        # 第二遍按「已送达」处理（不触发兜底通道，避免第三次重复）。
-        if not hasattr(self, '_last_sent'):
-            self._last_sent = {}
-        _dedupe_key = chat_username or chat_display_name
-        _prev_t, _prev_text = self._last_sent.get(_dedupe_key, (0, ''))
-        if text.strip() and text.strip() == _prev_text and G.time.time() - _prev_t < 90:
-            G.log('90 秒内已发过同样内容，折叠这次重复（不重复发送）→', chat_display_name)
-            self._last_sent[_dedupe_key] = (G.time.time(), text.strip())
-            return True
-        self._last_sent[_dedupe_key] = (G.time.time(), text.strip())
         with self.send_lock, G._SendStateScope(len(text)):
             if not self.send_policy_allows(chat_username, chat_display_name):
                 return False
@@ -475,58 +423,17 @@ class SenderMixin:
                 return False
             t_start = G.time.time()
             allow_mark_dead = True
-            _bg_ran = False
-            # 表情包开关不再牵连文字通道：零焦点通道被其他窗口盖住也能发
-            # （窗口消息打字，全程不抢前台、不动别人的窗口）；表情包发送有
-            # 自己独立的切前台逻辑（send_sticker），不需要这里让路。
-            if G.BG_SEND.get('enabled', True):
-                _bg_ran = True
-                G.touch()
-                # 打开会话时第三方库会 ensure_visible()→bring_to_front()，把微信抬到前台
-                # 并设成 TOPMOST，而且自己从不还原。后台通道以前成功后直接 return，
-                # 这些副作用就留在了桌面上（用户看到「回个消息微信跳出来」）。
-                # 所以这里也记快照，成功/失败都还原一次。
-                _bg_snap = self.snapshot_win_state()
+            if not G.STICKER_TEST_ON and G.BG_SEND.get('enabled', True):
+                G.SEND_STATE['start'] = G.time.time()
                 try:
                     if self.bg_send(text, chat_display_name, chat_username):
-                        self._mark_send_ok(chat_username)
-                        self.quiet_restore(_bg_snap)
+                        self.fail_streak.pop(chat_username, None)
                         G.log('发送成功（后台通道，%.1fs）→ %s' % (G.time.time() - t_start, display))
                         return True
                 except G.DraftDirtyError as e:
-                    # 脏输入 = 用户此刻正在微信输入框里打字（或有残留草稿）：输入法组合吞掉
-                    # WM_CHAR，且绝不能把正文和用户的草稿拼在一起发。正确做法是等用户打完：
-                    # 2.5 秒 → 10 秒两轮重试，用户清空/发出草稿后自动补发；都还脏才放弃。
                     allow_mark_dead = False
-                    G.log('发送暂停（%s）：等用户打完，2.5 秒后重试' % e)
-                    _dirty_last = None
-                    for _wait in (2.5, 10.0):
-                        G.time.sleep(_wait)
-                        G.touch()
-                        # bg_send 内部最多打 2 遍 + 编码探测，多轮重试等于最多 6 遍打字——
-                        # 预算按「重打」抬升，否则看门狗会在重试中途把整轮发送强杀掉。
-                        G.ensure_budget(min(180.0, 2.5 * (len(text) * 0.16 + 8.0) + 15.0))
-                        try:
-                            if self.bg_send(text, chat_display_name, chat_username):
-                                self._mark_send_ok(chat_username)
-                                G.log('发送成功（后台通道重试，%.1fs）→ %s' % (G.time.time() - t_start, chat_display_name))
-                                return True
-                            G.log('后台通道重试仍未发出（%.0fs 等待后），转前台通道矩阵' % _wait)
-                            break
-                        except G.DraftDirtyError as e2:
-                            _dirty_last = str(e2)
-                            G.log('仍是脏输入（%.0fs 等待后）：%s' % (_wait, e2))
-                        except G.ChatIdentityError as e2:
-                            G.log_error('会话核对没通过，这条不发（%s）：%s' % (chat_display_name, e2))
-                            return False
-                        except Exception as e2:
-                            G.log('后台通道重试异常，继续用旧通道：', repr(e2))
-                            break
-                    if _dirty_last is not None:
-                        # 两轮等待后仍是脏：用户可能一直占着输入框。放弃这条（绝不拿
-                        # 残留草稿走前台——半截草稿+新正文会拼成一条发出去）。
-                        G.log_error('等待后仍是脏输入，放弃这条：' + _dirty_last)
-                        return False
+                    G.log_error('发送暂停：%s' % e)
+                    return False
                 except G.ChatIdentityError as e:
                     G.log_error('会话核对没通过，这条不发（%s）：%s' % (display, e))
                     return False
@@ -536,30 +443,13 @@ class SenderMixin:
                     allow_mark_dead = False
                     G.log_error('后台通道失败且已关闭前台兜底，这条不发：', display)
                     return False
-            # S1 快速失败：bg 说目标不在会话列表 + UIA open_chat 也连着打不开
-            # （本轮发送之前已记满 2 次），就别再把引用/UIA×2/热激活/键盘/OCR
-            # 整条矩阵跑完——搜索兜底单次 8~20 秒，曾把看门狗逼成重启循环。
-            _open_key = chat_username or chat_display_name
-            _bg_chat_missing = (_bg_ran and self.BG_STATS.get('last') == 'chat_not_found'
-                                and self.BG_STATS.get('lastAt', 0) >= t_start)
-            if _bg_chat_missing and self.open_chat_fail.get(_open_key, 0) >= 2:
-                G.log('发送放弃：%s 连续 2 次打不开会话（列表和搜索都找不到），本轮不再走前台通道' % chat_display_name)
-                if chat_username and allow_mark_dead and G.time.time() - float(self.ACCOUNT.get('blockedAt') or 0) >= 30:
-                    self.fail_streak[chat_username] = self.fail_streak.get(chat_username, 0) + 1
-                    if self.fail_streak[chat_username] >= 2:
-                        self.dead_chats[chat_username] = G.time.time()
-                        G.log('连续发送失败，先停掉这个会话（10 分钟后自动放行探测）：', chat_display_name)
-                return False
-            # S1：前台通道矩阵结构长（单轮最多 5 次 uia_send、单次 open_chat 实测
-            # 8~20s），把预算抬到 120s+打字时间、封顶 180s，防合法慢发送被误杀。
-            G.ensure_budget(min(180.0, 120.0 + len(text) * 0.16))
             with self.gui_lock:
                 if self.gui is None:
                     G.log('初始化微信窗口驱动…（会抢一下焦点，约 5~10 秒）')
                     self.gui = self.new_window_driver()
             self.bind_gui_window(self.gui)
             if quote_latest and G.QUOTE_REPLY:
-                G.touch()
+                G.SEND_STATE['start'] = G.time.time()
                 try:
                     # 不传 target_text：走上游 1.2.10 的「引用最近一条」路径
                     # （UIA 行控件 + 像素重心），图片/表情/换行也不会 OCR 匹配失败。
@@ -570,29 +460,17 @@ class SenderMixin:
                     G.log('引用回复未确认浮层/发送，回退普通发送：', display)
                 except Exception as e:
                     G.log('引用回复失败，回退普通发送：', repr(e))
-                G.touch()
             uia_available = False
             try:
                 uia_available = self.gui._get_uia() is not None
             except Exception:
                 uia_available = False
-            # UIA 通道也要把「准备打入输入框的正文」记进残留库：风暴期间 UIA 打了字
-            # 却没发出去时，这些文字会留在输入框（微信草稿跨重启恢复）挡后续发送。
-            # 只有 bg 通道记录的话，UIA 通道的残留会变成认不出来的「用户草稿」
-            # （2026-11-14 14:09~14:12 实见：UIA 打的草稿 55 分钟后仍挡着每条回复）。
-            try:
-                G.bg_sender._remember_attempt(int(self.ACCOUNT.get('hwnd') or 0), text)
-            except Exception:
-                pass
             for attempt in (1, 2):
-                if _bg_chat_missing and self.open_chat_fail.get(_open_key, 0) >= 2:
-                    G.log('UIA 通道：%s 连续打不开会话，跳过第 %d 次尝试' % (chat_display_name, attempt))
-                    break
                 t_att = G.time.time()
-                G.touch()
+                G.SEND_STATE['start'] = G.time.time()
                 try:
                     if self.with_window_on_top(lambda: self.uia_send(text, chat_display_name, chat_username)):
-                        self._mark_send_ok(chat_username)
+                        self.fail_streak.pop(chat_username, None)
                         G.log('发送成功（%.1fs）→ %s' % (G.time.time() - t_start, display))
                         return True
                     G.log('UIA 发送未成功（第 %d 次，%.1fs），准备重试' % (attempt, G.time.time() - t_att))
@@ -602,11 +480,11 @@ class SenderMixin:
                 except Exception as e:
                     G.log('UIA 发送异常（第 %d 次，%.1fs）：%r' % (attempt, G.time.time() - t_att, e))
                 G.time.sleep(0.5)
-            if uia_available and not (_bg_chat_missing and self.open_chat_fail.get(_open_key, 0) >= 2):
+            if uia_available:
                 if self.recover_uia('发送失败'):
                     try:
                         if self.with_window_on_top(lambda: self.uia_send(text, chat_display_name, chat_username)):
-                            self._mark_send_ok(chat_username)
+                            self.fail_streak.pop(chat_username, None)
                             G.log('重新激活 UIA 后发送成功（%.1fs）→ %s' % (G.time.time() - t_start, display))
                             return True
                     except G.ChatIdentityError as e:
@@ -618,18 +496,18 @@ class SenderMixin:
             else:
                 G.log_throttled('uia-unavailable', 'UIA 不可用：先试键盘通道；如果一直这样，到启动器「诊断」页点「UIA 自检」看原因（常见：微信需要重新登录、鲸鱼娘不是管理员而微信是、微信缩在托盘）', ttl=600)
                 G.log('UIA 不可用，走 OCR 兜底')
-            if G.KEYBOARD_FALLBACK and not (_bg_chat_missing and self.open_chat_fail.get(_open_key, 0) >= 2):
-                G.touch()
+            if G.KEYBOARD_FALLBACK:
+                G.SEND_STATE['start'] = G.time.time()
                 try:
                     if self.keyboard_send(text, chat_display_name, chat_username):
-                        self._mark_send_ok(chat_username)
+                        self.fail_streak.pop(chat_username, None)
                         G.log('发送成功（键盘通道，%.1fs）→ %s' % (G.time.time() - t_start, display))
                         return True
                 except G.ChatIdentityError as e:
                     G.log_error('会话核对没通过，这条不发（%s）：%s' % (display, e))
                     return False
-            if not uia_available and not (_bg_chat_missing and self.open_chat_fail.get(_open_key, 0) >= 2):
-                G.touch()
+            if not uia_available:
+                G.SEND_STATE['start'] = G.time.time()
                 try:
                     with self.gui_lock:
                         try:
@@ -650,7 +528,6 @@ class SenderMixin:
                     _th = G.threading.Thread(target=_ocr_send, daemon=True)
                     _th.start()
                     _th.join(8)
-                    G.touch()
                     if _th.is_alive():
                         G.log('OCR 兜底 8 秒没返回（卡在截屏），放弃这条，等下次消息')
                         _ocr_cancel.set()
@@ -660,7 +537,7 @@ class SenderMixin:
                             raise _box['e']
                         resp = _box.get('r')
                     if bool(resp):
-                        self._mark_send_ok(chat_username)
+                        self.fail_streak.pop(chat_username, None)
                         return True
                     G.log('兜底发送失败：%s' % resp)
                 except Exception as e:
@@ -671,10 +548,8 @@ class SenderMixin:
                     return False
                 self.fail_streak[chat_username] = self.fail_streak.get(chat_username, 0) + 1
                 if self.fail_streak[chat_username] >= 2:
-                    # 记时间戳，10 分钟后 chat_dead() 自动放行一条探测；
-                    # 以前是 set 永久拉黑，微信重启一下这个会话就永远不回了。
-                    self.dead_chats[chat_username] = G.time.time()
-                    G.log('连续发送失败，先停掉这个会话（10 分钟后自动放行探测）：', display)
+                    self.fail_streak[chat_username] = 0
+                    self.pause_chat(chat_username, chat_display_name)
             G.log_error('发送最终失败，请把微信窗口保持在桌面、别最小化（这条 %d 字，正文不写日志）' % len(text))
             return False
 
@@ -686,15 +561,11 @@ class SenderMixin:
         chat_display_name = self.ui_chat_name(chat_username, chat_display_name)
         if not chat_display_name:
             return False
-        if chat_username and (self.chat_dead(chat_username) or not self.group_is_alive(chat_username)):
+        if chat_username and (self.chat_paused(chat_username) or not self.group_is_alive(chat_username)):
             return False
         if not self.account_send_allowed('@ 成员'):
             return False
         with self.send_lock, G._SendStateScope(len(text)):
-            # S1 同款：@ 成员走选人面板，目标不在列表顶部时全程可达 40 秒以上——
-            # 不抬预算/不打心跳的话，看门狗会把正常的 @ 发送误杀。
-            G.ensure_budget(min(180.0, 120.0 + len(text) * 0.16))
-            G.touch()
             if not self.send_policy_allows(chat_username, chat_display_name):
                 return False
             if not self.sticker_quarantine_allows(chat_username, chat_display_name):

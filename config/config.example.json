@@ -60,14 +60,16 @@
     "masterRoast": false
   },
   "chat": {
-    "_说明": "回复长度与上下文：privateMaxChars 私聊每条最多几个字，groupMaxChars 群聊每条，maxBubbles 一次最多连发几条，historyTurns 带多少轮历史",
+    "_说明": "回复长度与上下文：privateMaxChars 私聊每条最多几个字，groupMaxChars 群聊每条，maxBubbles 一次最多连发几条，historyTurns 带多少轮历史；messageSettleMs 是最后一条消息后的安静等待，groupMaxBatchWaitMs 是群聊从首条开始的最大等待",
     "privateMaxChars": 140,
     "groupMaxChars": 70,
     "maxBubbles": 2,
     "historyTurns": 200,
     "groupHistoryTurns": 150,
     "discussionMaxChars": 600,
-    "emojiChance": 0
+    "emojiChance": 0,
+    "messageSettleMs": 1500,
+    "groupMaxBatchWaitMs": 5000
   },
   "group": {
     "_说明": "群聊行为：requireAt=只有 @ 她/叫她名字才回；freeChat=允许她偶尔主动接话（概率 freeChatChance）；cooldownSec 两次回复最少隔几秒；silentMinutes 冷场多久算这个话题结束；engagedMinutes 接话后保持参与多少分钟；muteDefaultMinutes 免打扰默认时长；addressShadow=判定仲裁器影子模式（开=新旧判定分歧只记 [addr-shadow] 日志不改行为，收集够样本后切新判定）",
@@ -154,14 +156,32 @@
     }
   },
   "websearch": {
-    "_说明": "问天气/新闻等实时问题时联网现搜。city 填你所在的城市（比如「上海」），问她天气时才准；留空就按她收到的原话搜（可能搜到别的城市）。enabled=false 关闭所有联网",
+    "_说明": "问天气/新闻等实时问题时联网现搜。本地 Bing/360 始终开启；api.enabled 只控制是否额外调用第三方搜索 API。city 填你所在的城市（比如「上海」），问她天气时才准；留空就按她收到的原话搜（可能搜到别的城市）。",
     "enabled": true,
     "tavilyApiKey": "",
     "tavilyBaseUrl": "https://tavily.sharyuke.com",
     "tavilyMaxResults": 6,
     "_tavily说明": "Tavily 兼容搜索源：填了 Key 就作为首选检索源（结构化结果+全文+真实发布时间，无反爬问题），bing/360 退为兜底。支持官方 api.tavily.com 的 tvly- Key，或 tavily.sharyuke.com 这类 Hub 网关的 Key。留空=不启用",
     "city": "",
-    "timeoutMs": 20000
+    "timeoutMs": 20000,
+    "api": {
+      "_说明": "默认跟随聊天模型和 Key；已适配 DeepSeek / 千问官方搜索，其他服务使用本地 Bing/360。关闭总开关不调用搜索 API；关闭 followChat 后可手动添加 deepseek / zhihu。",
+      "enabled": true,
+      "followChat": true,
+      "providers": []
+    },
+    "deepseek": {
+      "_说明": "DeepSeek 搜索 API Key（/v1/tools/search）。留空时只在同源情况下复用 deepseek.apiKey。",
+      "apiKey": ""
+    },
+    "zhihu": {
+      "_说明": "知乎开放平台 Access Secret；dailyLimit 是本地每日上限，默认 4999，超了只走本地搜索。",
+      "accessSecret": "",
+"dailyLimit": 4999
+    },
+    "tavilyApiKey": "",
+    "tavilyBaseUrl": "https://tavily.sharyuke.com",
+    "tavilyMaxResults": 6
   },
   "env": {
     "_说明": "提示词 <env> 块里的环境信息。location 手填可以精确到区（比如「厦门市思明区」）；留空就自动探测：优先 Windows 定位服务（不吃公网 IP，挂 VPN 也是本机位置，精度差时只报城市），拿不到才按出口 IP 猜（会写明「挂 VPN 可能不符」）。autoDetect=false 完全关掉探测，只用手填和 websearch.city。timezone 是全局唯一时区来源：留空=系统时区，日记时间、主动搭话时间段、提醒、朋友圈夜间判断、聊天时间戳和 <env> 都按它算。地点最多到区，不落盘",
@@ -190,8 +210,9 @@
     "timeoutMs": 30000
   },
   "voice": {
-    "_说明": "语音消息转文字。默认阿里云百炼 qwen3-asr-flash；apiKey 留空则用 data/settings.json 里的 Key。maxSeconds=超过多少秒的语音不转",
+    "_说明": "语音消息转文字。默认启用、provider=follow 跟随聊天服务和 Key（已适配 DeepSeek、千问官方接口）；手动配置和关闭状态继续保留。provider=auto 时按接口地址判断：含 dashscope 走百炼，含 api.deepseek.com 走 DeepSeek。DeepSeek 不需要模型名，最长 120 秒。apiKey 留空则用同源服务商的 Key。enabled=false 时不下载、不请求。",
     "enabled": true,
+    "provider": "follow",
     "apiKey": "",
     "baseUrl": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
     "model": "qwen3-asr-flash",

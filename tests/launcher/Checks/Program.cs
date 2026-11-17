@@ -21,6 +21,10 @@ try {
  Check(Api.Detail(new ApiResult { Raw=new string('中',120) })==new string('中',120), "联系人摘要 120 字不截断");
  Check(Api.Detail(new ApiResult { Raw=new string('中',121) })==new string('中',120)+"…", "联系人摘要超长才加省略号");
  using var sup = new RuntimeSupervisor(root);
+ sup.UpdateBlocked = true;
+ sup.StartNode(); sup.StartBridge(); await sup.StartAllAsync();
+ Check(!sup.NodeRunning && !sup.BridgeRunning, "启动更新检查及强制态阻止所有业务启动入口");
+ sup.UpdateBlocked = false;
  var portFile = Path.Combine(root, "data", "server-port.txt");
  using (var external = Process.Start(new ProcessStartInfo(Path.Combine(root, "runtime", "node.exe"), "server.js")
  {
@@ -56,6 +60,13 @@ try {
      }
  }
  Check(!(await sup.ProbeAsync()).NodeUp, "后台内核退出后恢复未启动状态");
+ sup.StartNode();
+ Check(await sup.WaitForNodeAsync(), "单独桥接门禁场景内核就绪");
+ sup.UpdateBlocked = true;
+ sup.StartBridge();
+ Check(!sup.BridgeRunning, "内核运行时也不能绕过强制策略单独启动桥接");
+ sup.StopAll();
+ sup.UpdateBlocked = false;
  var restartHistory=(List<DateTime>)typeof(RuntimeSupervisor).GetField("_bridgeRestarts",BindingFlags.Instance|BindingFlags.NonPublic).GetValue(sup);
  var previousRestart=DateTime.UtcNow.AddMinutes(-1);restartHistory.Add(previousRestart);
  await sup.StartAllAsync(clearRestartHistory:false);

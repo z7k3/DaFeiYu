@@ -51,7 +51,7 @@ test('表情包进识别链路：不装死、不送进图片下载', () => {
   assert.match(bridge, /from emoji_vision import load_preview/, '走 emoji_vision 解本地缓存/回源');
   const fn = bridge.slice(bridge.indexOf('def on_message_inner'));
   const body = fn.slice(0, fn.indexOf('\n    def ', 10));
-  assert.match(body, /desc = describe_emoji\(msg\)/, '处理分支里要真的调用识别');
+  assert.match(body, /run_media_with_timeout\(lambda: describe_emoji\(msg\)/, '处理分支里要真的调用识别');
   assert.match(body, /对方发了一个表情包，画面是/, '识别结果要变成一句话交给对话');
 });
 
@@ -66,16 +66,63 @@ test('被标成「图片」的表情包也要走表情包链路，不能当图�
     '表情包分支必须排在图片识别之前');
   assert.doesNotMatch(body, /收到表情包（被标成图片），装死/, '不再装死');
 });
-test('识别失败不回话，但日志要能定位到具体消息（会话 / 发送者 / 类型 / id / 原因）', () => {
+test('识别失败要能定位到具体消息；图片取不到时让她回一句，表情/语音仍不回话', () => {
   // 以前失败只有一个 return，内部日志没有消息 id，用户问「这条为什么没回」只能猜。
   const fn = bridge.slice(bridge.indexOf('def on_message_inner'));
   const body = fn.slice(0, fn.indexOf('\n    def ', 10));
   for (const kind of ['图片', '表情', '语音']) {
-    assert.match(body, new RegExp(`media_failed\\(["']${kind}["']\\)`), `${kind}失败要先记日志再 return`);
+    assert.match(body, new RegExp(`media_failed\\(["']${kind}["']\\)`), `${kind}失败要先记日志`);
   }
   assert.match(body, /media-fail:%s:%s['"] % \(msg_id, kind\)/, '节流 key 要带消息 id，别把别的消息一起吞掉');
   assert.match(body, /emit=log_error/, '识别失败要写 error 级日志');
   assert.match(body, /会话=%s 发送者=%s 类型=%s 消息id=%s 原因=%s/, '一行里要能读全会话 / 发送者 / 类型 / id / 原因');
+  // 图片取不到不再沉默：交给模型回一句，并禁止编造画面。
+  assert.match(body, /media_placeholder = True/, '图片失败要标记为占位文本');
+  assert.match(body, /不要编造图里的内容/, '占位文本要明确禁止编造');
+  assert.match(body, /_guard_text = '%s#%s:%s'/, '占位文本按消息 id 查重，别把第二张图当重复消息');
+});
+
+/**
+ * 2026-11-15 16:15 本机：发完一张图片 Bot 就不回话了，日志停在
+ * 「图片缓存尚未就绪，等待重试（1/3）」，两分钟没动静，重启桥接才好。
+ * 根因是 wechatauto 找不到图片 AES 密钥时会扫描微信内存并再挂 120 秒 monitor，
+ * 而这段代码就在「同一会话串行」的消息 worker 里 —— 一张图能把整个会话卡死。
+ * 现在密钥扫描有超时护栏，识别本身也在守护线程里等待，超时只放弃这一条。
+ */
+test('图片识别不会把整个会话卡死：密钥扫描和识别都有时间上限', () => {
+  assert.match(bridge, /def install_key_scan_guard/, '要有图片密钥扫描护栏');
+  assert.match(bridge, /monitor=False, monitor_timeout=monitor_timeout/, '必须强制单次扫描，不再等 120 秒 monitor');
+  assert.match(bridge, /_scan_aes_key = scan/, '护栏要真的替换实例方法');
+  assert.match(bridge, /install_key_scan_guard\(dl, log=log\)/, '创建媒体下载器时要装上护栏');
+  assert.match(bridge, /def run_media_with_timeout/, '识别要有超时包一层');
+  const fn = bridge.slice(bridge.indexOf('def on_message_inner'));
+  const body = fn.slice(0, fn.indexOf('\n    def ', 10));
+  for (const kind of ['图片', '表情', '语音']) {
+    assert.match(body, new RegExp(`run_media_with_timeout\\(lambda: \\w+\\(msg\\), ['"]${kind}['"]`),
+      `${kind}识别必须走超时包装，不能直接同步调用`);
+  }
+});
+
+/**
+ * 图片密钥（AES）只能从 Weixin.exe 进程内存里反推，取不到时磁盘上的 .dat 解不开。
+ * 这时不能只留一条“这条不回话”：先记清能不能离线派生、图来自哪个账号目录，
+ * 再退到界面兜底（让微信导出明文，导不出就截预览窗）。
+ */
+test('密钥取不到时有诊断日志和界面兜底，不是静默不理人', () => {
+  assert.match(bridge, /def image_key_note/, '要记录 cfgDword 能不能离线派生');
+  assert.match(bridge, /def image_dir_note/, '要记录图来自当前账号目录还是别处');
+  assert.match(bridge, /图片密钥状态：%s；消息id=/, '失败日志要带密钥状态和消息 id');
+  assert.match(bridge, /def image_ui_fallback/, '磁盘解不开时要有界面兜底');
+  assert.match(bridge, /from image_ui_fallback import read_image_via_ui/, '兜底要真的去调界面');
+  assert.match(bridge, /def read_image_via_ui/, '先导出明文，导出不了再截图');
+  assert.match(bridge, /def capture_preview_image/, '要有截预览窗的实现');
+  assert.match(bridge, /def skipped\(reason\)/, '没处理的消息也要留痕');
+  assert.match(bridge, /消息未处理：%s；会话=%s 消息id=/, '跳过日志要带原因和消息 id');
+  assert.match(bridge, /界面兜底：没在可视区认出|界面兜底：没取到图/, '兜底失败要写清卡在哪一步');
+  const fn = bridge.slice(bridge.indexOf('def describe_image'));
+  const body = fn.slice(0, fn.indexOf('\n    def ', 10));
+  assert.match(body, /image_ui_fallback/, '本地取不到图时必须尝试界面兜底');
+  assert.ok(body.indexOf('image_dir_note') > 0, '取到图时要记录来源目录');
 });
 
 test('UIA 彻底不行时有键盘兜底通道（Ctrl+F 搜索会话 → 粘贴 → 回车，并回读确认）', () => {

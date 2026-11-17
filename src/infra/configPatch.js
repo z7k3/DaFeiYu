@@ -35,6 +35,8 @@ const SECRET_PATHS = new Set([
   'vision.apiKey',
   'voice.apiKey',
   'websearch.tavilyApiKey',
+  'websearch.deepseek.apiKey',
+  'websearch.zhihu.accessSecret',
   'gateway.wechat.inboundToken',
   'admin.spell',
 ]);
@@ -63,6 +65,36 @@ function setByPath(obj, dotted, value) {
   }
   cur[parts[parts.length - 1]] = value;
   return obj;
+}
+
+/** 删掉点号路径上的字段；父级不存在时返回 false。 */
+function deleteByPath(obj, dotted) {
+  const parts = pathParts(dotted);
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    if (!isPlainObject(cur[parts[i]])) return false;
+    cur = cur[parts[i]];
+  }
+  const last = parts[parts.length - 1];
+  if (!Object.prototype.hasOwnProperty.call(cur, last)) return false;
+  delete cur[last];
+  return true;
+}
+
+/** 清空一个对象里已经空的父级（只处理路径上的中间层，别把用户其它字段带走）。 */
+function pruneEmptyParents(obj, dotted) {
+  const parts = pathParts(dotted);
+  const stack = [];
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    if (!isPlainObject(cur[parts[i]])) return;
+    stack.push([cur, parts[i]]);
+    cur = cur[parts[i]];
+  }
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    const [parent, key] = stack[i];
+    if (isPlainObject(parent[key]) && Object.keys(parent[key]).length === 0) delete parent[key];
+  }
 }
 
 function specOf(dotted) {
@@ -299,6 +331,18 @@ function prepareConfigPatch(config, patch) {
       pending.push([p, next]);
     } catch (err) { errors.push(p + '：' + err.message); }
   }
+  // 群聊最大等待不能小于安静窗口，否则后者永远等不到。
+  const touchesSettle = pending.some(([p]) => p === 'chat.messageSettleMs' || p === 'chat.groupMaxBatchWaitMs');
+  if (touchesSettle) {
+    const effective = (dotted, fallback) => {
+      const hit = pending.find(([p]) => p === dotted);
+      const value = getByPath(config, dotted);
+      return hit ? hit[1] : (value === undefined ? fallback : value);
+    };
+    const settleMs = Number(effective('chat.messageSettleMs', DEFAULT_CONFIG.chat.messageSettleMs));
+    const maxWaitMs = Number(effective('chat.groupMaxBatchWaitMs', DEFAULT_CONFIG.chat.groupMaxBatchWaitMs));
+    if (maxWaitMs < settleMs) errors.push('chat.groupMaxBatchWaitMs：群聊最大等待不能小于连续消息等待');
+  }
   // 校验先于落盘：填错了就整批拒绝，别出现「改了一半」的状态
   if (errors.length) {
     throw Object.assign(new Error('配置没保存：' + errors.join('；')), { statusCode: 400 });
@@ -311,6 +355,7 @@ function writeConfigPatch(file, raw, pending) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // 原子写：保存到一半崩溃 / 断电不能把整份 config.json 变成坏 JSON（坏了会一路退回默认值）
   writeJsonAtomic(file, raw, { spaces: 2, trailingNewline: true });
+  fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8');
 }
 
 /** 把接口提交的 { "persona.name": "新名字" } 写进 config.json 并立刻生效 */
@@ -325,6 +370,66 @@ function applyConfigPatch(runtime, patch) {
   reloadRuntimeConfig(runtime);
   runtime.logger.info(`设置接口保存了配置：${changed.join('、')}${cleared.length ? `（同时清了 ${cleared.join('、')}，让改动真的生效）` : ''}`);
   return { changed, cleared };
+}
+
+/**
+ * 删除密钥：普通 patch 的「空值 = 不改」不能用来清 Key，所以单独走这个入口。
+ * 只允许 SECRET_PATHS，避免接口被拿来删任意配置。config.json 和
+ * data/settings.json 同路径上的值都会删掉，防止旧覆盖项把 Key 又盖回来。
+ */
+function clearSecrets(runtime, paths) {
+  const list = (Array.isArray(paths) ? paths : [])
+    .map((p) => String(p == null ? '' : p).trim())
+    .filter(Boolean);
+  if (!list.length) throw Object.assign(new Error('要指定要清除的密钥字段'), { statusCode: 400 });
+  for (const p of list) {
+    if (!SECRET_PATHS.has(p)) {
+      throw Object.assign(new Error('不允许清除这个字段：' + p), { statusCode: 400 });
+    }
+    pathParts(p);
+  }
+
+  const file = runtime.config.paths.configFile;
+  const raw = readRawConfig(file);
+  let changed = false;
+  for (const p of list) {
+    if (deleteByPath(raw, p)) {
+      pruneEmptyParents(raw, p);
+      changed = true;
+    }
+  }
+  if (changed) fs.writeFileSync(file, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+
+  // settings.json 只有同路径的旧覆盖项才删；不去猜顶层 apiKey，免得误删聊天 Key。
+  const settingsFile = runtime.config.paths.settingsFile;
+  try {
+    const st = readRawConfig(settingsFile);
+    let settingsChanged = false;
+    for (const p of list) {
+      if (deleteByPath(st, p)) {
+        pruneEmptyParents(st, p);
+        settingsChanged = true;
+      }
+      // 语音 Key 还有两处旧存放位置：settings.voiceApiKey / settings.keys.voice。
+      // 只清 voice.apiKey 时一并删掉，避免界面已关、桥接又捡起旧 Key。
+      if (p === 'voice.apiKey') {
+        if (Object.prototype.hasOwnProperty.call(st, 'voiceApiKey')) {
+          delete st.voiceApiKey;
+          settingsChanged = true;
+        }
+        if (isPlainObject(st.keys) && Object.prototype.hasOwnProperty.call(st.keys, 'voice')) {
+          delete st.keys.voice;
+          if (!Object.keys(st.keys).length) delete st.keys;
+          settingsChanged = true;
+        }
+      }
+    }
+    if (settingsChanged) fs.writeFileSync(settingsFile, JSON.stringify(st, null, 2), 'utf8');
+  } catch { /* 没有 settings.json 或写不了：config 已经清掉，运行时会以后者为准 */ }
+
+  reloadRuntimeConfig(runtime);
+  runtime.logger?.info?.('清除了密钥：' + list.join('、'));
+  return { cleared: list };
 }
 
 /** 默认值：按点号路径从 DEFAULT_CONFIG 里取（没有这一项就返回 undefined） */
@@ -410,9 +515,9 @@ function saveConfigPatch(config, patch) {
   const pending = prepareConfigPatch(config, patch || {});
   if (!pending.length) return [];
   // readRawConfig：文件不存在从 {} 起步；JSON 坏了/读不了会抛错拒绝保存，
-  // 不会把整份配置覆盖成「只有本次改的字段」（老版本的保护语义保持不变）。
-  const raw = readRawConfig(file);
   // 先落盘成功（原子写 + fsync），再改进程内存；磁盘失败时不能留下“内存新值、磁盘旧值”。
+  const raw = readRawConfig(file);
+  // 先落盘成功，再改进程内存；磁盘失败时不能留下“内存新值、磁盘旧值”。
   writeConfigPatch(file, raw, pending);
   for (const [dotted, next] of pending) setByPath(config, dotted, next);
   return pending.map(([dotted]) => dotted);
@@ -430,6 +535,7 @@ module.exports = {
   clearSettingsShadow,
   mergeConfigInPlace,
   applyConfigPatch,
+  clearSecrets,
   saveConfigPatch,
   defaultOf,
   resetConfig,

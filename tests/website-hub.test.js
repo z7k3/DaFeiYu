@@ -30,7 +30,7 @@ async function main() {
     const latest = release('v4.1.0');
     const old = release('v3.60');
     const preview = release('v4.2.0-rc.1', { prerelease: true });
-    const data = { latest, releases: [latest, old, preview, release('v9.0.0', { draft: true })],
+    const data = { latest, stars: 1234, releases: [latest, old, preview, release('v9.0.0', { draft: true })],
       fetchedAt: '2026-11-13T08:00:00Z', sourceCommit: 'a'.repeat(40), plugins: [{
         Id: 'text-counter', Name: '<测试插件>', Author: 'Banan1cee', Api: 1, Version: '1.0.0',
         MinAppVersion: '4.1.0', Description: '真实目录内容。', Sha256: 'b'.repeat(64),
@@ -42,6 +42,15 @@ async function main() {
     const home = read('index.html');
     const archive = read('downloads/index.html');
     const oldPage = read('downloads/v3.60/index.html');
+    for (const page of [home, archive, oldPage, read('team/index.html')]) {
+      assert.match(page, /class="github-button"[^>]+href="https:\/\/github.com\/Banan1cee\/whale_girl"/);
+      assert.match(page, /1,234 Stars，随官网部署更新/);
+      assert.match(page, /class="github-stars"[^>]*>.*1,234/);
+    }
+    for (const page of [home, archive, oldPage]) {
+      assert.match(page, /送我们一颗小星星/);
+      assert.match(page, /无需 Star 也能下载/);
+    }
     assert.match(home, /团队成员/);
     assert.doesNotMatch(home, /作者有话说|待作者确认|网站寄语草稿/);
     assert.match(home, /感谢每一位为鲸鲸贡献代码/);

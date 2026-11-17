@@ -9,7 +9,7 @@ namespace WhaleLauncher
     /// 轻量 RGB 调色窗：三根滑轨 + 预览 + 色值。不引入第三方颜色选择器，
     /// 手选结果直接写进 launcher-ui.json。
     /// </summary>
-    public sealed class ColorPickerWindow : Window
+    public sealed class ColorPickerWindow : UserControl
     {
         private readonly Slider _r;
         private readonly Slider _g;
@@ -18,16 +18,10 @@ namespace WhaleLauncher
         private readonly TextBlock _hex;
         private bool _ready;
 
-        public Color SelectedColor { get; private set; }
+        public Color SelectedColor => Current();
 
         public ColorPickerWindow(string title, Color initial, Style sliderStyle)
         {
-            SelectedColor = initial;
-            Title = "调色 · " + title;
-            Width = 430;
-            SizeToContent = SizeToContent.Height;
-            ResizeMode = ResizeMode.NoResize;
-            WindowStartupLocation = WindowStartupLocation.CenterOwner;
             SetResourceReference(BackgroundProperty, "Bg");
             SetResourceReference(ForegroundProperty, "Text");
             FontSize = 12.5;
@@ -64,22 +58,6 @@ namespace WhaleLauncher
             _ready = true;
             RefreshPreview();
 
-            var buttons = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                Margin = new Thickness(0, 16, 0, 0),
-            };
-            var ok = new Button { Content = "确定", Style = (Style)FindResource("Primary"), MinWidth = 82, IsDefault = true };
-            var cancel = new Button { Content = "取消", Style = (Style)FindResource("Ghost"), MinWidth = 82, IsCancel = true, Margin = new Thickness(8, 0, 0, 0) };
-            ok.Click += (_, __) =>
-            {
-                SelectedColor = Current();
-                DialogResult = true;
-            };
-            buttons.Children.Add(ok);
-            buttons.Children.Add(cancel);
-            root.Children.Add(buttons);
         }
 
         private Color Current() => Color.FromRgb((byte)Math.Round(_r.Value), (byte)Math.Round(_g.Value), (byte)Math.Round(_b.Value));

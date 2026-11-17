@@ -104,10 +104,119 @@ test('启用的人设插件加入预设，禁用后消失且不影响内置预�
   const marker = path.join(plugins, 'gentle-chat.persona.json');
   assert.deepEqual(presets.list(config).map(x => x.id), ['standard']);
   fs.writeFileSync(marker, JSON.stringify({
-    id: 'standard', name: '温和聊天', version: '1.0.0', customPrompt: '温和自然', personaName: '不可覆盖'
+    id: 'standard', name: '温和聊天', version: '1.0.0', customPrompt: '温和自然', personaName: '小鱼'
   }));
   assert.deepEqual(presets.list(config).map(x => x.id), ['standard', 'market-gentle-chat']);
-  assert.deepEqual(presets.toPatch(presets.load(config, 'market-gentle-chat')), { customPrompt: '温和自然' });
+  assert.deepEqual(presets.toPatch(presets.load(config, 'market-gentle-chat')), { name: '小鱼', customPrompt: '温和自然' });
   fs.unlinkSync(marker);
   assert.equal(presets.load(config, 'market-gentle-chat'), null);
+});
+
+function userConfig(root, persona = {}, chat = {}) {
+  return {
+    paths: { root, dataDir: path.join(root, 'data') },
+    persona: {
+      name: '鲸鲸', age: 23, job: '自由职业', appearance: '外形', personality: '性格',
+      background: '背景', customPrompt: '', emojiLevel: '少', ...persona,
+    },
+    chat: {
+      privateMaxChars: 140, groupMaxChars: 70, historyTurns: 120,
+      groupHistoryTurns: 100, maxBubbles: 2, ...chat,
+    },
+  };
+}
+
+test('另存为自建预设：写进 data/personas，列表标成 user，导入还原身份与长度', () => {
+  const root = makeRoot();
+  const config = userConfig(root, { name: '小鱼', personality: '很凶', customPrompt: '完整人设' }, { privateMaxChars: 200 });
+  const saved = presets.saveUser(config, { name: '我的小鱼' });
+  assert.equal(saved.ok, true);
+  assert.match(saved.preset.id, /^user-[a-z0-9-]+$/);
+  const file = path.join(root, 'data', 'personas', saved.preset.id + '.json');
+  assert.ok(fs.existsSync(file), '预设文件要落在 data/personas');
+  const list = presets.list(config);
+  assert.equal(list[0].id, saved.preset.id, '自建预设排在最前面');
+  assert.equal(list[0].source, 'user');
+  const patch = presets.toPatch(presets.load(config, saved.preset.id));
+  assert.equal(patch.name, '小鱼');
+  assert.equal(patch.personality, '很凶');
+  assert.equal(patch.emoji, '少');
+  assert.equal(patch.privateMaxChars, 200);
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 6, retryDelay: 60 });
+});
+
+test('保存人设会回写来源的当前自建预设，并保留创建时间', () => {
+  const root = makeRoot();
+  const config = userConfig(root);
+  const saved = presets.saveUser(config, { name: '甲' });
+  const first = JSON.parse(fs.readFileSync(path.join(root, 'data', 'personas', saved.preset.id + '.json'), 'utf8'));
+  config.persona.personality = '改过的性格';
+  assert.equal(presets.updateFromConfig(config, saved.preset.id), true);
+  const next = JSON.parse(fs.readFileSync(path.join(root, 'data', 'personas', saved.preset.id + '.json'), 'utf8'));
+  assert.equal(next.personality, '改过的性格');
+  assert.equal(next.createdAt, first.createdAt);
+  assert.equal(presets.updateFromConfig(config, 'persona-standard'), false, '内置预设不回写');
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 6, retryDelay: 60 });
+});
+
+test('自建预设物理删除；正在使用的不许删', () => {
+  const root = makeRoot();
+  const config = userConfig(root);
+  const saved = presets.saveUser(config, { name: '乙' });
+  const file = path.join(root, 'data', 'personas', saved.preset.id + '.json');
+  assert.equal(presets.removePreset(config, saved.preset.id, { currentId: saved.preset.id }).ok, false);
+  assert.ok(fs.existsSync(file), '正在使用的预设不能被删掉');
+  assert.equal(presets.removePreset(config, saved.preset.id).ok, true);
+  assert.equal(fs.existsSync(file), false);
+  assert.equal(presets.load(config, saved.preset.id), null);
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 6, retryDelay: 60 });
+});
+
+test('内置预设只隐藏不删文件，市场预设重装后自动恢复', () => {
+  const root = makeRoot();
+  writePreset(root, 'persona-standard.json', { id: 'persona-standard', name: '标准', customPrompt: '正文' });
+  const pluginFile = path.join(root, 'data', 'plugins', 'gentle.persona.json');
+  fs.mkdirSync(path.dirname(pluginFile), { recursive: true });
+  fs.writeFileSync(pluginFile, JSON.stringify({ id: 'gentle', name: '温和', customPrompt: '市场正文' }));
+  const config = userConfig(root);
+  assert.deepEqual(presets.list(config).map((x) => x.id), ['persona-standard', 'market-gentle']);
+
+  assert.equal(presets.removePreset(config, 'persona-standard').ok, true);
+  assert.ok(fs.existsSync(path.join(root, 'assets', 'personas', 'persona-standard.json')), '内置文件不能删');
+  assert.deepEqual(presets.list(config).map((x) => x.id), ['market-gentle']);
+
+  assert.equal(presets.removePreset(config, 'market-gentle').ok, true);
+  assert.deepEqual(presets.list(config).map((x) => x.id), []);
+
+  // 插件卸载后重装：文件重建、内容也变了 → 隐藏标记自动失效
+  fs.writeFileSync(pluginFile, JSON.stringify({ id: 'gentle', name: '温和', customPrompt: '重装后的新正文' }));
+  assert.deepEqual(presets.list(config).map((x) => x.id), ['market-gentle']);
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 6, retryDelay: 60 });
+});
+
+test('预设 id / 标题不合法时拒绝保存，不允许用标题当路径', () => {
+  const root = makeRoot();
+  const config = userConfig(root);
+  assert.equal(presets.saveUser(config, { name: '   ' }).ok, false);
+  assert.equal(presets.saveUser(config, { id: '../evil', name: '坏' }).ok, false);
+  assert.equal(presets.removePreset(config, '../../config').ok, false);
+  assert.equal(presets.saveUser(config, { name: '正常'.repeat(30) }).ok, true, '标题会截到 40 字');
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 6, retryDelay: 60 });
+});
+
+test('自建预设可以只改标题；来源判断区分内置/市场/自建', () => {
+  const root = makeRoot();
+  writePreset(root, 'persona-standard.json', { id: 'persona-standard', name: '标准', customPrompt: '正文' });
+  const config = userConfig(root);
+  const saved = presets.saveUser(config, { name: '旧标题' });
+  const before = JSON.parse(fs.readFileSync(path.join(root, 'data', 'personas', saved.preset.id + '.json'), 'utf8'));
+  assert.equal(presets.sourceOf(config, 'persona-standard'), 'builtin');
+  assert.equal(presets.sourceOf(config, saved.preset.id), 'user');
+  assert.equal(presets.sourceOf(config, 'nope'), '');
+  assert.equal(presets.renamePreset(config, saved.preset.id, '新标题').ok, true);
+  const after = JSON.parse(fs.readFileSync(path.join(root, 'data', 'personas', saved.preset.id + '.json'), 'utf8'));
+  assert.equal(after.name, '新标题');
+  assert.equal(after.customPrompt, before.customPrompt, '改名不能动人设内容');
+  assert.equal(presets.renamePreset(config, 'persona-standard', '改名').ok, false, '内置不能改名');
+  fs.rmSync(root, { recursive: true, force: true, maxRetries: 6, retryDelay: 60 });
 });

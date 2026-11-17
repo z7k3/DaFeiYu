@@ -15,26 +15,43 @@ using System.Threading.Tasks;
 
 namespace WhaleLauncher
 {
+    internal sealed record PluginAppRange(
+        [property: System.Text.Json.Serialization.JsonPropertyName("appEpoch")] int AppEpoch,
+        [property: System.Text.Json.Serialization.JsonPropertyName("minAppVersion")] string MinAppVersion,
+        [property: System.Text.Json.Serialization.JsonPropertyName("maxAppVersion")] string MaxAppVersion = null);
+
     internal sealed record PluginInfo(string Id, string Name, string Author, string Version, string MinAppVersion,
         string Description, string ResultLabel, int Api, string Download = null, string Sha256 = null, string Kind = "tool",
         string MaxAppVersion = null, int DiscussionIssue = 0, string HostAction = null,
         string[] Hooks = null, string[] Permissions = null, string Signature = null,
-        int ExecutionTimeoutMs = 30000, int IntervalSeconds = 60)
+        int ExecutionTimeoutMs = 30000, int IntervalSeconds = 60,
+        [property: System.Text.Json.Serialization.JsonPropertyName("appEpoch")] int AppEpoch = 0,
+        [property: System.Text.Json.Serialization.JsonPropertyName("appCompatibility")] PluginAppRange[] AppCompatibility = null)
     {
         internal bool IsPersona => Kind == "persona";
         internal bool IsMessage => Api == 3 && Kind == "message";
         internal bool IsJavaScript => Api == 4 && Kind is "message" or "tool";
         internal bool IsFlow => IsMessage || IsJavaScript;
-        internal string CompatibilityLabel => string.IsNullOrEmpty(MaxAppVersion)
-            ? $"鲸鲸 {MinAppVersion} 及以上" : $"鲸鲸 {MinAppVersion} – {MaxAppVersion}";
+        internal int EffectiveAppEpoch => AppEpoch == 0 ? 1 : AppEpoch;
+        internal PluginAppRange[] AppRanges => AppCompatibility
+            ?? [new(EffectiveAppEpoch, MinAppVersion, MaxAppVersion)];
+        internal string CompatibilityLabel => string.Join("；", AppRanges.Select(range =>
+            (range.AppEpoch == 2 ? "正式版 · " : "旧版 · ")
+            + (string.IsNullOrEmpty(range.MaxAppVersion)
+                ? $"鲸鲸 {range.MinAppVersion} 及以上" : $"鲸鲸 {range.MinAppVersion} – {range.MaxAppVersion}")));
     }
     internal sealed record PluginFeedback(int Comments, int Favorites);
-    internal sealed record PluginPackage(PluginInfo Info, byte[] Module, string Prompt = null);
+    internal sealed record PluginPackage(PluginInfo Info, byte[] Module, string Prompt = null, string Persona = null);
 
     internal sealed class PluginMarket
     {
         internal const string CatalogUrl = "https://raw.githubusercontent.com/Banan1cee/whale-girl-plugins/main/index.json";
         internal const string DigestAction = "chat.summary";
+
+        // 市场签名暂时隐藏：验签代码、内置公钥和签名工具都保留，恢复时把这里改成 true 即可。
+        // 关闭时目录不再拉取 .sig、条目里的 Signature 只解析不校验，卡片也不显示签名状态，
+        // 避免用户以为包已经验过；SHA-256、下载域名白名单和包内清单一致性照常检查。
+        internal static readonly bool MarketSignatureEnabled = false;
         private const string CatalogV2Url = "https://raw.githubusercontent.com/Banan1cee/whale-girl-plugins/main/index-v2.json";
         private const string CatalogV3Url = "https://raw.githubusercontent.com/Banan1cee/whale-girl-plugins/main/index-v3.json";
         private const string CatalogV4Url = "https://raw.githubusercontent.com/Banan1cee/whale-girl-plugins/main/index-v4.json";
@@ -127,9 +144,24 @@ namespace WhaleLauncher
         internal static bool SameAuthor(string left, string right) =>
             string.Equals((left ?? "").Trim(), (right ?? "").Trim(), StringComparison.OrdinalIgnoreCase);
 
-        internal static bool Compatible(PluginInfo info, string version) =>
-            Version.TryParse(version, out var app) && Version.TryParse(info.MinAppVersion, out var min) && app >= min
-            && (string.IsNullOrEmpty(info.MaxAppVersion) || (Version.TryParse(info.MaxAppVersion, out var max) && app <= max));
+        internal static bool Compatible(PluginInfo info, string version, int appEpoch = 1) =>
+            info != null && ValidAppRanges(info)
+            && Version.TryParse(version, out var app)
+            && info.AppRanges.Any(range => range.AppEpoch == (appEpoch == 0 ? 1 : appEpoch)
+                && Version.TryParse(range.MinAppVersion, out var min) && app >= min
+                && (string.IsNullOrEmpty(range.MaxAppVersion) || (Version.TryParse(range.MaxAppVersion, out var max) && app <= max)));
+
+        private static bool ValidAppRanges(PluginInfo info) =>
+            info.AppEpoch is >= 0 and <= 2
+            && info.AppRanges is { Length: > 0 and <= 2 } ranges
+            && ranges.All(range => range != null && range.AppEpoch is 1 or 2
+                && Version.TryParse(range.MinAppVersion, out var min)
+                && min >= (range.AppEpoch == 2 ? new Version(1, 0, 0)
+                    : info.IsJavaScript ? new Version(4, 1, 2)
+                    : info.IsMessage ? new Version(4, 1, 0) : new Version(0, 0))
+                && (string.IsNullOrEmpty(range.MaxAppVersion)
+                    || Version.TryParse(range.MaxAppVersion, out var max) && max >= min))
+            && ranges.Select(range => range.AppEpoch).Distinct().Count() == ranges.Length;
 
         private static bool Valid(PluginInfo info) => info != null && ValidId(info.Id) && (info.Api == 1 && info.HostAction == null
                 || info.Api == 2 && info.Kind == "tool" && info.HostAction is null or DigestAction
@@ -144,8 +176,11 @@ namespace WhaleLauncher
                     && info.ExecutionTimeoutMs is >= 100 and <= 120000
                     && info.IntervalSeconds is >= 1 and <= 86400)
             && Version.TryParse(info.Version, out _) && Version.TryParse(info.MinAppVersion, out var min)
-            && (!info.IsMessage || min >= new Version(4, 1, 0))
-            && (!info.IsJavaScript || min >= new Version(4, 1, 2))
+            && info.AppEpoch is >= 0 and <= 2
+            && ValidAppRanges(info)
+            && (info.EffectiveAppEpoch != 2 || min >= new Version(1, 0, 0))
+            && (!info.IsMessage || info.EffectiveAppEpoch == 2 || min >= new Version(4, 1, 0))
+            && (!info.IsJavaScript || info.EffectiveAppEpoch == 2 || min >= new Version(4, 1, 2))
             && (string.IsNullOrEmpty(info.MaxAppVersion) || (Version.TryParse(info.MaxAppVersion, out var max) && max >= min))
             && info.DiscussionIssue >= 0
             && info.Name?.Trim().Length is > 0 and <= 80
@@ -181,13 +216,10 @@ namespace WhaleLauncher
             {
                 using var preset = (zip.GetEntry("persona.json") ??
                     throw new InvalidDataException("人设包需要 persona.json")).Open();
-                using var json = JsonDocument.Parse(ReadLimited(preset, 64 * 1024));
+                using var json = JsonDocument.Parse(ReadLimited(preset, 192 * 1024));
                 var data = json.RootElement;
-                if (data.ValueKind != JsonValueKind.Object ||
-                    !data.TryGetProperty("customPrompt", out var value) || value.ValueKind != JsonValueKind.String ||
-                    value.GetString()?.Trim().Length is not (> 0 and <= 24000))
-                    throw new InvalidDataException("人设正文须填写在 customPrompt，最多 24000 字符");
-                return new PluginPackage(info, null, value.GetString().Trim());
+                var document = PersonaPackage.Read(data);
+                return new PluginPackage(info, null, (string)document["customPrompt"], JsonSerializer.Serialize(document));
             }
             using var code = (zip.GetEntry("plugin.wasm") ??
                 throw new InvalidDataException("工具包需要 plugin.wasm")).Open();
@@ -312,6 +344,7 @@ namespace WhaleLauncher
             string expectedKind = null)
         {
             var bytes = await DownloadAsync(url, 256 * 1024);
+            if (!MarketSignatureEnabled) return ParseCatalog(bytes, expectedApi, expectedKind);
             string signature = null;
             try
             {
@@ -415,15 +448,16 @@ namespace WhaleLauncher
                 return;
             }
             var package = ReadPackage(ReadFile(FileFor(id, ".zip")));
-            if (package.Info.Id != id || !Compatible(package.Info, UpdateManifestService.LocalVersion(_baseDir)))
+            if (package.Info.Id != id || !Compatible(package.Info, UpdateManifestService.LocalVersion(_baseDir), UpdateManifestService.LocalEpoch(_baseDir)))
                 throw new InvalidDataException("插件标识或兼容版本无效");
             if (package.Info.IsPersona)
             {
-                WriteAtomically(preset, JsonSerializer.SerializeToUtf8Bytes(new
-                {
-                    name = package.Info.Name, description = package.Info.Description,
-                    version = package.Info.Version, customPrompt = package.Prompt
-                }));
+                using var json = JsonDocument.Parse(package.Persona);
+                var document = PersonaPackage.Read(json.RootElement);
+                document["name"] = package.Info.Name;
+                document["description"] = package.Info.Description;
+                document["version"] = package.Info.Version;
+                WriteAtomically(preset, JsonSerializer.SerializeToUtf8Bytes(document));
             }
             else if (package.Info.IsFlow)
             {
@@ -464,8 +498,8 @@ namespace WhaleLauncher
         internal async Task InstallAsync(PluginInfo listing)
         {
             var bytes = await DownloadAsync(listing.Download, PackageLimit);
-            // 签名可选：条目里带了 Signature 就必须验过；没带就只靠 SHA-256 + 下载域名白名单。
-            if (!string.IsNullOrWhiteSpace(listing.Signature) && !PluginTrust.Verify(bytes, listing.Signature))
+            // 签名暂时隐藏：恢复 MarketSignatureEnabled 后，条目里带了 Signature 就必须验过。
+            if (MarketSignatureEnabled && !string.IsNullOrWhiteSpace(listing.Signature) && !PluginTrust.Verify(bytes, listing.Signature))
                 throw new InvalidDataException("插件包签名无效，已拒绝安装");
             if (!Convert.ToHexString(SHA256.HashData(bytes)).Equals(listing.Sha256, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("插件包校验失败");
@@ -487,8 +521,8 @@ namespace WhaleLauncher
 
         private bool Install(byte[] bytes, PluginInfo info, Func<PluginInfo, PluginInfo, bool> confirm = null)
         {
-            if (!Compatible(info, UpdateManifestService.LocalVersion(_baseDir)))
-                throw new InvalidDataException("这个插件需要更新的鲸鲸版本");
+            if (!Compatible(info, UpdateManifestService.LocalVersion(_baseDir), UpdateManifestService.LocalEpoch(_baseDir)))
+                throw new InvalidDataException("插件适用的鲸鲸版本体系或版本范围与当前客户端不兼容");
             var target = FileFor(info.Id, ".zip");
             PluginInfo current = null;
             if (Directory.Exists(_root)) EnsureRoot();
@@ -602,7 +636,7 @@ namespace WhaleLauncher
             EnsureRoot();
             if (!Enabled(id)) throw new InvalidOperationException("请先启用插件");
             var package = ReadPackage(ReadFile(FileFor(id, ".zip")));
-            if (package.Info.IsPersona || package.Info.IsFlow || package.Info.Id != id || !Compatible(package.Info, UpdateManifestService.LocalVersion(_baseDir)))
+            if (package.Info.IsPersona || package.Info.IsFlow || package.Info.Id != id || !Compatible(package.Info, UpdateManifestService.LocalVersion(_baseDir), UpdateManifestService.LocalEpoch(_baseDir)))
                 throw new InvalidDataException("插件类型、标识或兼容版本无效");
             if (package.Info.HostAction != authorizedAction)
                 throw new InvalidOperationException("此插件需要确认宿主权限");

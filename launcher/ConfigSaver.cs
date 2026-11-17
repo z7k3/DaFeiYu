@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -22,12 +23,38 @@ namespace WhaleLauncher
             _sup = sup;
         }
 
-        public async Task<ApiResult> SaveAsync(Func<IDictionary<string, object>> build)
+        public async Task FlushAsync()
+        {
+            await _gate.WaitAsync();
+            _gate.Release();
+        }
+
+        public Task<ApiResult> SaveAsync(Func<IDictionary<string, object>> build)
+            => RunAsync(() => _sup.PatchConfigurationAsync(build()));
+
+        public Task<ApiResult> SaveSettingsAsync(Func<object> build)
+            => RunAsync(() => _sup.SaveConfigurationAsync("/api/settings", build()));
+
+        /// <summary>显式清除密钥；普通 patch 的空值语义是「不改」，清 Key 必须走这个入口。</summary>
+        public Task<ApiResult> ClearSecretsAsync(IEnumerable<string> paths)
+            => RunAsync(() => _sup.SaveConfigurationAsync("/api/config/clear-secrets",
+                new { paths = (paths ?? Enumerable.Empty<string>()).ToArray() }));
+
+        public Task<ApiResult> SaveSecretAsync(string path, Func<string> build)
+            => RunAsync(() =>
+            {
+                var value = build();
+                // 排队期间输入框可能已被清空；沿用「留空表示不改」，不能发送空patch清密钥。
+                return value.Length == 0 ? Task.FromResult(new ApiResult { Ok = true })
+                    : _sup.PatchConfigurationAsync(new Dictionary<string, object> { [path] = value });
+            });
+
+        private async Task<ApiResult> RunAsync(Func<Task<ApiResult>> save)
         {
             await _gate.WaitAsync();
             try
             {
-                return await _sup.PatchConfigurationAsync(build());
+                return await save();
             }
             catch (Exception ex)
             {

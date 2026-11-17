@@ -29,6 +29,63 @@ optionalBridge.Latest = "4.1.2";
 Check(UpdateManifestService.ReleaseWarning(optionalBridge) == "", "下一版不继承上一版专用警告");
 Check(UpdateManifestService.ReleaseWarning(new UpdateManifest { Latest = "4.1.1", UpdateWarning = "旧警告" }) == "", "未绑定版本的警告不显示");
 Check(UpdateManifestService.ReleaseWarning(null) == "", "无清单时没有警告");
-Check(UpdateManifestService.Decide("4.0.8", hotfix, now) == UpdatePolicy.Force, "紧急热修只强制上一个发布版本");
+Check(UpdateManifestService.Decide("4.0.8", hotfix, now) == UpdatePolicy.Force, "旧协议下界内的落后版本要求更新");
 Check(UpdateManifestService.Decide("4.0.7", hotfix, now) == UpdatePolicy.Warn, "更老版本不被热修强制");
 Check(UpdateManifestService.Decide("4.0.8.1", hotfix, now) == UpdatePolicy.Ok, "已是最新版本不再强制");
+var dual = (UpdateManifest)parse.Invoke(null, new object[] { "{\"latest\":\"4.1.6.1\",\"epoch\":2,\"brand_latest\":\"1.0.0\",\"target\":\"1.0.0\",\"force\":false}" });
+Check(UpdateManifestService.HasUpdate("4.1.6", 0, dual), "旧轨道继续使用 latest");
+Check(UpdateManifestService.Resolve("4.1.6", 0, dual).Latest == "4.1.6.1", "旧客户端忽略新字段");
+Check(UpdateManifestService.HasUpdate("4.1.6.1", 1, dual), "跨代允许数字版本降低");
+Check(UpdateManifestService.Resolve("4.1.6.1", 1, dual).Latest == "1.0.0", "跨代展示与下载选择正式版");
+Check(!UpdateManifestService.HasUpdate("1.0.0", 2, dual), "同代正式版不被旧 latest 拉回");
+Check(UpdateManifestService.HasUpdate("0.9.0", 2, dual), "同代比较正式版本");
+Check(!UpdateManifestService.HasUpdate("1.0.1", 2, dual), "同代不降级");
+Check(!UpdateManifestService.HasUpdate("1.0.0", 3, dual), "拒绝旧代清单");
+Check(dual.Latest == "4.1.6.1", "选择轨道不污染原始缓存");
+Check(!UpdateManifestService.HasUpdate("1.0.0", 2, hotfix), "正式版拒绝不带代次的旧缓存");
+dual.Target = "1.0.1";
+Check(!UpdateManifestService.HasUpdate("4.1.6.1", 1, dual), "目标与展示版本冲突时不安装");
+
+UpdateManifest ReadManifest(string json) => (UpdateManifest)parse.Invoke(null, new object[] { json });
+var exact = ReadManifest("{\"latest\":\"4.1.8\",\"force\":true,\"force_from\":\"4.1.6\",\"force_versions\":[\"4.1.6\"]}");
+Check(UpdateManifestService.Decide("4.1.7", exact, now) == UpdatePolicy.Warn, "4.1.8 继承旧 force 时，不会再次强制已修复的 4.1.7");
+Check(UpdateManifestService.Decide("4.1.6", exact, now) == UpdatePolicy.Force, "精确名单仍要求问题版本更新");
+Check(UpdateManifestService.Decide("4.1.6.1", exact, now) == UpdatePolicy.Warn, "预留迁移版本不被三段版本名单误伤");
+Check(UpdateManifestService.Decide("4.1.5", exact, now) == UpdatePolicy.Warn, "未列入名单的更早版本只提示");
+Check(UpdateManifestService.Decide("4.1.8", exact, now) == UpdatePolicy.Ok, "已是最新版本正常运行");
+Check(UpdateManifestService.Decide("4.1.6.0", exact, now) == UpdatePolicy.Force, "三段版本与补零后的四段版本相同");
+exact.Force = false;
+Check(UpdateManifestService.Decide("4.1.6", exact, now) == UpdatePolicy.Force, "新名单不依赖旧 force=true");
+exact.ForceFrom = "4.1.7";
+Check(UpdateManifestService.Decide("4.1.6", exact, now) == UpdatePolicy.Force, "新名单不受旧 force_from 过滤");
+
+foreach (var value in new[] { "[]", "null", "true", "\"4.1.6\"", "[\"bad\"]", "[\"4.1.6\",null]", "[\"4.1.6\",\"4.1\"]", "[\"4.1.6\",\"4.2147483648.0\"]" })
+{
+    var safe = ReadManifest("{\"latest\":\"4.1.8\",\"force\":true,\"force_from\":\"4.1.6\",\"force_versions\":" + value + "}");
+    Check(UpdateManifestService.Decide("4.1.6", safe, now) == UpdatePolicy.Warn, "空名单或非法新规则不回落旧强制：" + value);
+}
+var noTimer = ReadManifest("{\"latest\":\"4.1.8\",\"released_at\":\"2020-01-01T00:00:00Z\",\"force_after_hours\":0,\"force_versions\":[]}");
+Check(UpdateManifestService.Decide("4.1.7", noTimer, now) == UpdatePolicy.Warn, "空名单不回落旧时间闸");
+var legacy = ReadManifest("{\"latest\":\"4.1.8\",\"force\":true,\"force_from\":\"4.1.6\"}");
+Check(UpdateManifestService.Decide("4.1.7", legacy, now) == UpdatePolicy.Force, "字段缺失时兼容旧协议");
+var discrete = ReadManifest("{\"latest\":\"4.1.8\",\"force_versions\":[\"v4.1.2\",\"4.1.6\"]}");
+Check(UpdateManifestService.Decide("4.1.2", discrete, now) == UpdatePolicy.Force, "支持多个离散版本及 v 前缀");
+Check(UpdateManifestService.Decide("4.1.5", discrete, now) == UpdatePolicy.Warn, "离散名单中间的版本不强制");
+var safetyFloor = ReadManifest("{\"latest\":\"4.1.8\",\"kill_below\":\"4.1.7\",\"force_versions\":[]}");
+Check(UpdateManifestService.Decide("4.1.6", safetyFloor, now) == UpdatePolicy.Kill, "明确的熔断线仍独立于精确更新名单");
+
+var serialize = typeof(UpdateManifestService).GetMethod("SerializeCache", BindingFlags.Static | BindingFlags.NonPublic);
+UpdateManifest Cached(UpdateManifest value) => ReadManifest((string)serialize.Invoke(null, new object[] { value }));
+Check(UpdateManifestService.Decide("4.1.7", Cached(exact), now) == UpdatePolicy.Warn, "缓存保留精确规则，未命中不回落旧强制");
+Check(UpdateManifestService.Decide("4.1.6", Cached(exact), now) == UpdatePolicy.Force, "离线缓存保留命中规则");
+Check(UpdateManifestService.Decide("4.1.7", Cached(legacy), now) == UpdatePolicy.Force, "缓存保留字段缺失，不擅自改成空名单");
+Check(UpdateManifestService.Decide("4.1.7", Cached(noTimer), now) == UpdatePolicy.Warn, "缓存保留显式空名单");
+var newGeneration = ReadManifest("{\"latest\":\"4.1.7\",\"epoch\":2,\"brand_latest\":\"1.0.0\",\"target\":\"1.0.0\",\"force\":true,\"force_versions\":[\"0.0.0\",\"4.1.7\"]}");
+Check(UpdateManifestService.Decide("0.0.0", UpdateManifestService.Resolve("4.1.7", 1, newGeneration), now) == UpdatePolicy.Warn, "同代名单不跨代套用，也不恢复旧布尔强制");
+Check(newGeneration.ForceVersions.Length == 2 && newGeneration.Latest == "4.1.7", "轨道解析不污染原始清单或名单");
+var choose = typeof(UpdateManifestService).GetMethod("SelectNewest", BindingFlags.Static | BindingFlags.NonPublic);
+var cachedPolicy = ReadManifest("{\"latest\":\"4.1.8\",\"manifest_version\":20,\"force_versions\":[]}");
+var stalePolicy = ReadManifest("{\"latest\":\"4.1.8\",\"manifest_version\":19,\"force\":true}");
+Check(ReferenceEquals(choose.Invoke(null, new object[] { new[] { stalePolicy }, cachedPolicy }), cachedPolicy), "旧在线清单不能覆盖新名单缓存而重新强制正常版本");
+stalePolicy.ManifestVersion = 21;
+Check(ReferenceEquals(choose.Invoke(null, new object[] { new[] { stalePolicy }, cachedPolicy }), stalePolicy), "更高序号在线策略仍可更新缓存");

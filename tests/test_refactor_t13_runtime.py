@@ -146,9 +146,10 @@ class ConfigSnapshotTests(unittest.TestCase):
         scope = dict(self.parser.runtime_snapshot(config)['values'])
         scope.update(bridge_config=self.parser, BASE_SYSTEM_SENDERS={'fixture-system'},
             CONFIG_SNAPSHOT=self.parser.runtime_snapshot(config), CURRENT_CONFIG=config,
-            _resolve_voice_key=Mock(return_value='fixture-key'), set_system_senders=Mock(),
+            resolve_voice_config=Mock(side_effect=load_pure_module('voice').resolve_voice_config), set_system_senders=Mock(),
             bridge_log=SimpleNamespace(set_level=Mock()), ROOT='fixture-root',
             log=Mock(), restart_for_config_change=Mock())
+        load_function('bridge/engine.py', 'voice_runtime', scope)
         load_function('bridge/engine.py', '_publish_runtime_config', scope)
         load_function('bridge/engine.py', 'reload_config', scope)
         return scope
@@ -171,7 +172,7 @@ class ConfigSnapshotTests(unittest.TestCase):
         scope = self.scope(before)
         self.assertTrue(scope['reload_config'](config={}))
         self.assertEqual(scope['STALE_AFTER'], 120)
-        self.assertEqual(scope['VOICE_MODEL'], 'qwen3-asr-flash')
+        self.assertEqual(scope['VOICE_MODEL'], '')
         self.assertTrue(scope['VOICE_ENABLED'])
         self.assertEqual(scope['MASTER_WXID'], '')
 
@@ -181,7 +182,7 @@ class ConfigSnapshotTests(unittest.TestCase):
         self.assertFalse(scope['reload_config'](config={'wechat': 'fixture-invalid-section'}))
         self.assertIs(scope['CURRENT_CONFIG'], before)
         self.assertTrue(scope['QUOTE_REPLY'])
-        scope['_resolve_voice_key'].assert_not_called()
+        scope['resolve_voice_config'].assert_not_called()
 
     def test_worker_environment_override_is_preserved_on_reload(self):
         with patch.dict('os.environ', {'WHALE_PIPELINE_WORKERS': '3'}):
@@ -265,15 +266,14 @@ class DefaultSafetyTests(unittest.TestCase):
         runtime = SimpleNamespace(
             snapshot_win_state=Mock(side_effect=lambda: events.append('snapshot') or snapshot),
             restore_win_state=Mock(side_effect=lambda value: events.append('restore')))
-        # 本地 fork：with_window_on_top 的还原收口到 quiet_restore()（前后台共用），
-        # 真实实现最终调 restore_win_state——桩按同一链条委托，断言盯的还是最终还原。
-        runtime.quiet_restore = Mock(side_effect=lambda value: runtime.restore_win_state(value))
 
         def foreground(fn, **kwargs):
             events.append('foreground')
             return fn()
 
         runtime.force_send_foreground = Mock(side_effect=foreground)
+        # fork：quiet_restore 委托到 restore_win_state（真实链条，断言盯最终还原）
+        runtime.quiet_restore = Mock(side_effect=lambda value: runtime.restore_win_state(value))
         g = SimpleNamespace(BACKGROUND_SEND=scope['BACKGROUND_SEND'], STICKER_TEST_ON=False,
                             ChatIdentityError=self.identity_error, log=Mock())
         call = load_function('bridge/window_mixin.py', 'with_window_on_top', {'G': g})
@@ -327,23 +327,17 @@ class DefaultSafetyTests(unittest.TestCase):
     def assert_quote_path(self, scope, requested=True, allowed=True):
         runtime, window, events, snapshot = self.window(scope)
         runtime.__dict__.update(
-            dead_chats=set(), group_is_alive=Mock(return_value=True), is_self_chat=Mock(return_value=False),
+            dead_chats=set(), dead_chat_until={}, chat_paused=Mock(return_value=False),
+            group_is_alive=Mock(return_value=True), is_self_chat=Mock(return_value=False),
             ui_chat_name=Mock(return_value='fixture-chat'), account_send_allowed=Mock(return_value=allowed),
             send_lock=nullcontext(), gui_lock=nullcontext(), send_policy_allows=Mock(return_value=True),
             sticker_quarantine_allows=Mock(return_value=True), fail_streak={}, bg_send=Mock(return_value=False),
-            # 本地 fork：dead_chats 改 dict+TTL 后，send_text 读写收口到 chat_dead()/_mark_send_ok()
-            chat_dead=Mock(return_value=False), _mark_send_ok=Mock(),
-            # 本地 fork：发送统计/窗口快照还原/驱动重建等 send_text 途经的附属设施
-            BG_STATS={}, ACCOUNT={'verified': True}, open_chat_fail=Mock(),
-            snapshot_win_state=Mock(return_value=None), quiet_restore=Mock(),
-            new_window_driver=Mock(return_value=None),
             gui=SimpleNamespace(quote_msg=Mock(return_value=True), _get_uia=Mock(return_value=object())),
             bind_gui_window=Mock(), uia_send=Mock(return_value=True), with_window_on_top=window)
         g = SimpleNamespace(QUOTE_REPLY=scope['QUOTE_REPLY'], STICKER_TEST_ON=False,
             BG_SEND=scope['BG_SEND'], SEND_STATE={}, _SendStateScope=lambda _: nullcontext(),
-            time=SimpleNamespace(time=lambda: 10000), log=Mock(), log_error=Mock(), log_throttled=Mock(),
-            # 本地 fork：发送临界区的看门狗进度心跳（SEND_STATE.touch 由它驱动）
-            touch=Mock(), safe_id=lambda _: 'fixture-id', ensure_budget=Mock(return_value=True),
+            time=SimpleNamespace(time=lambda: 10000, sleep=lambda *_: None), log=Mock(), log_error=Mock(), log_throttled=Mock(),
+            quiet_restore=None,
             safe_name=lambda _: 'fixture-chat', ChatIdentityError=self.identity_error,
             DraftDirtyError=type('FixtureDraftError', (Exception,), {}))
         send = load_function('bridge/sender_mixin.py', 'send_text', {'G': g})

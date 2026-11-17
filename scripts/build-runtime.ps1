@@ -33,7 +33,7 @@ param(
     'uiautomation==2.0.29', 'comtypes==1.4.17',
     'colorama==0.4.6', 'Pillow==13.0.0', 'pyperclip==1.11.0',
     'cryptography==50.0.2', 'winsdk==1.0.0b10', 'imageio-ffmpeg==0.8.1',
-    'zstandard==0.25.0', 'opencv-python==5.0.0.93', 'pyautogui==0.9.54'),
+    'zstandard==0.25.0', 'opencv-python==5.0.0.93', 'pyautogui==0.9.54', 'silk-python==0.2.9'),
   [string]$Mirror = 'https://pypi.tuna.tsinghua.edu.cn/simple',
   [switch]$Force,
   [switch]$SkipNode
@@ -118,7 +118,7 @@ $marker = Join-Path $runtime '.built'
 if ((Test-Path $marker) -and (Test-Path $pythonExe) -and (Test-Path (Join-Path $runtime 'node.exe')) -and
     ((Get-Content $marker -Raw -ErrorAction SilentlyContinue).Trim() -eq $stamp)) {
   Info '运行环境已就绪（命中缓存），跳过构建'
-  & $pythonExe -c "import wechatauto, psutil, win32com, uiautomation; print('imports ok')" 2>&1 | Select-Object -Last 2
+  & $pythonExe -c "import wechatauto, psutil, win32com, uiautomation, pysilk; print('imports ok')" 2>&1 | Select-Object -Last 2
   if ($LASTEXITCODE -eq 0) { exit 0 }
   Info '缓存里的依赖不完整，回退到完整构建'
 }
@@ -279,7 +279,7 @@ if (-not $post) {
 
 # ---------------------------------------------------------------- 6. 自检 + manifest
 Step '6/6 自检与 manifest'
-$check = & $pythonExe -c "import wechatauto, psutil, win32com, uiautomation, comtypes; print('imports ok, wechatauto ' + str(getattr(wechatauto, '__version__', '')))" 2>&1
+$check = & $pythonExe -c "import wechatauto, psutil, win32com, uiautomation, comtypes, pysilk; print('imports ok, wechatauto ' + str(getattr(wechatauto, '__version__', '')))" 2>&1
 if ($LASTEXITCODE -ne 0) { $check | Select-Object -Last 6; Fail '依赖导入失败' }
 Info $check
 

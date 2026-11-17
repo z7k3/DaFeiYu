@@ -185,7 +185,7 @@ namespace WhaleLauncher.Views
             var items = new (string Label, string Path)[]
             {
                 ("数据", _sup.DataDir),
-                ("配置", Path.Combine(_sup.BaseDir, "config.json")),
+                ("配置", ConfigurationPath.Resolve(_sup.BaseDir)),
                 ("启动器日志", Path.Combine(_sup.DataDir, "launcher.log")),
                 // 内核和桥接自己写的全量日志（debug），出问题时先看这两个
                 ("内核日志", Path.Combine(_sup.DataDir, "whale.log")),
@@ -499,7 +499,7 @@ namespace WhaleLauncher.Views
 
             // 先收集日志和配置（info.txt 里要写「哪些文件读失败了」，所以得排在 info.txt 之前）
             var logs = CollectLogs(skipped);
-            var config = RedactedJson(Path.Combine(_sup.BaseDir, "config.json"), skipped);
+            var config = RedactedJson(ConfigurationPath.Resolve(_sup.BaseDir), skipped);
             var settingsRedacted = RedactedJson(Path.Combine(_sup.DataDir, "settings.json"), skipped);
             // 原文和第三方库日志可能含聊天正文，只有用户明确勾选才打包。
             var waFiles = includeRaw ? WechatAutoLogs() : new List<string>();
@@ -1123,7 +1123,7 @@ namespace WhaleLauncher.Views
             var fileLevel = "";
             try
             {
-                var file = Path.Combine(_sup.BaseDir, "config.json");
+                var file = ConfigurationPath.Resolve(_sup.BaseDir);
                 if (!File.Exists(file)) return (level, fileLevel);
                 using var doc = JsonDocument.Parse(File.ReadAllText(file));
                 if (doc.RootElement.TryGetProperty("log", out var log) && log.ValueKind == JsonValueKind.Object)
@@ -1156,7 +1156,7 @@ namespace WhaleLauncher.Views
                     model = JsonStr(sroot, "model");
                     vision = JsonStr(sroot, "visionModel");
                 }
-                var file = Path.Combine(_sup.BaseDir, "config.json");
+                var file = ConfigurationPath.Resolve(_sup.BaseDir);
                 if (!File.Exists(file))
                 {
                     if (vision.Length == 0) vision = "glm-4.6v-flash";
@@ -1254,21 +1254,15 @@ namespace WhaleLauncher.Views
 
         private async void OnBackupMemory(object sender, RoutedEventArgs e)
         {
-            var dlg = new SaveFileDialog
-            {
-                Title = "备份记忆",
-                FileName = "whale-memory-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".json",
-                Filter = "鲸鲸记忆 (*.json)|*.json",
-                InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
-            };
-            if (dlg.ShowDialog() != true) return;
+            var file = AppFilePicker.Save("备份记忆", ".json", "whale-memory-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".json");
+            if (file == null) return;
 
             MaintenanceHint.Text = "正在导出记忆…";
-            var (code, output) = await RunToolAsync(NodeExe(), "\"scripts/memory-tool.js\" export \"" + dlg.FileName + "\"");
+            var (code, output) = await RunToolAsync(NodeExe(), "\"scripts/memory-tool.js\" export \"" + file + "\"");
             if (code == 0)
             {
-                MaintenanceHint.Text = "已备份到 " + dlg.FileName;
-                AppDialog.Show(Window.GetWindow(this), "已备份到：\n" + dlg.FileName + "\n\n默认不含 API Key；要连 Key 一起带走请用命令行加 --secrets。",
+                MaintenanceHint.Text = "已备份到 " + file;
+                AppDialog.Show(Window.GetWindow(this), "已备份到：\n" + file + "\n\n默认不含 API Key；要连 Key 一起带走请用命令行加 --secrets。",
                     "备份记忆");
             }
             else
@@ -1313,15 +1307,7 @@ namespace WhaleLauncher.Views
             var snaps = await LoadSnapshotsAsync();
             MaintenanceHint.Text = snaps.Count == 0 ? "还没有自动快照，可以选外部备份文件恢复。" : "";
 
-            var win = new Window
-            {
-                Title = "恢复记忆",
-                Width = 640,
-                Height = 440,
-                Owner = Window.GetWindow(this),
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            };
-            var grid = new Grid { Margin = new Thickness(14) };
+            var grid = new Grid { Margin = new Thickness(14), Height = 340 };
             grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
             grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -1339,27 +1325,17 @@ namespace WhaleLauncher.Views
 
             var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 10, 0, 0) };
             var pick = new Button { Content = "从文件恢复…", Padding = new Thickness(12, 4, 12, 4) };
-            var go = new Button { Content = "恢复选中", Padding = new Thickness(12, 4, 12, 4), Margin = new Thickness(8, 0, 0, 0), IsEnabled = snaps.Count > 0 };
-            var cancel = new Button { Content = "取消", Padding = new Thickness(12, 4, 12, 4), Margin = new Thickness(8, 0, 0, 0) };
             buttons.Children.Add(pick);
-            buttons.Children.Add(go);
-            buttons.Children.Add(cancel);
             Grid.SetRow(buttons, 2);
             grid.Children.Add(buttons);
-            win.Content = grid;
-
             string chosen = null;
-            cancel.Click += (s, _) => win.Close();
             pick.Click += (s, _) =>
             {
-                var dlg = new OpenFileDialog { Title = "选择记忆备份", Filter = "鲸鲸记忆 (*.json)|*.json" };
-                if (dlg.ShowDialog() == true) { chosen = dlg.FileName; win.Close(); }
+                var file = AppFilePicker.Open("选择记忆备份", ".json");
+                if (file != null) { chosen = file; pick.Content = "已选择：" + Path.GetFileName(file); listBox.SelectedItem = null; }
             };
-            go.Click += (s, _) =>
-            {
-                if (listBox.SelectedItem is SnapItem item) { chosen = item.File; win.Close(); }
-            };
-            win.ShowDialog();
+            listBox.SelectionChanged += (s, _) => { if (listBox.SelectedItem is SnapItem item) { chosen = item.File; pick.Content = "从文件恢复…"; } };
+            if (!AppDialog.ShowContent("恢复记忆", grid, 640, "继续", "取消")) return;
 
             if (string.IsNullOrEmpty(chosen)) return;
 

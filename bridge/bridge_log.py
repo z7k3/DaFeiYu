@@ -130,7 +130,7 @@ def configure(log_file=None, boot_log=None, level=None):
     if log_file:
         LOG_FILE = log_file
         data = os.path.dirname(os.path.abspath(log_file))
-        _secret_files[:] = [os.path.join(os.path.dirname(data), 'config.json'), os.path.join(data, 'settings.json')]
+        _secret_files[:] = [os.path.join(os.path.dirname(data), 'config.json'), os.path.join(data, 'config.json'), os.path.join(data, 'settings.json')]
     if boot_log:
         BOOT_LOG = boot_log
     set_level(level)

@@ -295,6 +295,9 @@ class AccountMixin:
         if not selected:
             self.ensure_uia_ready()
         probe = WeChatUIA()
+        if self.foreground_is_moments():
+            # 切换朋友圈不代表账号失效，不在此时物化隐藏主窗的控件树。
+            return probe, [], []
         out = []
         try:
             hwnds = list(probe._wechat_hwnds() or ())
@@ -461,6 +464,8 @@ class AccountMixin:
 
     def pick_account_window(self, force=False, quiet=False):
         """确认哪个微信窗口是 config/启动器指定的账号，并钉死它。"""
+        if self.foreground_is_moments():
+            return bool(self.ACCOUNT.get('verified'))
         if self.ACCOUNT['verified'] and (not force):
             return True
         if G.WINDOW_HWND:
@@ -693,4 +698,3 @@ class AccountMixin:
         if not allowed:
             G.log_throttled('sticker-account-ambiguous', '表情包跳过：当前微信窗口和账号信息不一致，或多个窗口无法区分。只登录一个号且数据库匹配时无需手选；多开时请在设置中选账号。', ttl=300)
         return allowed
-

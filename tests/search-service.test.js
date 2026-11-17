@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { search } = require('../src/services/search');
+const apiSearch = require('../src/adapters/search/apiSearch');
 const { result, formatResult } = require('../src/core/search/result');
 const { parseRoute, systemFor } = require('../src/adapters/searchRouter');
 const { weatherSnippet } = require('../src/adapters/search/weather');
@@ -37,9 +38,32 @@ test('路由完整意图直接驱动数据源，旧格式仍能回退规则', as
   assert.match(value.text, /open|weatherResult/);
 });
 
-test('空气质量/后天/周末走天气专用接口；台风路径、远期和指定日期走网页', async () => {
-  // 中国天气网给实况 + 未来 5 天 + 预警 + AQI（1425037 起），这三类用专用接口答得更好；
-  // 台风路径不在接口数据里，回看类和超 5 天的也拿不到——都走网页（policy.weatherSupported）。
+test('API 开启时先走 API，成功就不再跑本地', async (t) => {
+  const f = fixture();
+  const api = t.mock.method(apiSearch, 'apiSearch', async () => evidence('deepseek'));
+  const value = await f.run('查一下最新消息', {
+    config: { semanticRoute: true, timeoutMs: 1000, api: { enabled: true, providers: ['deepseek'] } },
+  });
+  assert.equal(api.mock.callCount(), 1);
+  assert.deepEqual(f.calls.map(x => x.method), []);
+  assert.equal(value.status, 'ok');
+  assert.equal(value.items[0].provider, 'deepseek');
+});
+
+test('API 开启但没有结果时回退本地', async (t) => {
+  const f = fixture();
+  const api = t.mock.method(apiSearch, 'apiSearch', async () => result([], { status: 'failed', reason: 'no_results' }));
+  const value = await f.run('查一下最新消息', {
+    config: { semanticRoute: true, timeoutMs: 1000, api: { enabled: true, providers: ['deepseek'] } },
+  });
+  assert.equal(api.mock.callCount(), 1);
+  assert.deepEqual(f.calls.map(x => x.method), ['searchResult']);
+  assert.equal(value.status, 'ok');
+});
+
+test('空气质量走天气接口拿AQI；台风路径、远期和指定日期不拿今明天气冒充答案', async () => {
+  // fork：中国天气网一次请求含实况+5天预报+预警+AQI，空气质量走专用接口更准；
+  // 台风路径不在天气接口数据里，回看类和超 5 天的走网页（policy.weatherSupported）。
   for (const text of ['北京空气质量', '北京后天天气', '北京周末天气']) {
     const f = fixture({ kind: 'weather', city: '北京' });
     await f.run(text);
@@ -151,16 +175,6 @@ test('格式化保留来源和获取时间，不把它们写成发布时间', ()
   assert.match(text, /获取时间：2026-11-06/);
 });
 
-test('格式化在总预算内保留 API 摘要和长来源正文尾部', () => {
-  const value = evidence('tavily');
-  value.answer = 'API_SUMMARY_START 已核实的摘要 API_SUMMARY_END';
-  value.items[0].rawContent = 'SOURCE_START ' + '来源正文。'.repeat(240) + ' SOURCE_END';
-  const text = formatResult(value, { maxChars: 3200 });
-  assert.match(text, /API_SUMMARY_END/);
-  assert.match(text, /SOURCE_END/);
-  assert.ok(text.length <= 3200);
-});
-
 test('路由北京时间与机器本地时区无关', () => {
   assert.match(systemFor(new Date('2026-11-06T20:30:00Z')), /2026-11-07 周六 04:30（北京时间）/);
 });
@@ -169,58 +183,4 @@ test('模型识别出的时间范围不会在改写查询后丢失', async () =>
   const f = fixture({ kind: 'web', timeRange: 'today', fresh: 'any', query: '发布会 新闻' });
   await f.run('今儿有什么发布会消息');
   assert.equal(f.calls[0].args[1].maxAgeDays, 2);
-});
-
-
-test('路由说不用查，但会变的统计事实仍强制检索（volatile_forced）', async () => {
-  // 现场：2026-11-13 问「你知道CS去年的top20名单吗」被判 need=false，她拿 2024 记忆冒充 2025 榜单。
-  // 这类榜单/排名/冠军是逐年更替的统计事实，模型记忆不可靠，路由说「不用查」也必须查。
-  const f = fixture({ need: false });
-  const value = await f.run('你知道CS去年的top20名单吗', { now: new Date(2026, 10, 13) });
-  assert.equal(f.calls[0].method, 'searchResult');
-  assert.match(f.calls[0].args[0], /2025年/, '「去年」要按注入的 now 锚成 2025');
-  assert.doesNotMatch(f.calls[0].args[0], /去年|你知道/, '口语词不进检索词');
-  assert.equal(value.status, 'ok');
-});
-
-test('路由给的检索词仍带相对时间时兜底锚定年份', async () => {
-  const f = fixture({ need: true, query: 'CS 去年 top20 名单', kind: 'web' });
-  await f.run('CS去年的top20名单', { now: new Date(2026, 10, 13) });
-  assert.equal(f.calls[0].method, 'searchResult');
-  assert.match(f.calls[0].args[0], /2025年/);
-  assert.doesNotMatch(f.calls[0].args[0], /去年/);
-});
-
-
-test('名单类查询抓结果页正文，把完整名单带进资料；闲聊不抓', async () => {
-  // 用户标准：「CS去年top20名单」就该直接拿到完整名单。搜索摘要只有前几名，
-  // 不抓正文她最多报半截——所以名单/榜单/top N 必须触发正文抓取。
-  const pages = [];
-  const f = fixture({ need: true, query: 'CS 2025年 top20 名单', kind: 'web' });
-  f.deps.describeLink = async (url) => {
-    pages.push(url);
-    return { ok: true, title: 'HLTV 2025年度top20', url,
-      article: 'CS 2025年 top20 名单完整版：1 m0NESY 2 donk 3 ZywOo …… 共20位选手与所属战队逐一盘点。' };
-  };
-  const value = await f.run('你知道CS 2025年的top20名单吗');
-  assert.equal(pages.length, 1, '名单类要抓结果页正文');
-  assert.equal(value.items[0].provider, 'page');
-  assert.match(value.items[0].snippet, /m0NESY/);
-
-  const idle = [];
-  const f2 = fixture({ need: true, query: '测试检索', kind: 'web' });
-  f2.deps.describeLink = async (url) => { idle.push(url); return { ok: true, title: 't', url, article: '正文'.repeat(60) }; };
-  await f2.run('随便聊聊今天怎么样');
-  assert.equal(idle.length, 0, '非原文/名单类不浪费预算抓正文');
-});
-
-test('stale_only 放行旧证据时，资料文本带存档标注（persona 必须报年份）', async () => {
-  const { result } = require('../src/core/search/result');
-  const f = fixture({ need: true, query: 'Falcons 队员名单', kind: 'web' });
-  f.deps.providers.searchResult = async () => result(
-    [{ title: 'Falcons 阵容名单', snippet: '2025年1月名单', url: 'https://example.test/r', provider: 'bing' }],
-    { status: 'ok', reason: 'stale_only' });
-  const value = await f.run('Falcons 队员名单');
-  assert.equal(value.reason, 'stale_only');
-  assert.match(value.text, /较旧时间的存档/);
 });

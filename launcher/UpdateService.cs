@@ -89,13 +89,15 @@ namespace WhaleLauncher
             try
             {
                 var name = "whale-girl-" + latest + "-setup.exe";
+                var assetBases = AssetBases.Select(b => b.Replace("/releases/latest/download",
+                    "/releases/download/v" + latest)).ToArray();
                 var dir = Path.Combine(Path.GetTempPath(), "whale-update", latest);
                 Directory.CreateDirectory(dir);
                 var setup = Path.Combine(dir, name);
 
                 // 校验清单：4 个源并行拿、哈希必须一致（安全锚）。拿不到才谈下载。
                 progress?.Report(new Progress { Text = "读取校验清单…（" + AssetBases.Length + " 个源并行）", Percent = -1 });
-                var sums = await FetchSumsAsync(name);
+                var sums = await FetchSumsAsync(name, assetBases);
                 if (sums.Hash.Length == 0) return Fail(sums.Error);
                 if (sums.SourcesHit > 1)
                     progress?.Report(new Progress { Text = "校验清单一致（" + sums.SourcesHit + " 个源）", Percent = -1 });
@@ -103,7 +105,7 @@ namespace WhaleLauncher
                 var expected = sums.Hash;
                 var ok = false;
                 var tried = new List<string>();
-                foreach (var baseUrl in AssetBases)
+                foreach (var baseUrl in assetBases)
                 {
                     var label = LabelOf(baseUrl);
                     progress?.Report(new Progress { Text = "下载安装包…（源：" + label + "）", Percent = 0 });
@@ -180,7 +182,10 @@ namespace WhaleLauncher
             "  if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { break }\n" +
             "  Start-Sleep -Milliseconds 200\n" +
             "}\n" +
-            "Start-Process -FilePath $Setup -ArgumentList '/SILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS' -Wait\n" +
+            "$installDir = [System.IO.Path]::GetDirectoryName($AppExe)\n" +
+            "$args = @('/SILENT','/SUPPRESSMSGBOXES','/NORESTART','/CLOSEAPPLICATIONS',('/DIR=\"' + $installDir + '\"'))\n" +
+            "$result = Start-Process -FilePath $Setup -ArgumentList $args -Wait -PassThru\n" +
+            "if ($result.ExitCode -ne 0) { exit $result.ExitCode }\n" +
             "if (Test-Path $AppExe) { Start-Process -FilePath $AppExe }\n";
 
         private static ApplyOutcome Fail(string reason)
@@ -203,9 +208,9 @@ namespace WhaleLauncher
             public int SourcesHit;
         }
 
-        private static async Task<SumsResult> FetchSumsAsync(string fileName)
+        private static async Task<SumsResult> FetchSumsAsync(string fileName, string[] assetBases)
         {
-            var hits = (await Task.WhenAll(AssetBases.Select(b => FetchSumsOneAsync(b, fileName))))
+            var hits = (await Task.WhenAll(assetBases.Select(b => FetchSumsOneAsync(b, fileName))))
                 .Where(h => h != null)
                 .ToList();
 

@@ -59,7 +59,9 @@ except Exception:
     except Exception:
         uia_boot = None
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_PATH = os.path.join(ROOT, 'config.json')
+CONFIG_PATH = os.path.join(ROOT, 'data', 'config.json')
+if not os.path.exists(CONFIG_PATH) and os.path.exists(os.path.join(ROOT, 'config.json')):
+    CONFIG_PATH = os.path.join(ROOT, 'config.json')
 try:
     CONFIG_MTIME_AT_START = os.path.getmtime(CONFIG_PATH)
 except OSError:
@@ -72,7 +74,7 @@ from bridge_log import (log, log_debug, log_warn, log_error, boot, log_window_pr
 from guards import is_system_notice, duplicate_guard, rate_guard, set_system_senders
 import config as bridge_config
 from config import read_config, build_bot_url, wait_for_server as _wait_for_server, ensure_ffmpeg_env as _ensure_ffmpeg_env
-from voice import resolve_voice_key as _resolve_voice_key, asr_transcribe, clean_transcript
+from voice import resolve_voice_key as _resolve_voice_key, resolve_voice_config, asr_transcribe, clean_transcript
 bridge_log.configure(log_file=LOG_FILE, boot_log=os.path.join(ROOT, 'data', 'bridge-boot.log'), level=LOG_LEVEL)
 bridge_config.configure(ROOT, CONFIG_PATH)
 ONLY_CHATS = []
@@ -90,10 +92,12 @@ STICKER_TEST_ON = False
 STICKER_COLLECT = False
 ACCOUNT_WANTED = ''
 REMINDER_RUNNER = None
-from send_state import SEND_STATE, ChatIdentityError, DraftDirtyError, _chat_identity_level, _SendStateScope, touch, ensure_budget, note_raised, clear_raised
+from send_state import SEND_STATE, ChatIdentityError, DraftDirtyError, _chat_identity_level, _SendStateScope
 BG_SEND = {'enabled': True, 'charGap': 0.04, 'verify': True, 'charMode': 'auto', 'fallback': True, 'strip': True, 'unhide': True}
 PIPELINE_WORKERS = 4
 PIPELINE_QUEUE_LIMIT = 8
+MESSAGE_SETTLE_MS = 1500
+GROUP_MAX_BATCH_WAIT_MS = 5000
 # 下面这 7 个开关必须在**读配置之前**就有默认值：config.json 解析失败时
 # （手填 Windows 路径写了单反斜杠就是典型），上面那个 try 会在 json.load 处
 # 整段中断，后面所有赋值一个都执行不到。以前没有默认值，main() 里一读
@@ -109,12 +113,13 @@ GOODNIGHT_TEXT = '晚安，电量快没了，我先睡啦，明天见～'
 CURRENT_CONFIG = {}
 CONFIG_SNAPSHOT = None
 _BOOT_CONFIG_VALID = False
-_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config.json')
+_cfg_path = CONFIG_PATH
 if not os.path.exists(_cfg_path):
-    _example = os.path.join(os.path.dirname(_cfg_path), 'config', 'config.example.json')
+    _example = os.path.join(ROOT, 'config', 'config.example.json')
     if os.path.exists(_example):
         try:
             import shutil
+            os.makedirs(os.path.dirname(_cfg_path), exist_ok=True)
             shutil.copyfile(_example, _cfg_path)
             log_call = True
         except Exception:
@@ -170,12 +175,21 @@ def log_throttled(key, *args, ttl=600, emit=None):
     bounded_log(_THROTTLE_LOG, key, *args, ttl=ttl, emit=emit or log,
                 folded=log, clock=getattr(time, 'monotonic', time.time))
 
+def voice_runtime(cfg=None):
+    current = CURRENT_CONFIG if cfg is None else cfg
+    resolved = resolve_voice_config(current, ROOT)
+    snapshot = bridge_config.runtime_snapshot(dict(current, voice=resolved))['values']
+    values = {k: v for k, v in snapshot.items() if k.startswith('VOICE_')}
+    values['VOICE_API_KEY'] = resolved.get('apiKey') or ''
+    values['VOICE_SUPPORTED'] = resolved.get('supported', True)
+    return values
+
 
 def _publish_runtime_config(cfg, snapshot):
     global CURRENT_CONFIG, CONFIG_SNAPSHOT
     values = dict(snapshot['values'])
-    VOICE_BASE_URL = values['VOICE_BASE_URL']
-    values['VOICE_API_KEY'] = _resolve_voice_key(cfg, VOICE_BASE_URL, ROOT)
+    resolved = voice_runtime(cfg)
+    values.update(resolved)
     values['SYSTEM_SENDER_NAMES'] = set(BASE_SYSTEM_SENDERS) | set(snapshot['ignoreSenders'])
     # Resolve all derived values before publishing: a failed read/parse keeps
     # the previous coherent configuration rather than half-updated globals.
@@ -207,12 +221,11 @@ def reload_config(path=None, *, config=None):
     返回是否真的重新加载了。
     """
     global QUOTE_REPLY, KEYBOARD_FALLBACK, BACKGROUND_SEND, LOW_BATTERY_PCT, GOODNIGHT_TEXT
-    global BG_SEND, PIPELINE_WORKERS, PIPELINE_QUEUE_LIMIT
+    global BG_SEND, PIPELINE_WORKERS, PIPELINE_QUEUE_LIMIT, MESSAGE_SETTLE_MS, GROUP_MAX_BATCH_WAIT_MS
     global ACCOUNT_GUARD, WINDOW_HWND, STICKER_TEST_ON, STICKER_COLLECT
     global CARE_ENABLED, CARE_QUIET_MIN
     global STALE_AFTER, SYSTEM_SENDER_NAMES, BASE_SYSTEM_SENDERS, MASTER_WXID
-    global VOICE_ENABLED, VOICE_BASE_URL, VOICE_MODEL, VOICE_API_KEY, VOICE_TIMEOUT, VOICE_MAX_SECONDS
-
+    global VOICE_ENABLED, VOICE_PROVIDER, VOICE_BASE_URL, VOICE_MODEL, VOICE_API_KEY, VOICE_TIMEOUT, VOICE_MAX_SECONDS
     global CARE_ENABLED, CARE_ALLOW_GROUPS, CARE_ONLY_MASTER, CARE_ALLOW_OTHERS
     try:
         if config is None:
@@ -287,11 +300,6 @@ def list_accounts_cli():
                     item['nick'] = str(info.get('nick_name') or info.get('remark') or '').strip()
             except Exception:
                 pass
-            finally:
-                # I2：已核对 wechatauto 源码，WeChatDB 没有 close()/dispose()，
-                # 也不常驻线程（查询用的连接都在库内部 finally 关闭）。这里显式
-                # 丢掉引用，让密钥表/文件清单尽早回收，别攒着等进程退出。
-                probe = None
         rows.append(item)
     rows.sort(key=lambda x: -x['lastActive'])
     payload = {'dbDir': db_dir or '', 'generatedAt': int(time.time() * 1000), 'accounts': rows}
@@ -349,9 +357,6 @@ def write_accounts_cache(db_dir, account='', nick='', probe_others=True, deadlin
                         item['nick'] = str(info.get('nick_name') or info.get('remark') or '').strip()
                 except Exception:
                     pass
-                finally:
-                    # I2：同上，WeChatDB 无 close()，用完显式丢引用。
-                    probe = None
             rows.append(item)
         rows.sort(key=lambda x: -x['lastActive'])
         payload = {'dbDir': db_dir, 'generatedAt': int(time.time() * 1000), 'accounts': rows}
@@ -363,15 +368,11 @@ def write_accounts_cache(db_dir, account='', nick='', probe_others=True, deadlin
     except Exception as e:
         log('账号缓存补写失败（不影响收发）：', repr(e))
         return False
-# 单实例锁端口。原来用的 47821 落在 WSL2 镜像网络保留的宿主端口段里
-# （本机实测 44620-48715 整段 bind 都失败，netstat 却看不见占用者），
-# 导致 bind() 必然失败、桥接每次秒退、启动器无限重启。换到保留段外，
-# 并多留两个后备端口（见 bridge/instance_lock.py）。
-BRIDGE_LOCK_PORT = 48800
-BRIDGE_LOCK_PORTS = (BRIDGE_LOCK_PORT, 48810, 48820)
-VOICE_ENABLED = True
-VOICE_BASE_URL = 'https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation'
-VOICE_MODEL = 'qwen3-asr-flash'
+BRIDGE_LOCK_PORT = 47821
+VOICE_ENABLED = False
+VOICE_PROVIDER = 'auto'
+VOICE_BASE_URL = 'https://api.deepseek.com/v1/tools/asr'
+VOICE_MODEL = ''
 VOICE_API_KEY = ''
 VOICE_TIMEOUT = 90
 VOICE_MAX_SECONDS = 120
@@ -391,36 +392,10 @@ def wait_for_server(url, timeout=30):
 def ensure_ffmpeg_env():
     """兼容旧调用：实现在 config.py。"""
     return _ensure_ffmpeg_env()
-
-def hard_exit(code):
-    """统一硬退出（S5）：os._exit 之前还原系统级副作用。
-
-    os._exit 不走 atexit：bg_sender 打开的 SPI_SETSCREENREADER（还带着
-    SPIF_UPDATEINIFILE 持久化）如果不还原，会一直留在系统设置里，影响
-    其它程序的无障碍行为。看门狗、配置热重载的重启都从这里退出，
-    保证标志一定被关掉（旧注释说「下次启动会关」，实际启动路径没人关）。
-    """
-    try:
-        import bg_sender
-        bg_sender.shutdown()
-    except Exception:
-        pass
-    # 发送期间被临时置顶的微信窗口同样要还原：os._exit 不执行 finally，
-    # 不还原的话进程一死微信就永远盖在所有窗口上面（只能重启微信才能恢复）。
-    try:
-        hwnd = int(SEND_STATE.get('raised_hwnd') or 0)
-        if hwnd and not SEND_STATE.get('raised_was_topmost'):
-            import ctypes
-            SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE = 0x2, 0x1, 0x10
-            ctypes.windll.user32.SetWindowPos(hwnd, ctypes.c_void_p(-2), 0, 0, 0, 0,
-                                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-    except Exception:
-        pass
-    os._exit(code)
 try:
-    from .msg_pipeline import MessagePipeline, MessageBatches, split_runs, mergeable
+    from .msg_pipeline import MessagePipeline, MessageBatches, SettleScheduler, split_runs, mergeable
 except ImportError:
-    from msg_pipeline import MessagePipeline, MessageBatches, split_runs, mergeable
+    from msg_pipeline import MessagePipeline, MessageBatches, SettleScheduler, split_runs, mergeable
 
 def _bg_cli(argv=None):
     """零焦点通道的命令行自检 / 发送。

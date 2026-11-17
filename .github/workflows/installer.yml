@@ -245,7 +245,7 @@ jobs:
             --self-contained false `
             -p:PublishSingleFile=true `
             -p:Version=$env:version `
-            -p:FileVersion=$env:version.0 `
+            -p:FileVersion=$env:version `
             -o launcher/publish `
             --nologo
           if ($LASTEXITCODE -ne 0) { Write-Output '::error title=启动器发布失败::dotnet publish 退出码非 0'; exit 1 }
@@ -719,10 +719,17 @@ jobs:
           # 客户端的四个源里有一个读 Release 资产；不发这份清单，用户装完也永远看不到「有新版本」。
           # manifest_version 必须递增：多源并存时客户端取序号最大的那一份。
           $manifestPath = 'artifacts/setup/release-manifest.json'
-          $manifest = Get-Content 'release-manifest.json' -Raw -Encoding utf8 | ConvertFrom-Json
+          # 只生成候选资产，不提前修改公开清单；显式发布策略由同一个生成器应用。
+          ./scripts/make-manifest.ps1 -Version $env:version -OutFile $manifestPath -TemplateFile 'release-manifest.json'
+          $manifest = Get-Content $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
           $manifest.latest = $env:version
-          $manifest.released_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-          $manifest.manifest_version = [int]$manifest.manifest_version + 1
+          if ($manifest.legacy_latest) { $manifest.latest = $manifest.legacy_latest }
+          $pkg = Get-Content package.json -Raw -Encoding utf8 | ConvertFrom-Json
+          $epoch = if ($null -ne $pkg.updateEpoch) { [int]$pkg.updateEpoch } else { 0 }
+          $manifest | Add-Member -NotePropertyName epoch -NotePropertyValue $epoch -Force
+          $manifest | Add-Member -NotePropertyName brand_latest -NotePropertyValue $env:version -Force
+          $manifest | Add-Member -NotePropertyName target -NotePropertyValue $env:version -Force
+          # released_at / manifest_version 已由 make-manifest 统一生成并递增一次。
           $manifest.message = "鲸鲸 $env:version 已发布：下载安装包覆盖安装即可，data 与 config.json 不受影响。"
           $popupSummary = (node scripts/release-notes.js $env:version --summary) -join "`n"
           if ($LASTEXITCODE -ne 0) { throw '本版本的更新弹窗摘要缺失或格式错误，停止准备发布资产' }
@@ -730,7 +737,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw '本版本缺少详细更新说明，停止准备发布资产' }
           $manifest | Add-Member -NotePropertyName release_notes -NotePropertyValue $popupSummary -Force
           $manifest | Add-Member -NotePropertyName release_details -NotePropertyValue $releaseDetails -Force
-          $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $manifestPath -Encoding utf8NoBOM
+          $manifest | ConvertTo-Json -Depth 20 | Set-Content -Path $manifestPath -Encoding utf8NoBOM
           Get-Content $manifestPath
 
           foreach ($file in @($setup, $sums, $manifestPath)) {

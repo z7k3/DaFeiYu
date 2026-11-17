@@ -134,7 +134,8 @@ Check 'GET /healthz' {
 
 # 微信网关（用 config.json 里的 token；没配置就用默认值）
 $token = 'change-me-wechat'
-$configPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'config.json'
+$configPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'data\config.json'
+if (-not (Test-Path -LiteralPath $configPath)) { $configPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'config.json' }
 if (Test-Path $configPath) {
   try {
     $cfg = Get-Content $configPath -Raw -Encoding UTF8 | ConvertFrom-Json

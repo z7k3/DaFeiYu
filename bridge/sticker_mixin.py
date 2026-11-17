@@ -59,7 +59,7 @@ class StickerMixin:
 
     def sticker_activity_allowed(self, username=''):
         try:
-            return not (self.foreground_is_fullscreen() or (username and (self.chat_dead(username) or not self.group_is_alive(username))))
+            return not (self.foreground_is_fullscreen() or (username and (self.chat_paused(username) or not self.group_is_alive(username))))
         except Exception:
             return False
 
@@ -79,13 +79,6 @@ class StickerMixin:
             hwnd = int(self.ACCOUNT.get('hwnd') or 0)
             snap = None
             try:
-                # 文字发送期间窗口被挪到屏幕外（静默发送）；表情包要走前台，先放回来。
-                try:
-                    # 放回屏幕内（表情包要走前台）；发完不必手动挪回——
-                    # 下次文字发送会自动再挪到屏幕外（park_window 是幂等的）。
-                    G.bg_sender.unpark_window(hwnd, log=G.log)
-                except Exception:
-                    pass
                 desktop = G.WindowsDesktop()
                 if not desktop.foreground(hwnd):
                     snap = self.snapshot_win_state()
@@ -124,6 +117,9 @@ class StickerMixin:
                         if not current_gui.use_window(hwnd) or int(current_gui.main_hwnd) != hwnd:
                             return G.sticker_result('failed', 'unable to bind the verified account window')
                         uia = getattr(current_gui, '_uia', None)
+                        if uia is None:
+                            # 冷启动/驱动重建后缓存未初始化不等于不可用，先走正式获取入口。
+                            uia = current_gui._get_uia()
                         if uia is None:
                             return G.sticker_result('failed', 'UIA target proof is unavailable; no OCR fallback')
                         search_keys = [chat_display_name] + [a for a in aliases if a and a != chat_display_name]
@@ -205,20 +201,19 @@ class StickerMixin:
             outcome = G.sticker_result('failed', 'claimed job identity did not match the request')
         else:
             outcome = self.send_sticker(claimed.get('path'), claimed.get('chat') or '', claimed.get('chatUsername') or '', claimed.get('generation'), job_id)
-        # ack 是「结果回执」不是发送：gate（开关/代际）变了也必须写回，否则服务端的
-        # job 永远停在 sending，之后开关再打开会误判重发。只报结果，不带任何内容。
-        payload = {'id': job_id, 'status': outcome['status'], 'error': outcome['error']}
-        for attempt in range(3):
-            try:
-                resp = G.LOCAL_HTTP.post(self.sticker_base + '/api/stickers/ack', json=payload, headers=self.sticker_headers, timeout=8)
-                if getattr(resp, 'status_code', 0) in (200, 404, 409):
-                    break
-            except Exception as exc:
-                if attempt == 2:
-                    G.log_throttled('sticker-ack-fail', '表情包结果没能写回服务端（不影响已经发出的消息）：' + repr(exc), ttl=300)
-            G.time.sleep(0.4)
-        if self.sticker_config_now() is not None:
-            G.log('表情包结果：', outcome['status'], outcome['error'])
+        if self.sticker_gate(item.get('generation')):
+            payload = {'id': job_id, 'status': outcome['status'], 'error': outcome['error']}
+            for attempt in range(3):
+                try:
+                    resp = G.LOCAL_HTTP.post(self.sticker_base + '/api/stickers/ack', json=payload, headers=self.sticker_headers, timeout=8)
+                    if getattr(resp, 'status_code', 0) in (200, 404, 409):
+                        break
+                except Exception as exc:
+                    if attempt == 2:
+                        G.log_throttled('sticker-ack-fail', '表情包结果没能写回服务端（不影响已经发出的消息）：' + repr(exc), ttl=300)
+                G.time.sleep(0.4)
+            if self.sticker_config_now() is not None:
+                G.log('表情包结果：', outcome['status'], outcome['error'])
         return outcome
 
     def cancel_reply_sticker(self, item, expected_username):

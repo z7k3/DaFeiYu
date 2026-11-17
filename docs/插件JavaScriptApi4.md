@@ -20,6 +20,8 @@ JavaScript **不是沙箱**。插件以当前 Windows 用户权限执行，可�
 
 ## 插件包
 
+迁移版 4.1.6.1 起，同一个包可用 `appCompatibility` 声明旧 4.x 与正式 1.x 的独立范围。正式代 1.0.0 是重新编号，不表示历史 1.x 已支持 API 4。
+
 ZIP 根目录仅两个文件：`plugin.json` 和 `plugin.js`。包上限 16 MiB，代码上限 8 MiB，UTF-8、CommonJS。
 不自动运行 npm 安装脚本。可在开发机用 Node.js 生态构建依赖，将依赖打包进单个 `plugin.js`，
 把 `whale` 及 Node 内置模块标为 external。宿主没有预装任意 npm 库。
@@ -28,6 +30,10 @@ ZIP 根目录仅两个文件：`plugin.json` 和 `plugin.js`。包上限 16 MiB�
 {
   "Id": "my-search", "Name": "我的搜索", "Author": "作者",
   "Version": "1.0.0", "MinAppVersion": "4.1.2", "Description": "按需检索并注入回复",
+  "appCompatibility": [
+    { "appEpoch": 1, "minAppVersion": "4.1.2" },
+    { "appEpoch": 2, "minAppVersion": "1.0.0" }
+  ],
   "ResultLabel": "结果", "Api": 4, "Kind": "message",
   "Hooks": ["chat.search", "chat.search_result"],
   "Permissions": ["system.full"], "ExecutionTimeoutMs": 30000, "IntervalSeconds": 60
@@ -38,6 +44,8 @@ ZIP 根目录仅两个文件：`plugin.json` 和 `plugin.js`。包上限 16 MiB�
 每个插件在独立 Node 子进程中串行执行，最多 16 个启用插件、2 个并行调用，单进程堆内存 256 MiB。
 异常或超时降级回宿主原流程并暂停该插件 30 秒。Wasm 的旧预算和权限保持原样。
 这些限制用于减少卡死，不是对完整系统权限代码的安全隔离。
+
+市场条目与包内兼容声明必须一致；每项可选 `maxAppVersion`。顶层 `MinAppVersion` 保留旧代范围供旧客户端读取。作者需在两代分别试装；外部市场目录生成器和校验器仍需同步升级，详见 [插件市场规范](插件市场规范.md)。
 
 ## 扩展点与输入
 

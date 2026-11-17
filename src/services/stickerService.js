@@ -4,7 +4,7 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const stickers = require('../adapters/stickers');
 const { installPresets } = require('../adapters/stickerPresets');
-const { describeError } = require('../infra/errors');
+const { describeError, errorMessage } = require('../infra/errors');
 const { tagId, tagName } = require('../infra/privacy');
 const probe = require('../infra/probe');
 const ACTIVE = new Set(['queued', 'reserved', 'sending']);
@@ -67,7 +67,7 @@ class StickerService {
       this._runMaintenance().catch((err) => {
         this.maintenance.phase = 'done';
         this.maintenance.finishedAt = Date.now();
-        this.maintenance.errors.push(String((err && err.message) || err));
+        this.maintenance.errors.push(errorMessage(err));
         if (this.logger) this.logger.warn('表情包图库维护失败（不影响收发）：' + describeError(err));
       });
     });

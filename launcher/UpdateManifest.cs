@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
@@ -19,14 +20,20 @@ namespace WhaleLauncher
         Kill
     }
 
-    /// <summary>release-manifest.json 的本体。字段缺失一律按「不强制」处理，别因为一次写错锁死用户。</summary>
+    /// <summary>清单模型：新名单缺失才兼容旧协议，名单写错时不能扩大强制范围。</summary>
     public sealed class UpdateManifest
     {
         public string Latest { get; set; } = "";
+        public int Epoch { get; set; }
+        public string BrandLatest { get; set; } = "";
+        public string Target { get; set; } = "";
+        public UpdateManifest Copy() => (UpdateManifest)MemberwiseClone();
         public DateTimeOffset ReleasedAt { get; set; }
         public double ForceAfterHours { get; set; } = 24;
         public bool? Force { get; set; }
         public string ForceFrom { get; set; } = "";
+        // null 表示旧协议；空数组表示新协议明确不强制，二者不能在缓存中混淆。
+        public string[] ForceVersions { get; set; }
         public string KillBelow { get; set; } = "";
         public string Message { get; set; } = "";
         public string UpdateWarning { get; set; } = "";
@@ -54,7 +61,7 @@ namespace WhaleLauncher
     /// 你改一行就能刹车，不需要发版。
     ///
     /// 多源同时拉、取 manifest_version 最大的那个：jsDelivr 会给旧缓存，只要别的源给了
-    /// 新序号就以新的为准；所有源都给旧的，说明确实还没发新的。
+    /// 新序号就以新的为准；缓存也参与比较，不能把 CDN 的旧响应当成最新策略。
     /// </summary>
     public static class UpdateManifestService
     {
@@ -143,49 +150,95 @@ namespace WhaleLauncher
             return "";
         }
 
+        public static int LocalEpoch(string baseDir)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(baseDir, "package.json")));
+                return Int(doc.RootElement, "updateEpoch");
+            }
+            catch { return 0; }
+        }
+
+        // 保留原始清单用于缓存；只把选中轨道交给现有 UI 和安装流程。
+        public static UpdateManifest Resolve(string local, int localEpoch, UpdateManifest source)
+        {
+            if (source == null) return null;
+            var m = source.Copy();
+            if (localEpoch <= 0) return m;
+            if (m.Epoch < localEpoch)
+            {
+                m.Latest = local;
+                return m;
+            }
+            var version = string.IsNullOrWhiteSpace(m.BrandLatest) ? m.Latest : m.BrandLatest;
+            var target = string.IsNullOrWhiteSpace(m.Target) ? version : m.Target;
+            // 展示版本与安装包版本必须一致，不能提示一个版本却安装另一个。
+            if (string.IsNullOrWhiteSpace(version) || target != version)
+            {
+                m.Latest = local;
+                return m;
+            }
+            m.Latest = version;
+            if (m.Epoch > localEpoch)
+            {
+                // 跨代时数字版本可能降低，旧代的强制阈值不能混入新代。
+                m.KillBelow = "";
+                m.ForceFrom = "";
+                if (m.ForceVersions != null) m.ForceVersions = Array.Empty<string>();
+            }
+            return m;
+        }
+
+        public static bool HasUpdate(string local, int localEpoch, UpdateManifest source)
+        {
+            if (source == null || string.IsNullOrWhiteSpace(local)) return false;
+            var m = Resolve(local, localEpoch, source);
+            if (localEpoch > 0 && source.Epoch < localEpoch) return false;
+            if (localEpoch > 0 && source.Epoch > localEpoch)
+                return m.Latest != local && !string.IsNullOrWhiteSpace(m.Latest);
+            return CompareVersion(local, m.Latest) < 0;
+        }
+
         /// <summary>拉清单并判定。永不抛：任何异常都变成「拿不到 + 放行」。</summary>
         public static async Task<ManifestCheck> FetchAsync(string baseDir)
         {
             var result = new ManifestCheck();
             result.Current = LocalVersion(baseDir);
 
-            UpdateManifest best = null;
+            var cached = LoadCache();
+            UpdateManifest best = cached;
             try
             {
                 var all = await Task.WhenAll(Sources.Select(DownloadAsync));
-                foreach (var m in all)
-                {
-                    if (m == null) continue;
-                    if (best == null || m.ManifestVersion > best.ManifestVersion) best = m;
-                }
+                best = SelectNewest(all, cached);
             }
             catch { }
 
             if (best != null)
             {
                 result.Manifest = best;
-                SaveCache(best);
+                result.FromCache = ReferenceEquals(best, cached);
+                if (result.FromCache) result.Error = "没有更新的在线策略，用的是上次缓存的策略";
+                else SaveCache(best);
             }
             else
             {
-                var cached = LoadCache();
-                if (cached != null)
-                {
-                    result.Manifest = cached;
-                    result.FromCache = true;
-                    result.Error = "网络不通，用的是上次缓存的策略";
-                }
-                else
-                {
-                    result.Error = "拿不到更新清单（断网 / 被墙）";
-                    return result;   // 从没成功过就放行，不拦人
-                }
+                result.Error = "拿不到更新清单（断网 / 被墙）";
+                return result;   // 从没成功过就放行，不拦人
             }
 
             try
             {
-                result.Policy = Decide(result.Current, result.Manifest, DateTimeOffset.UtcNow);
-                result.HasUpdate = CompareVersion(result.Current, result.Manifest.Latest) < 0;
+                var epoch = LocalEpoch(baseDir);
+                var source = result.Manifest;
+                result.HasUpdate = HasUpdate(result.Current, epoch, source);
+                result.Manifest = Resolve(result.Current, epoch, source);
+                // 已由代次确认跨代，不能再让旧代的大版本号拦住策略判断。
+                var policyVersion = epoch > 0 && source.Epoch > epoch ? "0.0.0" : result.Current;
+                result.Policy = result.HasUpdate
+                    ? Decide(policyVersion, result.Manifest, DateTimeOffset.UtcNow)
+                    : UpdatePolicy.Ok;
             }
             catch (Exception ex)
             {
@@ -197,8 +250,8 @@ namespace WhaleLauncher
         }
 
         /// <summary>
-        /// 判定顺序：已是最新 → 正常；低于熔断线 → 禁止启动；显式 force → 强制；
-        /// 显式 force=false → 只提示；否则看发布时间是否超过时间闸。
+        /// 精确名单存在时完整接管强制策略，未命中也不能回落到旧布尔或时间闸。
+        /// kill_below 仍是独立熔断；旧字段只用于兼容没有名单的清单。
         /// </summary>
         public static UpdatePolicy Decide(string local, UpdateManifest m, DateTimeOffset now)
         {
@@ -209,10 +262,13 @@ namespace WhaleLauncher
             if (!string.IsNullOrWhiteSpace(m.KillBelow) && CompareVersion(local, m.KillBelow) < 0)
                 return UpdatePolicy.Kill;
 
+            if (m.ForceVersions != null)
+                return IsPolicyVersion(local) && m.ForceVersions.Any(v => IsPolicyVersion(v) && CompareVersion(local, v) == 0)
+                    ? UpdatePolicy.Force : UpdatePolicy.Warn;
+
             if (m.Force == true)
             {
-                // 紧急热修只强制「上一个发布版本」；更老的版本只提示，
-                // 避免一次热修把所有历史版本都锁死。
+                // 仅兼容旧清单：实际范围是 [force_from, latest)，不是精确的上一版本。
                 if (!string.IsNullOrWhiteSpace(m.ForceFrom) && CompareVersion(local, m.ForceFrom) < 0)
                     return UpdatePolicy.Warn;
                 return UpdatePolicy.Force;
@@ -255,6 +311,31 @@ namespace WhaleLauncher
             return parts;
         }
 
+        private static bool IsPolicyVersion(string value)
+            => value != null && Regex.IsMatch(value, @"^[vV]?[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
+                && value.TrimStart('v', 'V').Split('.').All(part => int.TryParse(part, NumberStyles.None, CultureInfo.InvariantCulture, out _));
+
+        private static string[] ParseForceVersions(JsonElement value)
+        {
+            if (value.ValueKind != JsonValueKind.Array || value.GetArrayLength() > 256) return Array.Empty<string>();
+            var versions = new List<string>();
+            foreach (var item in value.EnumerateArray())
+            {
+                // 一项写错就降级成空名单，不能忽略坏项后意外执行旧全员强制。
+                if (item.ValueKind != JsonValueKind.String || !IsPolicyVersion(item.GetString())) return Array.Empty<string>();
+                versions.Add(item.GetString().TrimStart('v', 'V'));
+            }
+            return versions.Distinct().ToArray();
+        }
+
+        internal static UpdateManifest SelectNewest(IEnumerable<UpdateManifest> candidates, UpdateManifest cached)
+        {
+            var best = cached;
+            foreach (var candidate in candidates)
+                if (candidate != null && (best == null || candidate.ManifestVersion > best.ManifestVersion)) best = candidate;
+            return best;
+        }
+
         private static async Task<UpdateManifest> DownloadAsync(string url)
         {
             try
@@ -278,6 +359,9 @@ namespace WhaleLauncher
             if (r.ValueKind != JsonValueKind.Object) return null;
 
             var m = new UpdateManifest { Latest = Str(r, "latest") };
+            m.Epoch = Int(r, "epoch");
+            m.BrandLatest = Str(r, "brand_latest");
+            m.Target = Str(r, "target");
             if (string.IsNullOrWhiteSpace(m.Latest)) return null;
 
             if (r.TryGetProperty("released_at", out var ra) && ra.ValueKind == JsonValueKind.String
@@ -300,6 +384,7 @@ namespace WhaleLauncher
 
             m.KillBelow = Str(r, "kill_below");
             m.ForceFrom = Str(r, "force_from");
+            if (r.TryGetProperty("force_versions", out var versions)) m.ForceVersions = ParseForceVersions(versions);
             m.Message = Str(r, "message");
             m.UpdateWarning = Str(r, "update_warning");
             m.UpdateWarningVersion = Str(r, "update_warning_version");
@@ -313,6 +398,10 @@ namespace WhaleLauncher
         private static string Str(JsonElement e, string name)
             => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? (v.GetString() ?? "") : "";
 
+        private static int Int(JsonElement e, string name)
+            => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number
+                && v.TryGetInt32(out var n) && n >= 0 ? n : 0;
+
         // ── 缓存：断网时用上次成功拿到的策略，而不是「什么都拿不到就放行」 ──
 
         private static void SaveCache(UpdateManifest m)
@@ -321,25 +410,34 @@ namespace WhaleLauncher
             {
                 var dir = Path.GetDirectoryName(CachePath);
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                var obj = new
-                {
-                    latest = m.Latest,
-                    released_at = m.ReleasedAt == default ? "" : m.ReleasedAt.ToString("o", CultureInfo.InvariantCulture),
-                    force_after_hours = m.ForceAfterHours,
-                    force = m.Force,
-                    force_from = m.ForceFrom,
-                    kill_below = m.KillBelow,
-                    message = m.Message,
-                    update_warning = m.UpdateWarning,
-                    update_warning_version = m.UpdateWarningVersion,
-                    release_notes = m.ReleaseNotes,
-                    release_details = m.ReleaseDetails,
-                    manifest_version = m.ManifestVersion,
-                    cached_at = DateTimeOffset.UtcNow.ToString("o", CultureInfo.InvariantCulture),
-                };
-                File.WriteAllText(CachePath, JsonSerializer.Serialize(obj));
+                File.WriteAllText(CachePath, SerializeCache(m));
             }
             catch { }
+        }
+
+        internal static string SerializeCache(UpdateManifest m)
+        {
+            var obj = new
+            {
+                latest = m.Latest,
+                epoch = m.Epoch,
+                brand_latest = m.BrandLatest,
+                target = m.Target,
+                released_at = m.ReleasedAt == default ? "" : m.ReleasedAt.ToString("o", CultureInfo.InvariantCulture),
+                force_after_hours = m.ForceAfterHours,
+                force = m.Force,
+                force_from = m.ForceFrom,
+                force_versions = m.ForceVersions,
+                kill_below = m.KillBelow,
+                message = m.Message,
+                update_warning = m.UpdateWarning,
+                update_warning_version = m.UpdateWarningVersion,
+                release_notes = m.ReleaseNotes,
+                release_details = m.ReleaseDetails,
+                manifest_version = m.ManifestVersion,
+                cached_at = DateTimeOffset.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+            };
+            return JsonSerializer.Serialize(obj, new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
         }
 
         private static UpdateManifest LoadCache()

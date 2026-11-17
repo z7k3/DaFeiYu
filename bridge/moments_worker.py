@@ -208,6 +208,8 @@ def worker_main(input_stream, protocol):
         import uia_compat
         uia_compat.apply()
         from wechatauto import WeChat, WeChatGUI
+        from window_activation import install as install_safe_activation
+        install_safe_activation()
         from moments_publish import publish
         from window_mixin import WindowMixin
         account = payload['account']

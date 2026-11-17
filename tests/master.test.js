@@ -111,11 +111,11 @@ test('主人骂她不会触发回怼', async () => {
   cleanup();
 });
 
-test('主人身份刚配好时提示词带「身份纠错」，不再顺着旧记忆否认', async () => {
+test('当前认证优先于旧记忆，不再常驻大段身份纠错', async () => {
   const { bot, cleanup } = makeBot();
   const r = await bot.decide(master('我是你主人吗'));
-  assert.match(promptOf(r), /身份纠错/);
-  assert.match(promptOf(r), /作废/);
+  assert.doesNotMatch(promptOf(r), /身份纠错/);
+  assert.match(promptOf(r), /以当前认证为准/);
   cleanup();
 });
 
