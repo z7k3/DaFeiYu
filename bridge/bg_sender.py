@@ -1387,6 +1387,12 @@ _MODE_LOGGED = set()
 _PARKED = {}          # hwnd -> 原位置 (x, y)
 _NOFLASH = {'on': True}   # 静默发送：打字期间把窗口挪到屏幕外，屏幕上完全看不到
 _PARK_POS = -21333
+# 微信主窗身份白名单（防错停，见 park_window 内注释）：
+#   类名 —— mmui::MainWindow 是 UIA 的逻辑类名；微信 4.x 的 Win32 类名是
+#           Qt 框架类 Qt51514QWindowIcon（实测 2026-11-17），两种都要认。
+#   标题 —— 类名 + 标题双白名单，句柄回收错停无关窗口的概率趋近于零。
+_MAIN_WINDOW_CLASSES = frozenset({'mmui::MainWindow', 'Qt51514QWindowIcon'})
+_MAIN_WINDOW_TITLES = frozenset({'微信', 'wechat', 'weixin'})
 
 
 def park_window(hwnd, log=None):
@@ -1397,11 +1403,20 @@ def park_window(hwnd, log=None):
             return False
         import win32gui
         import win32con
-        # 防呆（fork fd597b2）：只停靠确认属于微信主窗类名的窗口——句柄回收后
+        # 防呆（fork fd597b2）：只停靠确认属于微信主窗的窗口——句柄回收后
         # 重分配，错停无关应用窗口会挡人且没人认领。
-        if win32gui.GetClassName(hwnd) != 'mmui::MainWindow':
+        # 不能用 GetClassName 单比 mmui::MainWindow：那是 UIA 的逻辑类名，
+        # Win32 层类名是 Qt51514QWindowIcon，单比永远不匹配 → 停靠从未生效 →
+        # 每次后台发送都真实跳前（2026-11-17 实见）。改用双白名单。
+        try:
+            cls = win32gui.GetClassName(hwnd)
+            title = (win32gui.GetWindowText(hwnd) or '').strip().lower()
+        except Exception:
+            cls, title = '', ''
+        if cls not in _MAIN_WINDOW_CLASSES or title not in _MAIN_WINDOW_TITLES:
             if log:
-                log('后台通道：目标窗口类名不是微信主窗，跳过屏幕外停靠')
+                log('后台通道：目标窗口不是微信主窗（class=%r title=%r），跳过屏幕外停靠'
+                    % (cls, title[:20]))
             return False
         rect = win32gui.GetWindowRect(hwnd)
         win32gui.SetWindowPos(hwnd, 0, _PARK_POS, _PARK_POS, 0, 0,

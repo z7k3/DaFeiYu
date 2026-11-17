@@ -19,6 +19,10 @@
 
 - 修复私聊问「top20/名单/榜单」时回复在半截被切的问题（实见「11 Tw」断词且无省略号）：上游 4.1.7 的「整轮回复硬截断」（privateMaxChars=120）发生在分泡之前，本地「名单整段合成、上限 600」的宽限永远轮不到。现在识别名单类回复（换行列表或行内连续编号）时整轮上限放宽到与名单规则一致的 600 字；被截断时补回「…」提示，不再无声切断（tests/list-reply-cap.test.js）。
 
+### 修复 · 屏幕外停靠从未生效——后台发送仍在跳前台
+
+- 修复停靠防呆的类名错配：微信 4.x 的 Win32 窗口类名是 Qt 框架类 Qt51514QWindowIcon，防呆单比 UIA 逻辑类名 mmui::MainWindow 永远不匹配，导致屏幕外停靠自部署起从未生效（跳过日志只进 wechatauto 4x.log，bridge.log 里看不到），每次后台发送都真实激活微信跳前台。改为类名白名单（mmui::MainWindow / Qt51514QWindowIcon）+ 窗口标题白名单（微信/WeChat/Weixin）双重校验，跳过日志带观测到的 class/title 便于诊断（tests/park-window-guard.test.py）。
+
 ### 修复 · 影子仲裁器分歧路径抛错导致不回话
 
 - 修复群聊影子仲裁器（addressShadow 开启时）的 ReferenceError：eturn verdict 写在 try 块外，const verdict 块级作用域出不来，只要影子判定与旧判定出现分歧（正是影子模式要收集的核心样本）整条消息就静默不回话。这是合并前就存在的老 bug（上游无此实验代码），本次实测连续两次撞上后定位。分歧样本现在正常返回并参与 free_chat 否决，计算异常仍安全降级为 null（tests/addr-shadow-verdict.test.js）。
