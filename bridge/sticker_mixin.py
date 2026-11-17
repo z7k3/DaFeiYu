@@ -25,7 +25,17 @@ class StickerMixin:
                 if G.sticker_input_is_blank(value) and entry['draft_observed']:
                     self.sticker_draft_quarantine.pop(key, None)
                 else:
-                    return False
+                    # fork 自动清理：附件草稿连续两次确认非空 → 用退格真删（微信一定认），
+                    # 清空后解除隔离放行后续发送。以前无限期拦截文字，一条 unconfirmed
+                    # 表情包能把之后所有回复都挡死（2026-11-17 11:42 实见 top20 回复被弃）。
+                    # 只清隔离登记的会话窗口，且内容非空才清——用户正在打的字不受影响
+                    # （隔离条目本身就带 aliases，目标不符时 quarantine 检查不会走到这）。
+                    try:
+                        self.clear_quarantined_draft(entry['hwnd'], entry['aliases'], value)
+                        self.sticker_draft_quarantine.pop(key, None)
+                        G.log('附件草稿已自动清空，解除隔离放行发送')
+                    except Exception:
+                        return False
             return True
         if gui_locked:
             allowed = inspect()
@@ -35,6 +45,35 @@ class StickerMixin:
         if not allowed:
             G.log_throttled('uncertain-attachment-draft', '发送暂停：上次附件操作可能留有草稿；请手动清空目标输入框后重试。无法读取清空证据时，请手动清空后重启桥接。', ttl=60)
         return allowed
+
+
+    def clear_quarantined_draft(self, hwnd, aliases, current_value=None):
+        """退格真删隔离中的附件草稿（只动登记过的会话窗口的输入框）。
+
+        bg_sender._clear_composer 的退格路径微信一定认；别名核对防止窗口
+        切到别的会话时误删别处内容。"""
+        import bg_sender
+        current = str(current_value or '')
+        if not current or G.sticker_input_is_blank(current):
+            return False
+        keys = [a for a in (aliases or []) if a]
+        try:
+            compat = self._compat_mod()
+            if self.ACCOUNT.get('verified') and int(self.ACCOUNT.get('hwnd') or 0) == int(hwnd or 0)                     and compat is not None:
+                u = self.gui._get_uia() if hasattr(self.gui, '_get_uia') else None
+                if u is not None:
+                    try:
+                        cur = str(u.current_chat() or '')
+                        if cur and cur not in keys:
+                            return False  # 当前会话已不是目标，不删
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            return bool(bg_sender._clear_composer(int(hwnd or 0)))
+        except Exception:
+            return False
 
     def sticker_config_now(self):
         if not G.STICKER_TEST_ON:
