@@ -770,8 +770,10 @@ class ReceiverMixin:
                 headers = {'x-whale-bridge': '1'}
                 if self.token:
                     headers['x-bot-token'] = self.token
-                # 模型生成耗时由内核控制，桥接不再用 120 秒读超时截断本轮回复。
-                r = G.LOCAL_HTTP.post(self.bot_url, json=payload, headers=headers, timeout=(10, None))
+                # 模型生成耗时由内核控制，桥接不再用 120 秒读超时截断本轮回复；
+                # 但也不能无限等：内核卡死时这个会话会被永久占死（engine.WEBHOOK_READ_TIMEOUT）。
+                r = G.LOCAL_HTTP.post(self.bot_url, json=payload, headers=headers,
+                                      timeout=(10, G.WEBHOOK_READ_TIMEOUT))
                 if r.status_code != 200:
                     G.CONN_STATE['ok'] = False
                     hint = '桥接 token 不匹配，请核对配置并重启桥接' if r.status_code in (401, 403) else '请查看内核诊断日志'
@@ -786,6 +788,13 @@ class ReceiverMixin:
                     G.log_throttled('adapter-disabled', '微信网关未开启，请在启动器设置中开启 gateway.wechat.enabled')
                     return
             except Exception as e:
+                _is_timeout = type(e).__name__ in ('ReadTimeout', 'ConnectTimeout', 'Timeout')
+                if _is_timeout:
+                    G.CONN_STATE['ok'] = False
+                    G.log_throttled('webhook-read-timeout',
+                                    '鲸鲸接口 %d 秒没回（读超时），这轮回复放弃：会话=%s。正常生成最长约两分钟，'
+                                    '超时说明内核卡住了，去看内核诊断日志' % (G.WEBHOOK_READ_TIMEOUT, G.safe_id(username)))
+                    return
                 _msg = repr(e)
                 if '10061' in _msg or 'refused' in _msg.lower() or '积极拒绝' in _msg:
                     G.log_throttled('conn-refused', '连不上本地服务（积极拒绝 = 127.0.0.1 上没有程序在监听）。先在启动器里点「启动」，等状态变成「运行中」再来。')
@@ -827,6 +836,7 @@ class ReceiverMixin:
                 if isinstance(data.get('sticker'), dict):
                     self.cancel_reply_sticker(data['sticker'], username)
                 G.log('这一分钟回太多了，先停一下：', G.safe_name(target))
+                self.report_delivery_failure(username, len(bubbles), 'rate_limited')
                 return
             if data.get('stickerOnly') is True:
                 sticker = data.get('sticker')
@@ -870,7 +880,7 @@ class ReceiverMixin:
                         pass
                 else:
                     G.log('[voice] stage=delivery result=text_fallback reason=prepare_or_synthesis_failed')
-            for line in bubbles:
+            for idx, line in enumerate(bubbles):
                 if not line:
                     continue
                 if first and mention and is_group:
@@ -892,7 +902,10 @@ class ReceiverMixin:
                 if not self.send_text(line, target, username, quote_latest=quote_latest):
                     if isinstance(data.get('sticker'), dict):
                         self.cancel_reply_sticker(data['sticker'], username)
-                    G.log('[delivery] stage=text result=failed reason=send_failed remainingBubbles=cancelled stickers=cancelled')
+                    remaining = len(bubbles) - idx
+                    G.log('[delivery] stage=text result=failed reason=send_failed remainingBubbles=%d stickers=cancelled' % remaining)
+                    # 剩余气泡全部放弃，回报内核记账（否则她会以为已经说过这些话）
+                    self.report_delivery_failure(username, remaining, 'send_failed')
                     return
                 first = False
                 G.time.sleep(0.6)
@@ -1055,3 +1068,30 @@ class ReceiverMixin:
         except Exception:
             pass
         return out
+
+    def report_delivery_failure(self, username, bubbles, reason):
+        """送达失败回执：本地桥接从 webhook 响应里拿走回复后自行发送，发送失败或被
+        rate_guard 丢弃时内核毫不知情——gateway.send 对 local 恒返回 ok，内核动作账本
+        永远记不到「她说过了但没送到」，下一轮她会以为自己已经回过话（且提示词就是
+        让她按账本口径回答的）。这里回报一条，内核据此记账；回执本身失败只打日志，
+        绝不能影响消息处理主流程。"""
+        try:
+            base = self.bot_url.rsplit('/webhook', 1)[0]
+            headers = {'x-whale-bridge': '1'}
+            if self.token:
+                headers['x-bot-token'] = self.token
+            payload = {
+                'platform': 'wechat',
+                'chatId': username,
+                'chatType': 'group' if username.endswith('@chatroom') else 'private',
+                'bubbles': max(1, int(bubbles or 1)),
+                'reason': str(reason or 'send_failed')[:40],
+            }
+            resp = G.LOCAL_HTTP.post(base + '/api/bridge/delivery-failed', json=payload,
+                                     headers=headers, timeout=3)
+            if resp.status_code != 200:
+                G.log_throttled('delivery-report-' + str(resp.status_code),
+                                '送达失败回执被拒（HTTP %s）：内核可能记不上这次未送达' % resp.status_code)
+        except Exception as e:
+            G.log_throttled('delivery-report-error',
+                            '送达失败回执发送失败（不影响消息处理）：' + repr(e))

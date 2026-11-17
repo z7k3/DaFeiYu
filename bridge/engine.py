@@ -140,6 +140,11 @@ START_TS = time.time()
 from http_client import ThreadLocalHTTP as _ThreadLocalHTTP
 LOCAL_HTTP = _ThreadLocalHTTP()
 bridge_config.set_local_http(LOCAL_HTTP)
+# 请求鲸鲸 webhook 的读超时上限。以前是 (10, None)——读方向永不超时，内核事件循环
+# 一旦卡死（同步 IO / 磁盘挂起），该会话 worker 就永久占死，会话停摆到重启桥接。
+# 正常生成有内核侧硬顶（LLM 总超时 ≤120s + 检索/关怀路由等短调用），240s 足够宽裕；
+# 真到这一步说明内核出了问题，放弃这轮比把会话卡死好。
+WEBHOOK_READ_TIMEOUT = 240
 os.environ['NO_PROXY'] = ','.join(filter(None, [os.environ.get('NO_PROXY', ''), '127.0.0.1,localhost,::1']))
 _THROTTLE_LOG = {}
 CONN_STATE = {'ok': None}
