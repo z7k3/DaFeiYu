@@ -19,6 +19,10 @@
 
 - 修复私聊问「top20/名单/榜单」时回复在半截被切的问题（实见「11 Tw」断词且无省略号）：上游 4.1.7 的「整轮回复硬截断」（privateMaxChars=120）发生在分泡之前，本地「名单整段合成、上限 600」的宽限永远轮不到。现在识别名单类回复（换行列表或行内连续编号）时整轮上限放宽到与名单规则一致的 600 字；被截断时补回「…」提示，不再无声切断（tests/list-reply-cap.test.js）。
 
+### 修复 · 影子仲裁器分歧路径抛错导致不回话
+
+- 修复群聊影子仲裁器（addressShadow 开启时）的 ReferenceError：eturn verdict 写在 try 块外，const verdict 块级作用域出不来，只要影子判定与旧判定出现分歧（正是影子模式要收集的核心样本）整条消息就静默不回话。这是合并前就存在的老 bug（上游无此实验代码），本次实测连续两次撞上后定位。分歧样本现在正常返回并参与 free_chat 否决，计算异常仍安全降级为 null（tests/addr-shadow-verdict.test.js）。
+
 ### 修复 · 送达失败记账与内核卡死保护
 
 - 新增桥接送达失败回执（/api/bridge/delivery-failed）：发送失败、会话静默、限流丢弃时桥接回报内核并记入动作账本，修复本地桥接「她说发了但没收到、追问口径对不上」的问题；正文不回传，只记条数与原因（tests/delivery-ledger.test.js、tests/test_delivery_report.py）。

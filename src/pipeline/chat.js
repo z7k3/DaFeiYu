@@ -1397,11 +1397,15 @@ class Bot {
           + ' topics=' + verdict.topicMentions.length
           + ' len=' + text.length);
       }
+      // 分歧样本正是影子模式要收集的核心数据：verdict 必须在 try 内返回。
+      // 原来写在 try 外面 —— const 块级作用域出不来，分歧一触发就
+      // ReferenceError → decide 整个抛错 → 这条消息直接静默不回话
+      // （addressShadow 开着时必现，2026-11-17 16:23/16:30 两次实见）。
+      return verdict;
     } catch (err) {
       this.logger && this.logger.warn('[addr-shadow] 计算失败（不影响正常流程）：' + describeError(err));
       return null;
     }
-    return verdict;
   }
 
   computeTrigger(args) {
