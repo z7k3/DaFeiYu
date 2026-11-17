@@ -1384,6 +1384,63 @@ class _WriteGuard:
 _MODE_LOGGED = set()
 
 
+_PARKED = {}          # hwnd -> 原位置 (x, y)
+_NOFLASH = {'on': True}   # 静默发送：打字期间把窗口挪到屏幕外，屏幕上完全看不到
+_PARK_POS = -21333
+
+
+def park_window(hwnd, log=None):
+    """把窗口挪到屏幕外并记住原位置；已经挪过就直接返回。"""
+    try:
+        hwnd = int(hwnd or 0)
+        if not hwnd or hwnd in _PARKED:
+            return False
+        import win32gui
+        import win32con
+        # 防呆（fork fd597b2）：只停靠确认属于微信主窗类名的窗口——句柄回收后
+        # 重分配，错停无关应用窗口会挡人且没人认领。
+        if win32gui.GetClassName(hwnd) != 'mmui::MainWindow':
+            if log:
+                log('后台通道：目标窗口类名不是微信主窗，跳过屏幕外停靠')
+            return False
+        rect = win32gui.GetWindowRect(hwnd)
+        win32gui.SetWindowPos(hwnd, 0, _PARK_POS, _PARK_POS, 0, 0,
+                              win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+        _PARKED[hwnd] = (rect[0], rect[1])
+        if log:
+            log("后台通道：已把微信窗口移到屏幕外（静默发送，屏幕上不会有任何闪烁）")
+        return True
+    except Exception as e:
+        if log:
+            log("后台通道：移动到屏幕外失败（不影响发送） %r" % (e,))
+        return False
+
+
+def unpark_window(hwnd, log=None):
+    """把窗口挪回原来的位置（退出/需要前台发送时调用）。"""
+    try:
+        hwnd = int(hwnd or 0)
+        pos = _PARKED.pop(hwnd, None)
+        if not pos:
+            return False
+        import win32gui
+        import win32con
+        win32gui.SetWindowPos(hwnd, 0, int(pos[0]), int(pos[1]), 0, 0,
+                              win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+        if log:
+            log("后台通道：微信窗口已还原到原来的位置")
+        return True
+    except Exception:
+        return False
+
+
+def is_parked(hwnd):
+    try:
+        return int(hwnd or 0) in _PARKED
+    except Exception:
+        return False
+
+
 def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
          strip_unencodable=True, verify=True, unhide=True, char_mode="auto"):
     """一步发完：物化 → 切会话 → 伪焦点打字 → 点发送 → 回读确认。
@@ -1434,143 +1491,151 @@ def send(text, chat=None, hwnd=0, log=None, char_gap=0.04,
             info = _ensure_tree(hwnd, log=log, unhide=unhide, want_edit=bool(chat))
             if len(info["nodes"]) < MIN_NODES:
                 return False, "tree_not_ready"
+            # fork 静默发送：打字前把微信停靠到屏幕外——UIA SetValue/WM_CHAR 会激活微信，
+            # 窗口在屏幕上时每次后台发送都会真实跳前（2026-11-17 实见）。停靠后激活不可见；
+            # 发送确认（或失败）后在 finally 放回原位，语音/表情包的前台路径不受影响。
+            _parked_here = park_window(hwnd, log=log)
+            try:
 
-            # 先切会话，再看输入框：微信可能停在朋友圈 / 通讯录，
-            # 这时 edit 不存在，但会话列表行还在，点一下就能回到聊天页。
-            if chat and not open_chat(sender, chat, log=log):
-                return False, "chat_not_found"
+                # 先切会话，再看输入框：微信可能停在朋友圈 / 通讯录，
+                # 这时 edit 不存在，但会话列表行还在，点一下就能回到聊天页。
+                if chat and not open_chat(sender, chat, log=log):
+                    return False, "chat_not_found"
 
-            info = read_ui(hwnd)                   # 切过会话要重读（按钮位置会变）
-            if info["edit"] is None:
-                # 点完会话后微信会重建一次控件树（实测 150 → 81 再回来），补一次物化
-                info = _ensure_tree(hwnd, log=log, unhide=False)
-            if info["edit"] is None:
-                return False, "no_input_field"
-            if info["send_xy"] is None:
-                return False, "no_send_button"
-            # 硬闸：点开的那一行必须真是目标会话。以前只校验「点中的行名 == 当前会话」，
-            # 名字只是「包含」关系（群A / 群A2）也会放行 —— 正文就发到别的群了。
-            if chat:
-                ok_same, cur_chat = _chat_is_target(info.get("chat"), chat)
-                log("后台通道：核对 目标=%r 当前=%r → %s"
-                    % (safe_name(chat), safe_name(cur_chat), "通过" if ok_same else "不是目标，拒绝发送"))
-                if not ok_same:
-                    return False, "chat_mismatch"
-            # 空框 UIA 读出来是 '\n'，按真值判会误报 input_not_empty（M1）；
-            # 读不到（None）维持原语义：当作没草稿，继续发。
-            if info["value"] is not None and not _is_blank(info["value"]):
-                if _composer_text(info["value"]) in _PROBE_TEXTS:
-                    log("后台通道：输入框里是编码探测留下的「鲸」，删掉后再发（不是用户草稿）")
-                return False, "input_not_empty"
-            if info["value"] is None:
-                # 还没输入时可以安全退回 Unicode 剪贴板通道；输入之后则不能盲目重发。
-                return False, "input_unreadable"
-            chat = chat or info.get("chat")  # CLI 没有指定目标时也绑定当前会话
+                info = read_ui(hwnd)                   # 切过会话要重读（按钮位置会变）
+                if info["edit"] is None:
+                    # 点完会话后微信会重建一次控件树（实测 150 → 81 再回来），补一次物化
+                    info = _ensure_tree(hwnd, log=log, unhide=False)
+                if info["edit"] is None:
+                    return False, "no_input_field"
+                if info["send_xy"] is None:
+                    return False, "no_send_button"
+                # 硬闸：点开的那一行必须真是目标会话。以前只校验「点中的行名 == 当前会话」，
+                # 名字只是「包含」关系（群A / 群A2）也会放行 —— 正文就发到别的群了。
+                if chat:
+                    ok_same, cur_chat = _chat_is_target(info.get("chat"), chat)
+                    log("后台通道：核对 目标=%r 当前=%r → %s"
+                        % (safe_name(chat), safe_name(cur_chat), "通过" if ok_same else "不是目标，拒绝发送"))
+                    if not ok_same:
+                        return False, "chat_mismatch"
+                # 空框 UIA 读出来是 '\n'，按真值判会误报 input_not_empty（M1）；
+                # 读不到（None）维持原语义：当作没草稿，继续发。
+                if info["value"] is not None and not _is_blank(info["value"]):
+                    if _composer_text(info["value"]) in _PROBE_TEXTS:
+                        log("后台通道：输入框里是编码探测留下的「鲸」，删掉后再发（不是用户草稿）")
+                    return False, "input_not_empty"
+                if info["value"] is None:
+                    # 还没输入时可以安全退回 Unicode 剪贴板通道；输入之后则不能盲目重发。
+                    return False, "input_unreadable"
+                chat = chat or info.get("chat")  # CLI 没有指定目标时也绑定当前会话
 
-            configured = str(char_mode or "auto").lower()
-            previous = _CONFIGURED_MODES.get(int(hwnd))
-            if previous is not None and previous != configured:
-                # 用户主动改选项才重置候选；同一个设置不能每条消息都盖掉实测结果。
-                _DETECTED_MODES.pop(int(hwnd), None)
-            _CONFIGURED_MODES[int(hwnd)] = configured
-            mode = _DETECTED_MODES.get(int(hwnd), configured)
-            if mode in (None, "", "auto"):
-                mode = detect_char_mode(hwnd, log=log, chat=chat)
-                if _DETECT_DIRTY:
-                    # 探测完输入框没清干净：宁可这条不发，也不能把「鲸」拼进正文
-                    _DETECT_DIRTY.clear()
-                    return False, "input_dirty"
-            if mode == "gbk" and not _composer_text(_expected_text(text, mode, strip_unencodable)):
-                # GBK 连本条内容都装不下；UTF-16 经实测可用时可留在后台发送。
-                confirmed, clean = _calibrate_char_mode(sender, chat, ("utf16",), log)
-                if not clean:
-                    return False, "input_dirty"
-                if not confirmed:
-                    return False, "gbk_unsupported"
-                mode = confirmed
-            if mode not in _MODE_LOGGED:
-                _MODE_LOGGED.add(mode)
-                log("后台通道：打字编码 = %s（UIA SetValue 优先，失败回退 WM_CHAR）" % mode)
-            # 校验失败本身无法区分丢字、格式差异和乱码。只有短探测读回正确，才重写正文。
-            for attempt in range(2):
-                current = read_ui(hwnd)
-                if not _target_composer(current, chat) or not _is_blank(current.get("value")):
-                    return False, "input_dirty" if attempt else "input_not_empty"
-                expected = _composer_text(_expected_text(text, mode, strip_unencodable))
-                if not expected:
-                    return False, "content_mismatch" if attempt else "gbk_unsupported"
-                input_before = _input_snapshot()
-                draft_dirty = True
-                ok, skipped = _type_text(sender, current.get("edit"), text,
-                                         mode=mode, char_gap=char_gap,
-                                         strip_unencodable=strip_unencodable, log=log)
-                if not ok:
+                configured = str(char_mode or "auto").lower()
+                previous = _CONFIGURED_MODES.get(int(hwnd))
+                if previous is not None and previous != configured:
+                    # 用户主动改选项才重置候选；同一个设置不能每条消息都盖掉实测结果。
+                    _DETECTED_MODES.pop(int(hwnd), None)
+                _CONFIGURED_MODES[int(hwnd)] = configured
+                mode = _DETECTED_MODES.get(int(hwnd), configured)
+                if mode in (None, "", "auto"):
+                    mode = detect_char_mode(hwnd, log=log, chat=chat)
+                    if _DETECT_DIRTY:
+                        # 探测完输入框没清干净：宁可这条不发，也不能把「鲸」拼进正文
+                        _DETECT_DIRTY.clear()
+                        return False, "input_dirty"
+                if mode == "gbk" and not _composer_text(_expected_text(text, mode, strip_unencodable)):
+                    # GBK 连本条内容都装不下；UTF-16 经实测可用时可留在后台发送。
+                    confirmed, clean = _calibrate_char_mode(sender, chat, ("utf16",), log)
+                    if not clean:
+                        return False, "input_dirty"
+                    if not confirmed:
+                        return False, "gbk_unsupported"
+                    mode = confirmed
+                if mode not in _MODE_LOGGED:
+                    _MODE_LOGGED.add(mode)
+                    log("后台通道：打字编码 = %s（UIA SetValue 优先，失败回退 WM_CHAR）" % mode)
+                # 校验失败本身无法区分丢字、格式差异和乱码。只有短探测读回正确，才重写正文。
+                for attempt in range(2):
+                    current = read_ui(hwnd)
+                    if not _target_composer(current, chat) or not _is_blank(current.get("value")):
+                        return False, "input_dirty" if attempt else "input_not_empty"
+                    expected = _composer_text(_expected_text(text, mode, strip_unencodable))
+                    if not expected:
+                        return False, "content_mismatch" if attempt else "gbk_unsupported"
+                    input_before = _input_snapshot()
+                    draft_dirty = True
+                    ok, skipped = _type_text(sender, current.get("edit"), text,
+                                             mode=mode, char_gap=char_gap,
+                                             strip_unencodable=strip_unencodable, log=log)
+                    if not ok:
+                        sender.end_input()
+                        return False, "input_dirty"
+                    time.sleep(TIMING["sendEnabled"])
+                    info, observed, stable = _read_typed_composer(hwnd, chat, expected)
+                    if chat and not _chat_is_target(info.get("chat"), chat)[0]:
+                        sender.end_input()
+                        return False, "chat_mismatch"
+                    if observed == expected:
+                        break
                     sender.end_input()
-                    return False, "input_dirty"
-                time.sleep(TIMING["sendEnabled"])
-                info, observed, stable = _read_typed_composer(hwnd, chat, expected)
-                if chat and not _chat_is_target(info.get("chat"), chat)[0]:
-                    sender.end_input()
-                    return False, "chat_mismatch"
-                if observed == expected:
-                    break
-                sender.end_input()
-                log("后台通道：正文校验不符（编码=%s，预期长度=%d，回读长度=%s，稳定=%s）"
-                    % (mode, len(expected), len(observed) if observed is not None else "未知", stable))
-                if not stable or not _reset_typed_composer(hwnd, chat, info.get("value"), input_before):
-                    log("后台通道：无法确认本次输入已清空，停止发送")
-                    return False, "input_dirty"
-                if attempt:
-                    return False, "content_mismatch"
-                # 纯 ASCII 或仅有空白差异时，改字节编码解决不了这次回读问题。
-                if expected.isascii() or (observed and observed.split() == expected.split()):
-                    return False, "content_mismatch"
-                alternate = "gbk" if mode == "utf16" else "utf16"
-                confirmed, clean = _calibrate_char_mode(sender, chat, (mode, alternate), log)
-                if not clean:
-                    return False, "input_dirty"
-                if not confirmed:
-                    return False, "content_mismatch"
-                log("后台通道：编码实测%s，重试正文一次（%s）"
-                    % ("未变" if confirmed == mode else "确认变化", confirmed))
-                mode = confirmed
+                    log("后台通道：正文校验不符（编码=%s，预期长度=%d，回读长度=%s，稳定=%s）"
+                        % (mode, len(expected), len(observed) if observed is not None else "未知", stable))
+                    if not stable or not _reset_typed_composer(hwnd, chat, info.get("value"), input_before):
+                        log("后台通道：无法确认本次输入已清空，停止发送")
+                        return False, "input_dirty"
+                    if attempt:
+                        return False, "content_mismatch"
+                    # 纯 ASCII 或仅有空白差异时，改字节编码解决不了这次回读问题。
+                    if expected.isascii() or (observed and observed.split() == expected.split()):
+                        return False, "content_mismatch"
+                    alternate = "gbk" if mode == "utf16" else "utf16"
+                    confirmed, clean = _calibrate_char_mode(sender, chat, (mode, alternate), log)
+                    if not clean:
+                        return False, "input_dirty"
+                    if not confirmed:
+                        return False, "content_mismatch"
+                    log("后台通道：编码实测%s，重试正文一次（%s）"
+                        % ("未变" if confirmed == mode else "确认变化", confirmed))
+                    mode = confirmed
 
-            info = read_ui(hwnd)
-            if not _target_composer(info, chat) or _composer_text(info.get("value")) != expected:
-                sender.end_input()
-                return False, "input_dirty"
-            if skipped:
-                log("后台通道：GBK 编不了 %d 个字符，已跳过" % len(skipped))
-            xy = info["send_xy"]
-            if xy is None:
-                sender.end_input()
-                log("后台通道：打完字找不到发送按钮，草稿可能残留在输入框")
-                return False, "input_dirty"
-            sender.click_screen(*xy)
-            if not expected.isascii():
-                _remember_char_mode(hwnd, mode, log)
-            time.sleep(TIMING["afterClick"])
-            sender.end_input()
-
-            partial = "sent_partial" if skipped else "sent"
-            if not verify:
-                return True, partial
-
-            # 发出去了没有：输入框清空 = 走了。空框可能是 '\n'，按 _is_blank 判
-            # （M1）；读不到（None）按「已发送」处理，免得退回前台通道再打一遍、
-            # 聊天里出现两句一样的话。
-            deadline = time.time() + 2.0
-            while time.time() < deadline:
                 info = read_ui(hwnd)
-                v = info.get("value")
-                if not _target_composer(info, chat) or v is None:
-                    log("后台通道：发送后无法确认原会话输入框，按已提交处理（避免重复）")
-                    return True, "sent_unverified"
-                if _is_blank(v):
-                    return True, partial
-                time.sleep(TIMING["verifyPoll"])
-            return False, "residue_left"
+                if not _target_composer(info, chat) or _composer_text(info.get("value")) != expected:
+                    sender.end_input()
+                    return False, "input_dirty"
+                if skipped:
+                    log("后台通道：GBK 编不了 %d 个字符，已跳过" % len(skipped))
+                xy = info["send_xy"]
+                if xy is None:
+                    sender.end_input()
+                    log("后台通道：打完字找不到发送按钮，草稿可能残留在输入框")
+                    return False, "input_dirty"
+                sender.click_screen(*xy)
+                if not expected.isascii():
+                    _remember_char_mode(hwnd, mode, log)
+                time.sleep(TIMING["afterClick"])
+                sender.end_input()
 
+                partial = "sent_partial" if skipped else "sent"
+                if not verify:
+                    return True, partial
+
+                # 发出去了没有：输入框清空 = 走了。空框可能是 '\n'，按 _is_blank 判
+                # （M1）；读不到（None）按「已发送」处理，免得退回前台通道再打一遍、
+                # 聊天里出现两句一样的话。
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    info = read_ui(hwnd)
+                    v = info.get("value")
+                    if not _target_composer(info, chat) or v is None:
+                        log("后台通道：发送后无法确认原会话输入框，按已提交处理（避免重复）")
+                        return True, "sent_unverified"
+                    if _is_blank(v):
+                        return True, partial
+                    time.sleep(TIMING["verifyPoll"])
+                return False, "residue_left"
+
+            finally:
+                if _parked_here:
+                    unpark_window(hwnd, log=log)
         except UipiDenied as e:
             log("后台通道：%s" % (e,))
             if draft_dirty:
