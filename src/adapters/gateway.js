@@ -52,6 +52,9 @@ function normalizeInbound(payload, platform) {
 
   return {
     platform,
+    // 会话标识是否显式提供：wechat 缺失时 handleInbound 直接拒收（见下），
+    // 不再拿 sender_id/「unknown」兜底——不同人会被并进同一个会话，记忆互串。
+    chatIdExplicit: rawChatId !== undefined && rawChatId !== null && String(rawChatId).trim() !== '',
     chatId: String(rawChatId ?? firstDefined(body, ['sender_id', 'user_id', 'from', 'sender']) ?? 'unknown'),
     chatType: isGroup ? 'group' : 'private',
     senderId: String(firstDefined(body, ['sender_id', 'user_id', 'userId', 'sender', 'from', 'wxid', 'author_id']) ?? 'unknown'),
@@ -188,6 +191,13 @@ class Gateway {
 
   async handleInbound(payload, { local = false } = {}) {
     const msg = normalizeInbound(payload, this.platform);
+    // wechat 没有会话标识就拒收：兜底成 sender_id/「unknown」会把不同人的私聊并进
+    // 同一个会话，记忆和上下文直接串门。本地桥接永远带 chat_id；自建中转漏传这个
+    // 字段属于接入方 bug，拒收 + 日志比静默串话好。
+    if (this.platform === 'wechat' && !msg.chatIdExplicit) {
+      this.logger && this.logger.warn('[wechat] 消息缺少会话标识（chat_id），已拒收：请检查接入方 payload');
+      return { ok: true, skipped: 'missing_chat_id' };
+    }
     if (local) {
       // 桥接来取消息也算一次心跳（它一定是活着的）
       this.bridge.lastSeen = Date.now();
