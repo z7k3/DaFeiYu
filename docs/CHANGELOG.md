@@ -25,7 +25,7 @@
 
 ### 修复 · 影子仲裁器分歧路径抛错导致不回话
 
-- 修复群聊影子仲裁器（addressShadow 开启时）的 ReferenceError：eturn verdict 写在 try 块外，const verdict 块级作用域出不来，只要影子判定与旧判定出现分歧（正是影子模式要收集的核心样本）整条消息就静默不回话。这是合并前就存在的老 bug（上游无此实验代码），本次实测连续两次撞上后定位。分歧样本现在正常返回并参与 free_chat 否决，计算异常仍安全降级为 null（tests/addr-shadow-verdict.test.js）。
+- 修复群聊影子仲裁器（addressShadow 开启时）的 ReferenceError：return verdict 语句写在 try 块外，const verdict 块级作用域出不来，只要影子判定与旧判定出现分歧（正是影子模式要收集的核心样本）整条消息就静默不回话。这是合并前就存在的老 bug（上游无此实验代码），本次实测连续两次撞上后定位。分歧样本现在正常返回并参与 free_chat 否决，计算异常仍安全降级为 null（tests/addr-shadow-verdict.test.js）。
 
 ### 修复 · 送达失败记账与内核卡死保护
 
