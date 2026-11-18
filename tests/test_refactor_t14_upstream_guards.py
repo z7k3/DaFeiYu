@@ -156,7 +156,7 @@ class QuoteDiscriminationTests(unittest.TestCase):
             mention=SimpleNamespace(analyze=lambda *_: {
                 'addressed': False, 'bare_any': False, 'bare_self': False,
                 'mentioned_names': []}), LOCAL_HTTP=SimpleNamespace(post=post),
-            CONN_STATE={'ok': True}, log=log, log_throttled=Mock(), log_error=Mock(),
+            CONN_STATE={'ok': True}, WEBHOOK_READ_TIMEOUT=240, log=log, log_throttled=Mock(), log_error=Mock(),
             safe_name=str, safe_text=str, safe_id=str)
         runtime = SimpleNamespace(
             me='fixture-self', token='', bot_url='fixture-kernel',
