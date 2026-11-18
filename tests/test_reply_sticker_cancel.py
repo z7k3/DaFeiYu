@@ -1,4 +1,4 @@
-﻿"""Execute actual reply delivery branches with fake HTTP and no WeChat/UI."""
+"""Execute actual reply delivery branches with fake HTTP and no WeChat/UI."""
 import ast
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +21,9 @@ class ReplyStickerCancelTests(unittest.TestCase):
                         log=Mock(), QUOTE_REPLY=False, time=SimpleNamespace(sleep=Mock()),
                         data={'sticker': self.item}, username='peer-test', target='测试会话',
                         first=True, mention=None, is_group=False,
-                        bubbles=['first', 'second'], send_text=Mock(return_value=False))
+                        bubbles=['first', 'second'], send_text=Mock(return_value=False),
+                        # 送达失败回执（H2）：发送失败/限流丢弃时回报内核记账
+                        report_delivery_failure=Mock())
         init(self.env)
         load_function('cancel_reply_sticker', self.env)
 
@@ -29,8 +31,13 @@ class ReplyStickerCancelTests(unittest.TestCase):
         source = ROOT / 'bridge' / 'receiver_mixin.py'
         tree = ast.parse(source.read_text(encoding='utf-8'))
         if kind == 'text':
+            # 迭代对象是 bubbles：兼容 `for line in bubbles` 与
+            # `for idx, line in enumerate(bubbles)`（H2 送达记账改写后的形态）
             node = next(n for n in ast.walk(tree) if isinstance(n, ast.For)
-                        and isinstance(n.iter, ast.Name) and n.iter.id == 'bubbles')
+                        and ((isinstance(n.iter, ast.Name) and n.iter.id == 'bubbles')
+                             or (isinstance(n.iter, ast.Call) and isinstance(n.iter.func, ast.Name)
+                                 and n.iter.func.id == 'enumerate' and n.iter.args
+                                 and isinstance(n.iter.args[0], ast.Name) and n.iter.args[0].id == 'bubbles')))
         elif kind == 'rate':
             node = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
                         and isinstance(n.test, ast.UnaryOp) and isinstance(n.test.operand, ast.Call)
@@ -54,6 +61,8 @@ class ReplyStickerCancelTests(unittest.TestCase):
         self.http.assert_called_once_with('http://test.invalid/api/stickers/cancel',
             json={'id': 'reply-job', 'generation': 'generation-one', 'chatUsername': 'peer-test'},
             headers=self.env['sticker_headers'], timeout=3)
+        # 发送失败放弃剩余气泡时必须回报内核记账（H2）：2 条都未送达
+        self.env['report_delivery_failure'].assert_called_once_with('peer-test', 2, 'send_failed')
 
     def test_voice_handled_reply_also_releases_unused_sticker(self):
         # fork：receiver 语音块的 voice_outcome/started/explicit 在 if 节点外，env 提供
@@ -69,6 +78,8 @@ class ReplyStickerCancelTests(unittest.TestCase):
         self.run_branch('text')
         self.assertEqual(self.env['send_text'].call_count, 2)
         self.http.assert_called_once()
+        # 第一条已送达，失败点在第 2 条：剩余 2 条未送达
+        self.env['report_delivery_failure'].assert_called_once_with('peer-test', 2, 'send_failed')
 
     def test_unrelated_cancellation_response_is_not_reported_as_success(self):
         self.http.return_value = SimpleNamespace(status_code=200, json=lambda: {
@@ -92,6 +103,8 @@ class ReplyStickerCancelTests(unittest.TestCase):
         self.run_branch('rate')
         self.http.assert_called_once()
         self.env['send_text'].assert_not_called()
+        # 限流丢弃也要回报内核记账（M2/L3），整批 2 条都未送达
+        self.env['report_delivery_failure'].assert_called_once_with('peer-test', 2, 'rate_limited')
 
     def test_text_failure_without_sticker_never_calls_sticker_api(self):
         self.env['data'] = {}
